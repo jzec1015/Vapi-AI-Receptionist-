@@ -13,7 +13,7 @@ Use one replica with SQLite. Back up the volume and set an appropriate retention
 ## Vapi
 
 Keep the existing assistant and submit_service_request schema. After `/readyz` returns HTTP 200, change the tool Server URL to `https://YOUR-RAILWAY-DOMAIN/vapi/webhook` and publish the tool.
-The endpoint supports Vapi toolCallList and toolWithToolCallList envelopes, correlated string results, and one saved request per call ID. Corrections after a save do not create another request.
+The endpoint supports Vapi toolCallList and toolWithToolCallList envelopes and correlated string results. Phone intake is deduplicated per call ID. Dashboard chat uses a session ID when present, otherwise a chat ID, in a separate namespace. Corrections after a save do not create another request within that identity.
 It does not book appointments, dispatch, transfer, or promise callbacks.
 
 ## Optional receipts

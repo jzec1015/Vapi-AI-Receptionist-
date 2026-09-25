@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
-import { createApp } from './server.mjs';
+import { createApp, conversationKey } from './server.mjs';
 
 const key = 'synthetic-test-key-not-used-in-production';
 const details = { name: 'Synthetic Test', address: 'Test fixture only', issue: 'Synthetic verification', is_test: true };
@@ -63,4 +63,33 @@ test('email provider failure preserves the request and does not resend on retry'
   assert.equal(first.saved, true); assert.equal(first.caller_email, 'needs_review');
   const retry = await result(await post(request));
   assert.equal(retry.request_id, first.request_id); assert.equal(sends, 1);
+});
+
+test('conversation identity preserves voice keys and rejects malformed identifiers', () => {
+  assert.equal(conversationKey({ call: { id: 'voice-id' } }), 'voice-id');
+  assert.equal(conversationKey({ call: { id: '' }, chat: { id: 'chat-id' } }), null);
+  assert.equal(conversationKey({ chat: { id: 'x'.repeat(201) } }), null);
+  assert.equal(conversationKey({ session: { id: 'session-id' }, chat: { id: 'turn-id' } }), 'session:session-id');
+  assert.equal(conversationKey({ chat: { id: 'turn-id', sessionId: 'session-id' } }), 'session:session-id');
+});
+
+test('dashboard chat intake saves and deduplicates separately from phone calls', async t => {
+  const post = await fixture(t);
+  const chat = payload('same-id'); delete chat.message.call; chat.message.chat = { id: 'same-id' };
+  const first = await result(await post(chat));
+  assert.equal(first.saved, true);
+  assert.equal((await result(await post(chat))).request_id, first.request_id);
+  const voice = await result(await post(payload('same-id')));
+  assert.notEqual(voice.request_id, first.request_id);
+});
+
+test('successive chat turns in one session cannot duplicate an intake', async t => {
+  const post = await fixture(t);
+  const chat = payload('unused'); delete chat.message.call;
+  chat.message.chat = { id: 'turn-1', sessionId: 'session-1' };
+  const first = await result(await post(chat));
+  chat.message.chat.id = 'turn-2';
+  const second = await result(await post(chat));
+  assert.equal(second.request_id, first.request_id);
+  assert.equal(second.duplicate, true);
 });

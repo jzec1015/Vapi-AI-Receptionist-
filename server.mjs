@@ -5,6 +5,15 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 
+export function conversationKey(message) {
+  const valid = value => typeof value === 'string' && value.length > 0 && value.length <= 200;
+  // Keep voice IDs unchanged so deployed records retain their retry identity.
+  if (message.call != null) return valid(message.call.id) ? message.call.id : null;
+  const sessionId = message.session?.id ?? message.chat?.sessionId;
+  if (sessionId != null) return valid(sessionId) ? `session:${sessionId}` : null;
+  return valid(message.chat?.id) ? `chat:${message.chat.id}` : null;
+}
+
 export function createApp(env = process.env, send = fetch) {
   const dataDir = env.RAILWAY_VOLUME_MOUNT_PATH || env.DATA_DIR;
   const key = env.VAPI_WEBHOOK_SECRET || '';
@@ -90,7 +99,7 @@ export function createApp(env = process.env, send = fetch) {
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.0.0', ready,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.0.1', ready,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL)
       });
@@ -117,8 +126,8 @@ export function createApp(env = process.env, send = fetch) {
       const results = [];
       for (const tool of calls) {
         let result;
-        const callId = message.call?.id;
-        if (typeof callId !== 'string' || !callId || callId.length > 200) result = failure('Missing Vapi call ID');
+        const callId = conversationKey(message);
+        if (!callId) result = failure('Missing Vapi call, chat or session ID');
         else if ((tool.function?.name || tool.name) !== 'submit_service_request') result = failure('Unknown tool');
         else {
           try {
