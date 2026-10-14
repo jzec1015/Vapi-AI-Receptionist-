@@ -105,18 +105,20 @@ export function createApp(env = process.env, send = fetch) {
   }
   // Safety net: a phone call that ended without a saved request still reaches the office.
   async function hangup(callId, message, route) {
-    if (db.prepare('SELECT 1 FROM requests WHERE call_id = ?').get(callId)) return;
+    if (db.prepare('SELECT 1 FROM requests WHERE call_id = ?').get(callId)) return 'already_saved';
     const callerId = callerNumberOf(message);
-    if (!callerId || !(Number(message.durationSeconds) >= 10)) return;
+    if (!callerId) return 'no_caller_id';
+    if (!(Number(message.durationSeconds) >= 10)) return 'too_short';
     const summary = String(message.analysis?.summary || message.summary || '').trim().slice(0, 1000);
     const details = { name: 'Unknown caller', address: '', issue: summary ? `Hung up before finishing. Summary: ${summary}` : 'Hung up before giving details',
       is_test: false, callback_phone: '', caller_id: callerId, email: '', notes: [] };
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
     const inserted = db.prepare('INSERT OR IGNORE INTO requests VALUES (?, ?, ?, ?, ?)').run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result));
-    if (!inserted.changes) return;
+    if (!inserted.changes) return 'already_saved';
     result.office_alert = await alert(route, details, id, 'hangup');
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
+    return `hangup_request_created alert=${result.office_alert}`;
   }
   async function submit(callId, args, message = {}) {
     const old = db.prepare('SELECT result FROM requests WHERE call_id = ?').get(callId);
@@ -198,7 +200,9 @@ export function createApp(env = process.env, send = fetch) {
       const message = body?.message;
       if (message?.type === 'end-of-call-report') {
         const callId = conversationKey(message);
-        if (callId && message.call) await hangup(callId, message, routeFor(message));
+        const outcome = callId && message.call ? await hangup(callId, message, routeFor(message)) : 'no_call';
+        // Operational log only: outcome and IDs, never caller details.
+        console.log(`end-of-call-report call=${callId} assistant=${assistantIdOf(message)} outcome=${outcome}`);
         return reply(200, {});
       }
       if (message?.type !== 'tool-calls') return reply(200, {});
