@@ -175,6 +175,19 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
     return { saved: true, request_id: row.id, note_added: true, office_alert: await alert(route, details, row.id, 'note') };
   }
+  // An email given after the request was saved: only accepted once spelled back and confirmed, then the confirmation goes out.
+  async function addEmail(callId, args, route) {
+    const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
+    if (!row) return failure('No saved request yet; save the request first');
+    if (args?.confirmed_after_spelling_back !== true) return failure('Not added: spell the email back letter by letter and get a clear yes first.');
+    const email = typeof args?.email === 'string' ? args.email.trim() : '';
+    if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return failure('Invalid email');
+    const details = JSON.parse(row.details);
+    details.email = email;
+    db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
+    const caller_email = details.is_test ? 'suppressed_test' : await receipt(email, details, row.id, 'caller', route);
+    return { saved: true, request_id: row.id, email_added: true, caller_email };
+  }
   // Safety net: a phone call that ended without a saved request still reaches the office.
   async function hangup(callId, message, route) {
     if (db.prepare('SELECT 1 FROM requests WHERE call_id = ?').get(callId)) return 'already_saved';
@@ -214,6 +227,9 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       if (args[field] != null && (typeof args[field] !== 'string' || args[field].length > 500)) return failure(`Invalid ${field}`);
       details[field] = (args[field] || '').trim();
     }
+    // Skipping the email question is only allowed for emergencies.
+    if (args.email_status === 'skipped_emergency' && !/^\s*URGENT\b/i.test(details.issue))
+      return failure('Not saved: this is not an urgent job, so ask the caller for their email first, then save again.');
     details.caller_id = callerNumberOf(message);
     details.notes = [];
     details.email = '';
@@ -257,7 +273,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.4.0', ready,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.5.0', ready,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
         sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length
@@ -302,6 +318,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
             if (typeof args === 'string') args = JSON.parse(args);
             result = await addNote(callId, args, routeFor(message));
           } catch { result = failure('Unable to add note'); }
+        }
+        else if (name === 'add_customer_email') {
+          try {
+            let args = tool.function?.arguments ?? tool.parameters;
+            if (typeof args === 'string') args = JSON.parse(args);
+            result = await addEmail(callId, args, routeFor(message));
+          } catch { result = failure('Unable to add email'); }
         }
         else if (name !== 'submit_service_request') result = failure('Unknown tool');
         else {

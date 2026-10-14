@@ -129,3 +129,21 @@ test('job type, size and details reach the office alert', async t => {
   assert.match(text, /Details: 50-gal gas tank, about 12 years old, leaking at base/);
   assert.match(text, /Reply STOP to opt out$/);
 });
+
+test('skipping the email question is refused for a non-urgent job', async t => {
+  const { post } = await fixture(t);
+  const r = await result(await post(toolCall('skip-1', 'submit_service_request', { ...intake, issue: 'Faucet drip', email_status: 'skipped_emergency' })));
+  assert.equal(r.saved, false); assert.match(r.error, /ask the caller for their email/);
+  const ok = await result(await post(toolCall('skip-2', 'submit_service_request', { ...intake, email_status: 'skipped_emergency' })));
+  assert.equal(ok.saved, true);
+});
+
+test('a late email is only added after spell-back and then sends the confirmation', async t => {
+  const { post, sent } = await fixture(t);
+  await post(toolCall('late-1', 'submit_service_request', intake));
+  const refused = await result(await post(toolCall('late-1', 'add_customer_email', { email: 'linda@example.com', confirmed_after_spelling_back: false })));
+  assert.equal(refused.saved, false);
+  const added = await result(await post(toolCall('late-1', 'add_customer_email', { email: 'linda@example.com', confirmed_after_spelling_back: true })));
+  assert.equal(added.email_added, true); assert.equal(added.caller_email, 'accepted');
+  assert.ok(sent.some(s => s.url.includes('resend') && s.body.to[0] === 'linda@example.com' && /we received your request/.test(s.body.subject)));
+});
