@@ -156,7 +156,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     // A caller who said "test call" is a test; never alert a client about it.
     const said = `${message.artifact?.transcript || message.transcript || ''} ${summary}`;
     const details = { name: 'Unknown caller', address: '', issue: summary ? `Hung up before finishing. Summary: ${summary}` : 'Hung up before giving details',
-      is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [] };
+      is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [] };
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
     const inserted = db.prepare('INSERT OR IGNORE INTO requests VALUES (?, ?, ?, ?, ?)').run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result));
