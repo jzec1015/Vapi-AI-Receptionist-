@@ -98,3 +98,10 @@ test('an unconfirmed email is never sent and no time defaults to a callback', as
   await post(toolCall('call-nomail', 'submit_service_request', { ...intake, email: 'x@example.com', email_confirmed: false }));
   assert.equal(sent.filter(s => s.url.includes('resend') && s.body.to[0] === 'x@example.com').length, 0);
 });
+
+test('a hang-up on a test call is recorded but never alerts the client', async t => {
+  const { post, sent } = await fixture(t);
+  await post({ message: { type: 'end-of-call-report', durationSeconds: 30, artifact: { transcript: 'User: Hi, this is a test call. My water heater is leaking.' },
+    call: { id: 'hang-test', assistantId: 'client-a', type: 'inboundPhoneCall', customer: { number: '+16155550100' } } } });
+  assert.equal(sent.length, 0);
+});
