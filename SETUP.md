@@ -45,3 +45,14 @@ Add `transfer-destination-request` and `transfer-update` to the assistant's serv
 
 Run `npm test`. `/healthz` checks process/database health, `/readyz` checks storage and webhook authentication configuration. Neither endpoint reveals records or credentials.
 Service requests are stored in requests.sqlite on the mounted volume; use controlled Railway console access to inspect or export them. There is no unauthenticated record API.
+
+## Test data isolation (v1.6)
+
+Every request row now stores `assistant_id` and an `is_test` column (existing databases are migrated on start; old test rows are backfilled from `details.is_test` and chat sessions).
+A request is a test, stored but never alerting a client or emailing a caller, when any of these match (`details.test_reason` records which):
+- the receptionist set `is_test` (caller said "this is a test call");
+- it came from a dashboard chat/session (Emma takes live jobs by phone only);
+- the assistant is listed in `TEST_ASSISTANT_IDS` (comma-separated; demo or staging assistants);
+- the caller ID or callback number is listed in `TEST_CALLER_NUMBERS` (comma-separated; e.g. Jake's phone and the voicetest caller line).
+`GET /admin/requests/summary` with the `x-anchorline-key` header returns counts by assistant and test flag (no caller details).
+Live reports and exports should filter `WHERE is_test = 0`.

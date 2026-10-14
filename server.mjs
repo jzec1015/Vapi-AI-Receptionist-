@@ -23,6 +23,24 @@ export function callerNumberOf(message) {
   return typeof number === 'string' && number.length <= 40 ? number : '';
 }
 
+const digitsOf = value => String(value || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
+
+// Why a request is test traffic, or null for a live request. Test requests are stored but
+// flagged, never alert a client or email a caller, and are excluded from live counts.
+//   explicit        the receptionist marked it (caller said "this is a test call")
+//   chat            dashboard/API chat sessions (Emma takes live jobs by phone only)
+//   test_assistant  assistant listed in TEST_ASSISTANT_IDS (demo / staging assistants)
+//   test_number     caller ID or callback number listed in TEST_CALLER_NUMBERS (Jake's phones, voicetest line)
+export function testReason(env, { explicit = false, callId = '', assistantId = '', callerId = '', callbackPhone = '' }) {
+  if (explicit) return 'explicit';
+  if (/^(chat|session):/.test(callId)) return 'chat';
+  if (assistantId && listOf(env.TEST_ASSISTANT_IDS).includes(assistantId)) return 'test_assistant';
+  const numbers = new Set(listOf(env.TEST_CALLER_NUMBERS).map(digitsOf).filter(Boolean));
+  if ([callerId, callbackPhone].some(n => numbers.has(digitsOf(n)))) return 'test_number';
+  return null;
+}
+
 // US numbers read as (615) 555-0142; anything else is shown as given.
 export function formatPhone(value) {
   const digits = String(value || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
@@ -146,7 +164,26 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS transfers (
         call_id TEXT PRIMARY KEY, assistant_id TEXT, status TEXT NOT NULL, due_at INTEGER NOT NULL, updated_at TEXT NOT NULL
       );`);
+    // v1.6: queryable assistant and test columns, so live data can be filtered and test rows purged safely.
+    const columns = new Set(db.prepare('PRAGMA table_info(requests)').all().map(c => c.name));
+    if (!columns.has('assistant_id')) db.exec('ALTER TABLE requests ADD COLUMN assistant_id TEXT');
+    if (!columns.has('is_test')) {
+      db.exec(`ALTER TABLE requests ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;
+        UPDATE requests SET is_test = 1 WHERE json_extract(details, '$.is_test') = 1 OR call_id LIKE 'chat:%' OR call_id LIKE 'session:%';`);
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS requests_live ON requests (is_test, assistant_id, created_at)');
   }
+  const insert = (orIgnore, callId, id, details, result, assistantId) => db.prepare(
+    `INSERT ${orIgnore ? 'OR IGNORE ' : ''}INTO requests (call_id, id, created_at, details, result, assistant_id, is_test) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result), assistantId, details.is_test ? 1 : 0);
+  // Marks details as a test when any rule matches (see testReason). Mutates and returns details.
+  const classify = (details, callId, message) => {
+    const reason = testReason(env, { explicit: details.is_test === true, callId, assistantId: assistantIdOf(message) || '',
+      callerId: details.caller_id, callbackPhone: details.callback_phone });
+    details.is_test = !!reason;
+    if (reason) details.test_reason = reason;
+    return details;
+  };
   const authorized = req => {
     const supplied = Buffer.from(String(req.headers['x-anchorline-key'] || ''));
     const expected = Buffer.from(key);
@@ -310,7 +347,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [] };
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
-    const inserted = db.prepare('INSERT OR IGNORE INTO requests VALUES (?, ?, ?, ?, ?)').run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result));
+    classify(details, callId, message);
+    const inserted = insert(true, callId, id, details, result, assistantIdOf(message));
     if (!inserted.changes) return 'already_saved';
     result.office_alert = await alert(route, details, id, 'hangup');
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
@@ -346,12 +384,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       if (typeof args.email !== 'string' || args.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(args.email)) return failure('Invalid confirmed email');
       details.email = args.email;
     }
+    classify(details, callId, message);
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id,
       caller_email: details.email ? 'pending' : 'not_requested',
       anchorline_email: env.OFFICE_EMAIL ? 'pending' : 'not_requested' };
     // Commit before any network operation. One request per Vapi call survives retries/restarts.
-    db.prepare('INSERT INTO requests VALUES (?, ?, ?, ?, ?)').run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result));
+    insert(false, callId, id, details, result, assistantIdOf(message));
     // Urgent job with an owner's cell on the route: offer a live transfer and hold the spoken alert call for its outcome.
     const transfer = canTransfer(routeFor(message), details);
     if (transfer) {
@@ -394,6 +433,17 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length,
         transfer_routes: Object.values(routes).filter(r => isE164(r?.transfer)).length
       });
+    }
+    // Read-only counts for ops checks (e.g. "is any test data left before go-live?"). Counts and IDs only, never caller details.
+    if (path === '/admin/requests/summary') {
+      if (req.method !== 'GET') return reply(405, { error: 'GET required' });
+      if (!db || key.length < 32) return reply(503, { error: 'Not configured' });
+      if (!authorized(req)) return reply(401, { error: 'Unauthorized' });
+      const groups = db.prepare(`SELECT COALESCE(assistant_id, 'unknown') AS assistant_id, is_test, COUNT(*) AS n,
+        MIN(created_at) AS first, MAX(created_at) AS last FROM requests GROUP BY 1, 2 ORDER BY 1, 2`).all();
+      const total = groups.reduce((sum, g) => sum + g.n, 0);
+      const test = groups.filter(g => g.is_test).reduce((sum, g) => sum + g.n, 0);
+      return reply(200, { total, live: total - test, test, by_assistant: groups.map(g => ({ ...g, is_test: !!g.is_test })) });
     }
     if (path !== '/vapi/webhook') return reply(404, { error: 'Not found' });
     if (req.method !== 'POST') return reply(405, { error: 'POST required' });
