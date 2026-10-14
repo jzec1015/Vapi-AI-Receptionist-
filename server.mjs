@@ -48,20 +48,24 @@ export function formatPhone(value) {
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : String(value || '');
 }
 
-// Plain-text office alert, kept short enough for two SMS segments.
+// Plain-text office alert. GSM-7 only (no emoji, no smart quotes) so a full alert is at most
+// 3 SMS segments; one non-GSM character would switch the whole text to UCS-2 (70 chars/segment).
+// Carrier rules: the sender brand (Anchorline AI) is named and every text carries an opt-out line,
+// matching the registered 10DLC campaign samples.
+const gsm = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[\u2018\u2019\u02BC]/g, "'").replace(/[\u201C\u201D]/g, '"')
+  .replace(/[\u2013\u2014\u00B7\u2022]/g, '-').replace(/\u2026/g, '...').replace(/[^\n\x20-\x7E]/g, '');
 export function alertText(route, details, kind = 'new') {
   const urgent = /^\s*URGENT\b/i.test(details.issue);
-  const head = kind === 'note' ? 'Update' : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
+  const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
-  const lines = [`${urgent || kind === 'hangup' ? '🚨 ' : ''}${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} · ${phone}`];
+  const lines = [`Anchorline AI: ${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} - ${phone}`];
   if (details.address) lines.push(details.address);
   lines.push(kind === 'note' ? `Note: ${details.notes.at(-1)}` : issue);
-  if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' · ')}`);
+  if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' - ')}`);
   if (kind === 'new' && details.job_details) lines.push(`Details: ${details.job_details}`);
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
-  // Carrier rules: every business text carries an opt-out line.
-  return `${lines.join('\n').slice(0, 280)}\nReply STOP to opt out`;
+  return `${gsm(lines.join('\n')).slice(0, 280)}\nReply STOP to opt out`;
 }
 
 // Customer confirmation: what we received, never a promised appointment time.
@@ -243,7 +247,12 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       for (const to of route.sms || []) jobs.push(send('https://api.telnyx.com/v2/messages', {
         method: 'POST', signal: AbortSignal.timeout(8000),
         headers: { Authorization: `Bearer ${env.TELNYX_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from: env.TELNYX_FROM, to, text }) }));
+        body: JSON.stringify({ from: env.TELNYX_FROM, to, text }) }).then(async r => {
+          // Log only Telnyx error codes (e.g. 40300 recipient opted out, 40010 number not 10DLC-linked), never the text.
+          if (!r.ok) { let codes = ''; try { codes = (await r.clone().json()).errors?.map(e => e.code).join(',') || ''; } catch {}
+            console.warn(`sms alert failed: HTTP ${r.status} ${codes}`); }
+          return r;
+        }));
     }
     if (env.RESEND_API_KEY && env.EMAIL_FROM && (route.email || []).length) {
       jobs.push(send('https://api.resend.com/emails', {

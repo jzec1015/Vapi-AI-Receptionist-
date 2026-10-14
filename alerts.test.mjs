@@ -31,7 +31,7 @@ test('a saved request texts and emails only that client route', async t => {
   assert.equal(saved.saved, true); assert.equal(saved.office_alert, 'sent');
   const sms = sent.filter(s => s.url.includes('telnyx'));
   assert.equal(sms.length, 1); assert.equal(sms[0].body.to, '+15550000001');
-  assert.match(sms[0].body.text, /^🚨 URGENT call - Gold Star Plumbing/);
+  assert.match(sms[0].body.text, /^Anchorline AI: URGENT call - Gold Star Plumbing/);
   assert.match(sms[0].body.text, /\(615\) 555-0142/);
   assert.equal(sent.filter(s => s.url.includes('resend')).length, 1);
   const other = await result(await post(toolCall('call-2', 'submit_service_request', intake, { assistantId: 'demo-line' })));
@@ -56,7 +56,7 @@ test('notes append to the saved request and send an update', async t => {
   await post(toolCall('call-4', 'submit_service_request', intake));
   const noted = await result(await post(toolCall('call-4', 'add_request_note', { note: 'Asked if you work Saturdays' })));
   assert.equal(noted.note_added, true); assert.equal(noted.office_alert, 'sent');
-  assert.match(sent.filter(s => s.url.includes('telnyx')).at(-1).body.text, /^🚨 Update - Gold Star Plumbing[\s\S]*Note: Asked if you work Saturdays/);
+  assert.match(sent.filter(s => s.url.includes('telnyx')).at(-1).body.text, /^Anchorline AI: URGENT update - Gold Star Plumbing[\s\S]*Note: Asked if you work Saturdays/);
 });
 
 test('a hang-up before saving still reaches the office once', async t => {
@@ -66,7 +66,7 @@ test('a hang-up before saving still reaches the office once', async t => {
   assert.equal((await post(report('hang-1', 45))).status, 200);
   await post(report('hang-1', 45));
   const sms = sent.filter(s => s.url.includes('telnyx'));
-  assert.equal(sms.length, 1); assert.match(sms[0].body.text, /^🚨 Caller hung up - Gold Star Plumbing[\s\S]*\(615\) 555-0100 \(caller ID\)[\s\S]*leak/);
+  assert.equal(sms.length, 1); assert.match(sms[0].body.text, /^Anchorline AI: Caller hung up - Gold Star Plumbing[\s\S]*\(615\) 555-0100 \(caller ID\)[\s\S]*leak/);
   await post(report('hang-short', 4));
   await post(toolCall('saved-call', 'submit_service_request', intake));
   const before = sent.length;
@@ -76,7 +76,7 @@ test('a hang-up before saving still reaches the office once', async t => {
 
 test('alert text stays short and marks urgency', () => {
   const text = alertText({ business: 'Maple Plumbing' }, { ...intake, issue: 'Slow drain '.repeat(60), notes: [] });
-  assert.ok(text.length <= 302); assert.match(text, /Reply STOP to opt out$/); assert.match(text, /^New call - Maple Plumbing/);
+  assert.ok(text.length <= 302); assert.match(text, /Reply STOP to opt out$/); assert.match(text, /^Anchorline AI: New call - Maple Plumbing/); assert.match(text, /^[\n\x20-\x7E]+$/);
 });
 
 test('a confirmed caller email gets a branded confirmation without promising a time', async t => {
@@ -125,7 +125,7 @@ test('job type, size and details reach the office alert', async t => {
   await post(toolCall('call-job', 'submit_service_request', { ...intake, issue: 'Water heater quote',
     job_type: 'Replacement', job_size: 'Big job (half day+)', job_details: '50-gal gas tank, about 12 years old, leaking at base' }));
   const text = sent.find(s => s.url.includes('telnyx')).body.text;
-  assert.match(text, /Job: Replacement · Big job \(half day\+\)/);
+  assert.match(text, /Job: Replacement - Big job \(half day\+\)/);
   assert.match(text, /Details: 50-gal gas tank, about 12 years old, leaking at base/);
   assert.match(text, /Reply STOP to opt out$/);
 });
