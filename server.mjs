@@ -72,19 +72,52 @@ Reference: ${id.slice(0, 8)}`
 }
 
 // Spoken alert for urgent jobs: reads the job once, repeats on request, then hangs up.
-export function alertCall(route, details, phoneNumberId, to) {
+// missedTransfer: the caller was offered a live transfer that nobody picked up.
+export function alertCall(route, details, phoneNumberId, to, missedTransfer = false) {
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : details.caller_id ? formatPhone(details.caller_id) : 'no number given';
   const job = `${details.name}, at ${details.address || 'no address given'}. ${issue}. Callback number: ${phone}.`;
+  const missed = missedTransfer ? ' I tried to put them through to you live but couldn\'t reach you, so please call them back.' : '';
   return {
     phoneNumberId, customer: { number: to },
     assistant: {
       name: 'Urgent job alert', maxDurationSeconds: 90, endCallFunctionEnabled: true, firstMessageMode: 'assistant-speaks-first',
-      firstMessage: `Hi, this is an urgent job alert for ${route.business}. ${job} It's also in your email. Want me to repeat that?`,
+      firstMessage: `Hi, this is an urgent job alert for ${route.business}. ${job}${missed} It's also in your email. Want me to repeat that?`,
       voice: { provider: '11labs', voiceId: 'EXAVITQu4vr4xnSDxMaL', model: 'eleven_turbo_v2_5' },
       model: { provider: 'openai', model: 'gpt-4.1', maxTokens: 120, messages: [{ role: 'system', content:
         `You just delivered this urgent job alert for ${route.business}: ${job} If asked, repeat it slowly, especially the callback number. ` +
         'You cannot do anything else. When they say thanks, no, or goodbye, say a short goodbye and end the call.' }] }
+    }
+  };
+}
+
+export const isE164 = value => typeof value === 'string' && /^\+[1-9]\d{7,14}$/.test(value);
+
+// Warm transfer of an urgent caller to the owner's cell (Vapi transfer-destination-request reply).
+// The owner hears the saved job (confirmed details, not a generated summary) and must accept before the
+// caller is connected. Voicemail, no answer or a decline returns the caller to Emma (fallbackPlan).
+export function transferDestination(route, details) {
+  const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
+  const phone = details.callback_phone ? formatPhone(details.callback_phone) : details.caller_id ? formatPhone(details.caller_id) : 'no number given';
+  const intro = `Hi, it's Emma from ${route.business} with an urgent caller on hold: ${details.name}, at ${details.address || 'no address given'}. ${issue}. ` +
+    `Their number is ${phone}. Can you take the call now?`;
+  return {
+    type: 'number', number: route.transfer, callerId: '{{phoneNumber.number}}',
+    transferPlan: {
+      mode: 'warm-transfer-experimental',
+      contextEngineeringPlan: { type: 'none' },
+      transferAssistant: {
+        firstMessageMode: 'assistant-waits-for-user', maxDurationSeconds: 45, silenceTimeoutSeconds: 20,
+        voice: { provider: '11labs', voiceId: 'EXAVITQu4vr4xnSDxMaL', model: 'eleven_turbo_v2_5' },
+        model: { provider: 'openai', model: 'gpt-4.1', maxTokens: 120, messages: [{ role: 'system', content:
+          `You are Emma, calling the owner of ${route.business} to hand over an urgent caller who is on hold. ` +
+          `When a live person answers, say exactly: "${intro}" ` +
+          'If they accept (yes, sure, go ahead, put them through), call transferSuccessful right away without saying more. ' +
+          'If you hear voicemail, a recorded greeting, an automated message or a busy signal, call transferCancel at once and say nothing about the caller. ' +
+          'If they say no, they cannot, or ask you to take a message, call transferCancel. If asked, repeat the details slowly, especially the number. ' +
+          'Keep every reply to one short sentence.' }] }
+      },
+      fallbackPlan: { message: 'I couldn\'t get the owner on the line just now. Your request is already saved for the team. One moment.', endCallEnabled: false }
     }
   };
 }
@@ -94,9 +127,13 @@ export function createApp(env = process.env, send = fetch) {
   const key = env.VAPI_WEBHOOK_SECRET || '';
   // ALERT_ROUTES: {"<assistantId>": {"business": "...", "sms": ["+1..."], "email": ["..."], "call": ["+1..."], "alertTests": false}}
   // "call" numbers get a spoken alert for URGENT jobs (needs VAPI_API_KEY and ALERT_CALL_FROM_ID).
+  // "transfer": "+1..." (owner's cell) enables a live warm transfer for URGENT jobs. The spoken alert call then waits
+  // until the transfer is not answered, and is placed anyway after TRANSFER_FALLBACK_SECONDS unless the caller was connected.
   let routes = {};
   try { routes = JSON.parse(env.ALERT_ROUTES || '{}') || {}; } catch { routes = {}; }
   const routeFor = message => routes[assistantIdOf(message)] || null;
+  const fallbackMs = Math.max(0, Number(env.TRANSFER_FALLBACK_SECONDS ?? 75) || 0) * 1000;
+  const canTransfer = (route, details) => !!route && isE164(route.transfer) && /^\s*URGENT\b/i.test(details.issue) && (!details.is_test || !!route.alertTests);
   let db;
   if (dataDir) {
     mkdirSync(dataDir, { recursive: true });
@@ -105,6 +142,9 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS requests (
         call_id TEXT PRIMARY KEY, id TEXT NOT NULL, created_at TEXT NOT NULL,
         details TEXT NOT NULL, result TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS transfers (
+        call_id TEXT PRIMARY KEY, assistant_id TEXT, status TEXT NOT NULL, due_at INTEGER NOT NULL, updated_at TEXT NOT NULL
       );`);
   }
   const authorized = req => {
@@ -137,8 +177,17 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       return response.ok ? 'accepted' : 'needs_review';
     } catch { return 'needs_review'; }
   }
+  // Spoken alert calls to a route's "call" numbers (urgent jobs only).
+  function phoneAlerts(route, details, missedTransfer = false) {
+    if (!env.VAPI_API_KEY || !env.ALERT_CALL_FROM_ID) return [];
+    return (route.call || []).map(to => send('https://api.vapi.ai/call', {
+      method: 'POST', signal: AbortSignal.timeout(8000),
+      headers: { Authorization: `Bearer ${env.VAPI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(alertCall(route, details, env.ALERT_CALL_FROM_ID, to, missedTransfer)) }));
+  }
   // Office alerts for one client route. Returns a status string; never throws.
-  async function alert(route, details, id, kind) {
+  // holdCall: a live transfer will be tried first, so the spoken alert call waits for its outcome.
+  async function alert(route, details, id, kind, holdCall = false) {
     if (!route || (details.is_test && !route.alertTests)) return details.is_test ? 'suppressed_test' : 'not_configured';
     const text = alertText(route, details, kind);
     const jobs = [];
@@ -155,15 +204,67 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: text.split('\n')[0], text: `${text}\n\nRequest reference: ${id}` }) }));
     }
     const urgent = /^\s*URGENT\b/i.test(details.issue);
-    if (kind === 'new' && urgent && env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID) {
-      for (const to of route.call || []) jobs.push(send('https://api.vapi.ai/call', {
-        method: 'POST', signal: AbortSignal.timeout(8000),
-        headers: { Authorization: `Bearer ${env.VAPI_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(alertCall(route, details, env.ALERT_CALL_FROM_ID, to)) }));
-    }
+    if (kind === 'new' && urgent && !holdCall) jobs.push(...phoneAlerts(route, details));
+    return settle(jobs);
+  }
+  async function settle(jobs) {
     if (!jobs.length) return 'not_configured';
     const settled = await Promise.allSettled(jobs);
     return settled.every(s => s.status === 'fulfilled' && s.value.ok) ? 'sent' : 'needs_review';
+  }
+  // Live transfer bookkeeping. One row per call; the held alert call is placed at most once.
+  const transferRow = callId => db.prepare('SELECT status, due_at FROM transfers WHERE call_id = ?').get(callId);
+  function setTransfer(callId, status, from) {
+    const placeholders = from.map(() => '?').join(', ');
+    return db.prepare(`UPDATE transfers SET status = ?, updated_at = ? WHERE call_id = ? AND status IN (${placeholders})`)
+      .run(status, new Date().toISOString(), callId, ...from).changes === 1;
+  }
+  // The transfer was not answered (or its outcome is unknown): place the held urgent alert call now, once.
+  async function releaseAlert(callId, reason) {
+    if (!setTransfer(callId, 'alerting', ['pending', 'dialing'])) return transferRow(callId)?.status || 'no_transfer';
+    const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
+    const assistantId = db.prepare('SELECT assistant_id FROM transfers WHERE call_id = ?').get(callId)?.assistant_id;
+    const route = routes[assistantId];
+    const outcome = row && route ? await settle(phoneAlerts(route, JSON.parse(row.details), true)) : 'not_configured';
+    setTransfer(callId, 'alerted', ['alerting']);
+    console.log(`transfer call=${callId} outcome=alert_${outcome} reason=${reason}`);
+    return outcome;
+  }
+  // Was the caller handed to the owner? Asks Vapi for the call; any doubt counts as not connected.
+  async function transferConnected(callId) {
+    if (!env.VAPI_API_KEY) return false;
+    try {
+      const response = await send(`https://api.vapi.ai/call/${encodeURIComponent(callId)}`, {
+        method: 'GET', signal: AbortSignal.timeout(8000), headers: { Authorization: `Bearer ${env.VAPI_API_KEY}` } });
+      if (!response.ok) return false;
+      const call = await response.json();
+      return call?.status === 'forwarding' || call?.endedReason === 'assistant-forwarded-call';
+    } catch { return false; }
+  }
+  // Backstop: held alerts whose window passed without a connected transfer get their call.
+  async function sweepTransfers(now = Date.now()) {
+    if (!db) return [];
+    const due = db.prepare("SELECT call_id FROM transfers WHERE status IN ('pending', 'dialing') AND due_at <= ?").all(now);
+    const outcomes = [];
+    for (const { call_id } of due) {
+      if (await transferConnected(call_id)) { setTransfer(call_id, 'connected', ['pending', 'dialing']); outcomes.push('connected'); continue; }
+      outcomes.push(await releaseAlert(call_id, 'timeout'));
+    }
+    return outcomes;
+  }
+  // transfer-destination-request: only a saved, urgent request with a transfer route is put through.
+  function transferRequest(message) {
+    const callId = conversationKey(message);
+    const route = routeFor(message);
+    const row = callId && db.prepare('SELECT details FROM requests WHERE call_id = ?').get(callId);
+    if (!row) return { error: 'Not transferred: save the request with submit_service_request first.' };
+    const details = JSON.parse(row.details);
+    if (!canTransfer(route, details)) return { error: 'Not transferred: live transfer is only for urgent jobs on a line with a transfer number.' };
+    // One attempt per call: the restarted window covers ringing, the owner's answer and the hand-over.
+    db.prepare('INSERT OR IGNORE INTO transfers VALUES (?, ?, ?, ?, ?)').run(callId, assistantIdOf(message), 'pending', 0, new Date().toISOString());
+    if (!setTransfer(callId, 'dialing', ['pending'])) return { error: 'Not transferred: the owner was already tried on this call.' };
+    db.prepare('UPDATE transfers SET due_at = ? WHERE call_id = ?').run(Date.now() + fallbackMs, callId);
+    return { destination: transferDestination(route, details) };
   }
   async function addNote(callId, args, route) {
     const row = db.prepare('SELECT id, details, result FROM requests WHERE call_id = ?').get(callId);
@@ -187,6 +288,14 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
     const caller_email = details.is_test ? 'suppressed_test' : await receipt(email, details, row.id, 'caller', route);
     return { saved: true, request_id: row.id, email_added: true, caller_email };
+  }
+  // The live transfer came back unanswered: the held urgent alert call goes out now.
+  async function noAnswer(callId) {
+    const status = transferRow(callId)?.status;
+    if (!status) return failure('No live transfer was tried on this call.');
+    if (status === 'alerted' || status === 'alerting') return { saved: true, owner_alert: 'already_sent' };
+    if (status === 'connected') return failure('The caller was already connected to the owner.');
+    return { saved: true, owner_alert: await releaseAlert(callId, 'no_answer') };
   }
   // Safety net: a phone call that ended without a saved request still reaches the office.
   async function hangup(callId, message, route) {
@@ -243,7 +352,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       anchorline_email: env.OFFICE_EMAIL ? 'pending' : 'not_requested' };
     // Commit before any network operation. One request per Vapi call survives retries/restarts.
     db.prepare('INSERT INTO requests VALUES (?, ?, ?, ?, ?)').run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result));
-    const officeAlert = alert(routeFor(message), details, id, 'new');
+    // Urgent job with an owner's cell on the route: offer a live transfer and hold the spoken alert call for its outcome.
+    const transfer = canTransfer(routeFor(message), details);
+    if (transfer) {
+      db.prepare('INSERT OR IGNORE INTO transfers VALUES (?, ?, ?, ?, ?)').run(callId, assistantIdOf(message), 'pending', Date.now() + fallbackMs, new Date().toISOString());
+      result.live_transfer = 'available';
+    }
+    const officeAlert = alert(routeFor(message), details, id, 'new', transfer);
     if (details.is_test) {
       result.caller_email = details.email ? 'suppressed_test' : 'not_requested';
       result.anchorline_email = env.OFFICE_EMAIL ? 'suppressed_test' : 'not_requested';
@@ -273,10 +388,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.5.0', ready,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.6.0', ready,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
-        sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length
+        sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length,
+        transfer_routes: Object.values(routes).filter(r => isE164(r?.transfer)).length
       });
     }
     if (path !== '/vapi/webhook') return reply(404, { error: 'Not found' });
@@ -298,8 +414,23 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       if (message?.type === 'end-of-call-report') {
         const callId = conversationKey(message);
         const outcome = callId && message.call ? await hangup(callId, message, routeFor(message)) : 'no_call';
+        // A held urgent alert is settled when the call ends: handed to the owner, or the alert call goes out now.
+        let transfer = '';
+        if (callId && ['pending', 'dialing'].includes(transferRow(callId)?.status)) {
+          const forwarded = (message.endedReason ?? message.call?.endedReason) === 'assistant-forwarded-call';
+          transfer = forwarded && setTransfer(callId, 'connected', ['pending', 'dialing']) ? ' transfer=connected' : ` transfer=alert_${await releaseAlert(callId, 'call_ended')}`;
+        }
         // Operational log only: outcome and IDs, never caller details.
-        console.log(`end-of-call-report call=${callId} assistant=${assistantIdOf(message)} outcome=${outcome}`);
+        console.log(`end-of-call-report call=${callId} assistant=${assistantIdOf(message)} outcome=${outcome}${transfer}`);
+        return reply(200, {});
+      }
+      if (message?.type === 'transfer-destination-request') {
+        const answer = transferRequest(message);
+        console.log(`transfer-destination-request call=${conversationKey(message)} assistant=${assistantIdOf(message)} outcome=${answer.error ? 'refused' : 'dialing'}`);
+        return reply(200, answer);
+      }
+      if (message?.type === 'transfer-update') {
+        console.log(`transfer-update call=${conversationKey(message)} destination=${message.destination?.type || 'unknown'}`);
         return reply(200, {});
       }
       if (message?.type !== 'tool-calls') return reply(200, {});
@@ -326,6 +457,9 @@ This records a request only. It does not confirm an appointment, dispatch, trans
             result = await addEmail(callId, args, routeFor(message));
           } catch { result = failure('Unable to add email'); }
         }
+        else if (name === 'transfer_no_answer') {
+          try { result = await noAnswer(callId); } catch { result = failure('Unable to alert the owner'); }
+        }
         else if (name !== 'submit_service_request') result = failure('Unknown tool');
         else {
           try {
@@ -345,7 +479,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   });
   server.requestTimeout = 30000;
   server.headersTimeout = 15000;
-  server.on('close', () => db?.close());
+  // Held urgent alerts are checked every few seconds, and again after a restart (rows live in SQLite).
+  const sweeper = db ? setInterval(() => sweepTransfers().catch(() => {}), 5000) : null;
+  sweeper?.unref();
+  server.sweepTransfers = sweepTransfers;
+  server.on('close', () => { clearInterval(sweeper); db?.close(); });
   return server;
 }
 

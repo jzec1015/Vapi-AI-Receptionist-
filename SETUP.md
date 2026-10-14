@@ -14,7 +14,7 @@ Use one replica with SQLite. Back up the volume and set an appropriate retention
 
 Keep the existing assistant and submit_service_request schema. After `/readyz` returns HTTP 200, change the tool Server URL to `https://YOUR-RAILWAY-DOMAIN/vapi/webhook` and publish the tool.
 The endpoint supports Vapi toolCallList and toolWithToolCallList envelopes and correlated string results. Phone intake is deduplicated per call ID. Dashboard chat uses a session ID when present, otherwise a chat ID, in a separate namespace. Corrections after a save do not create another request within that identity.
-It does not book appointments, dispatch, transfer, or promise callbacks.
+It does not book appointments, dispatch, or promise callbacks. Live transfer is limited to urgent jobs (see below).
 
 ## Optional receipts
 
@@ -33,6 +33,13 @@ SMS uses TELNYX_API_KEY and TELNYX_FROM (a 10DLC-registered Telnyx number). Emai
 Requests starting with "URGENT -" are flagged in the alert. The caller ID is stored and used when no callback number was given.
 The add_request_note tool appends a note to the saved request and sends an update alert.
 To catch callers who hang up before a request is saved, set the assistant Server URL to this webhook with the x-anchorline-key header and enable the end-of-call-report server message. Calls of 10 seconds or more with a caller ID become a "Caller hung up" request.
+
+## Emergency live transfer (v1.6)
+
+Add `"transfer": "+1..."` (owner's cell, E.164) to a route in ALERT_ROUTES. For a saved URGENT job, submit_service_request returns `live_transfer: "available"` and the spoken alert call is held while Emma tries the owner.
+Emma's transfer tool has no fixed destination, so Vapi sends `transfer-destination-request` to this webhook. The reply is a `warm-transfer-experimental` destination: the owner hears the saved job (name, address, issue, callback number) and must accept before the caller is connected. Voicemail, no answer or a decline returns the caller to Emma (`fallbackPlan.endCallEnabled: false`).
+The held alert call goes out, once, when Emma calls `transfer_no_answer`, when the call ends without being forwarded, or after TRANSFER_FALLBACK_SECONDS (default 75) unless Vapi reports the call as forwarded. Only one transfer attempt per call; test calls transfer only when the route has `alertTests: true`.
+Add `transfer-destination-request` and `transfer-update` to the assistant's serverMessages.
 
 ## Verification
 
