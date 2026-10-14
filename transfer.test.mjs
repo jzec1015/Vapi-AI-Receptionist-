@@ -132,3 +132,18 @@ test('transfer destination falls back to caller ID when no callback number was g
   const { transferPlan } = transferDestination(route, { ...intake, callback_phone: '', caller_id: '+16155550100' });
   assert.match(transferPlan.transferAssistant.model.messages[0].content, /Their number is \(615\) 555-0100\./);
 });
+
+test('an urgent test call on a transfer line never rings, transfers to or alerts the owner', async t => {
+  const { post, sent, app } = await fixture(t, { env: { TRANSFER_FALLBACK_SECONDS: '0', TEST_CALLER_NUMBERS: '+16155550100' } });
+  // Said "this is a test call", and separately a live-looking urgent call from a listed test number.
+  const said = await result(await post(toolCall('tt-1', 'submit_service_request', { ...intake, is_test: true })));
+  const fromJake = await result(await post(toolCall('tt-2', 'submit_service_request', intake)));
+  for (const saved of [said, fromJake]) { assert.equal(saved.saved, true); assert.equal(saved.office_alert, 'suppressed_test'); assert.equal(saved.live_transfer, undefined); }
+  for (const id of ['tt-1', 'tt-2']) {
+    assert.match((await (await post(destinationRequest(id))).json()).error, /only for urgent jobs/);
+    assert.equal((await result(await post(toolCall(id, 'transfer_no_answer', {})))).saved, false);
+    await post(endOfCall(id, 'customer-ended-call'));
+  }
+  assert.deepEqual(await app.sweepTransfers(Date.now() + 3600000), []);
+  assert.deepEqual(sent, []);
+});
