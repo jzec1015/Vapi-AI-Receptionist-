@@ -48,7 +48,7 @@ Service requests are stored in requests.sqlite on the mounted volume; use contro
 
 ## Test data isolation (v1.6)
 
-Every request row now stores `assistant_id` and an `is_test` column (existing databases are migrated on start; old test rows are backfilled from `details.is_test` and chat sessions).
+Every request row now has `assistant_id` and `is_test` columns (existing databases are migrated on start; old chat-session rows are marked as tests). Both are VIRTUAL generated columns read from the `details` JSON, so the table still stores 5 columns and a rollback to v1.5.0 keeps saving requests. Write test flags into `details`, never into these columns.
 A request is a test, stored but never alerting a client or emailing a caller, when any of these match (`details.test_reason` records which):
 - the receptionist set `is_test` (caller said "this is a test call");
 - it came from a dashboard chat/session (Emma takes live jobs by phone only);
