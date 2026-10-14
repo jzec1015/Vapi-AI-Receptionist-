@@ -32,7 +32,34 @@ export function alertText(route, details, kind = 'new') {
   const lines = [`${urgent || kind === 'hangup' ? '🚨 ' : ''}${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} · ${phone}`];
   if (details.address) lines.push(details.address);
   lines.push(kind === 'note' ? `Note: ${details.notes.at(-1)}` : issue);
+  if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
   return lines.join('\n').slice(0, 300);
+}
+
+// Customer confirmation: what we received, never a promised appointment time.
+export function confirmationEmail(route, details, id) {
+  const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
+  const phone = details.callback_phone || details.caller_id || 'The number you called from';
+  const when = details.preferred_time ? `${details.preferred_time} (the team will call to confirm)` : 'The team will call you to set a time';
+  return {
+    subject: `${route.business}: we received your request`,
+    text: `Hi ${details.name},
+
+Thanks for calling ${route.business}. We received your service request, and our team will be in touch soon.
+
+` +
+      `Name: ${details.name}
+Phone: ${phone}
+Service address: ${details.address}
+Issue: ${issue}
+Requested time: ${when}
+
+` +
+      `If anything here is wrong, just reply to this email.
+
+${route.business}
+Reference: ${id.slice(0, 8)}`
+  };
 }
 
 export function createApp(env = process.env, send = fetch) {
@@ -59,15 +86,25 @@ export function createApp(env = process.env, send = fetch) {
   };
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
   const inflight = new Map();
-  async function receipt(to, details, id, recipient) {
+  async function receipt(to, details, id, recipient, route = null) {
     if (!to) return 'not_requested';
     if (!env.RESEND_API_KEY || !env.EMAIL_FROM) return 'needs_review';
+    const branded = recipient === 'caller' && route?.business;
+    const message = branded ? confirmationEmail(route, details, id) : { subject: 'Anchorline service request received',
+      text: `Request reference: ${id}
+
+Name: ${details.name}
+Address: ${details.address}
+Issue: ${details.issue}
+Callback: ${details.callback_phone || 'Not provided'}
+
+This records a request only. It does not confirm an appointment, dispatch, transfer, or callback.` };
     try {
       const response = await send('https://api.resend.com/emails', {
         method: 'POST', signal: AbortSignal.timeout(8000),
         headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': `${id}-${recipient}` },
-        body: JSON.stringify({ from: env.EMAIL_FROM, to: [to], subject: 'Anchorline service request received',
-          text: `Request reference: ${id}\n\nName: ${details.name}\nAddress: ${details.address}\nIssue: ${details.issue}\nCallback: ${details.callback_phone || 'Not provided'}\n\nThis records a request only. It does not confirm an appointment, dispatch, transfer, or callback.` })
+        body: JSON.stringify({ from: branded ? `${route.business} <${env.EMAIL_FROM}>` : env.EMAIL_FROM, to: [to], ...message,
+          ...(branded && route.email?.length ? { reply_to: route.email } : {}) })
       });
       return response.ok ? 'accepted' : 'needs_review';
     } catch { return 'needs_review'; }
@@ -133,6 +170,8 @@ export function createApp(env = process.env, send = fetch) {
     details.is_test = args.is_test;
     if (args.callback_phone != null && (typeof args.callback_phone !== 'string' || args.callback_phone.length > 100)) return failure('Invalid callback phone');
     details.callback_phone = args.callback_phone || '';
+    if (args.preferred_time != null && (typeof args.preferred_time !== 'string' || args.preferred_time.length > 200)) return failure('Invalid preferred time');
+    details.preferred_time = (args.preferred_time || '').trim();
     details.caller_id = callerNumberOf(message);
     details.notes = [];
     details.email = '';
@@ -152,7 +191,7 @@ export function createApp(env = process.env, send = fetch) {
       result.anchorline_email = env.OFFICE_EMAIL ? 'suppressed_test' : 'not_requested';
     } else {
       [result.caller_email, result.anchorline_email] = await Promise.all([
-        receipt(details.email, details, id, 'caller'), receipt(env.OFFICE_EMAIL, details, id, 'office')
+        receipt(details.email, details, id, 'caller', routeFor(message)), receipt(env.OFFICE_EMAIL, details, id, 'office')
       ]);
     }
     result.office_alert = await officeAlert;
@@ -176,7 +215,7 @@ export function createApp(env = process.env, send = fetch) {
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.1.0', ready,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.2.0', ready,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
         sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), alert_routes: Object.keys(routes).length
