@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
+import { createBooking } from './booking.mjs';
 
 export function conversationKey(message) {
   const valid = value => typeof value === 'string' && value.length > 0 && value.length <= 200;
@@ -163,7 +164,8 @@ export function createApp(env = process.env, send = fetch) {
       );
       CREATE TABLE IF NOT EXISTS transfers (
         call_id TEXT PRIMARY KEY, assistant_id TEXT, status TEXT NOT NULL, due_at INTEGER NOT NULL, updated_at TEXT NOT NULL
-      );`);
+      );
+      CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);`);
     // v1.6: queryable assistant and test columns, so live data can be filtered and test rows purged safely.
     const columns = new Set(db.prepare('PRAGMA table_info(requests)').all().map(c => c.name));
     if (!columns.has('assistant_id')) db.exec('ALTER TABLE requests ADD COLUMN assistant_id TEXT');
@@ -183,6 +185,15 @@ export function createApp(env = process.env, send = fetch) {
     details.is_test = !!reason;
     if (reason) details.test_reason = reason;
     return details;
+  };
+  // Booking into the client's scheduling tool (off unless BOOKING_ROUTES names the assistant).
+  const booking = createBooking(env, send, {
+    get: callId => { const row = db?.prepare('SELECT result FROM bookings WHERE call_id = ?').get(callId); return row ? JSON.parse(row.result) : undefined; },
+    set: (callId, result) => db?.prepare('INSERT OR IGNORE INTO bookings VALUES (?, ?, ?)').run(callId, new Date().toISOString(), JSON.stringify(result))
+  });
+  const savedRequest = callId => {
+    const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
+    return row ? { ...JSON.parse(row.details), request_id: row.id } : null;
   };
   const authorized = req => {
     const supplied = Buffer.from(String(req.headers['x-anchorline-key'] || ''));
@@ -430,7 +441,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.6.0', ready,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
-        sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length,
+        sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length, booking_routes: booking.routeCount,
         transfer_routes: Object.values(routes).filter(r => isE164(r?.transfer)).length
       });
     }
@@ -509,6 +520,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         }
         else if (name === 'transfer_no_answer') {
           try { result = await noAnswer(callId); } catch { result = failure('Unable to alert the owner'); }
+        }
+        else if (booking.names.includes(name)) {
+          try {
+            let args = tool.function?.arguments ?? tool.parameters;
+            if (typeof args === 'string') args = JSON.parse(args);
+            result = await booking.handle(name, { callId, assistantId: assistantIdOf(message), request: savedRequest(callId) }, args);
+          } catch { result = { booked: false, appointment_confirmed: false, status: 'error' }; }
         }
         else if (name !== 'submit_service_request') result = failure('Unknown tool');
         else {
