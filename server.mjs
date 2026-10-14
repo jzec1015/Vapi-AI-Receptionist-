@@ -171,17 +171,25 @@ export function createApp(env = process.env, send = fetch) {
       );
       CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);`);
     // v1.6: queryable assistant and test columns, so live data can be filtered and test rows purged safely.
-    const columns = new Set(db.prepare('PRAGMA table_info(requests)').all().map(c => c.name));
-    if (!columns.has('assistant_id')) db.exec('ALTER TABLE requests ADD COLUMN assistant_id TEXT');
-    if (!columns.has('is_test')) {
-      db.exec(`ALTER TABLE requests ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;
-        UPDATE requests SET is_test = 1 WHERE json_extract(details, '$.is_test') = 1 OR call_id LIKE 'chat:%' OR call_id LIKE 'session:%';`);
-    }
-    db.exec('CREATE INDEX IF NOT EXISTS requests_live ON requests (is_test, assistant_id, created_at)');
+    // They are VIRTUAL generated columns read from the details JSON, so the table still takes 5 values and a
+    // rollback to v1.5.0 (which inserts with VALUES (?, ?, ?, ?, ?)) keeps saving requests. One transaction:
+    // a failed migration leaves the v1.5.0 table as it was.
+    const columns = new Set(db.prepare('PRAGMA table_xinfo(requests)').all().map(c => c.name));
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!columns.has('assistant_id')) db.exec(`ALTER TABLE requests ADD COLUMN assistant_id TEXT
+        GENERATED ALWAYS AS (CASE WHEN json_valid(details) THEN json_extract(details, '$.assistant_id') END) VIRTUAL`);
+      if (!columns.has('is_test')) db.exec(`UPDATE requests SET details = json_set(details, '$.is_test', json('true'), '$.test_reason', 'chat')
+          WHERE (call_id LIKE 'chat:%' OR call_id LIKE 'session:%') AND CASE WHEN json_valid(details) THEN json_extract(details, '$.is_test') IS NOT 1 ELSE 0 END;
+        ALTER TABLE requests ADD COLUMN is_test INTEGER
+          GENERATED ALWAYS AS (CASE WHEN NOT json_valid(details) THEN 0 WHEN json_extract(details, '$.is_test') = 1 THEN 1 ELSE 0 END) VIRTUAL;`);
+      db.exec('CREATE INDEX IF NOT EXISTS requests_live ON requests (is_test, assistant_id, created_at); COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
+  // Column list matches the v1.5.0 table; assistant_id and is_test are derived from details.
   const insert = (orIgnore, callId, id, details, result, assistantId) => db.prepare(
-    `INSERT ${orIgnore ? 'OR IGNORE ' : ''}INTO requests (call_id, id, created_at, details, result, assistant_id, is_test) VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result), assistantId, details.is_test ? 1 : 0);
+    `INSERT ${orIgnore ? 'OR IGNORE ' : ''}INTO requests (call_id, id, created_at, details, result) VALUES (?, ?, ?, ?, ?)`
+  ).run(callId, id, new Date().toISOString(), JSON.stringify({ ...details, is_test: !!details.is_test, assistant_id: assistantId || null }), JSON.stringify(result));
   // Marks details as a test when any rule matches (see testReason). Mutates and returns details.
   const classify = (details, callId, message) => {
     const reason = testReason(env, { explicit: details.is_test === true, callId, assistantId: assistantIdOf(message) || '',
