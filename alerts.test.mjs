@@ -105,3 +105,17 @@ test('a hang-up on a test call is recorded but never alerts the client', async t
     call: { id: 'hang-test', assistantId: 'client-a', type: 'inboundPhoneCall', customer: { number: '+16155550100' } } } });
   assert.equal(sent.length, 0);
 });
+
+test('urgent jobs phone the route owner; routine jobs and tests do not', async t => {
+  const { post, sent } = await fixture(t, { VAPI_API_KEY: 'fixture-only', ALERT_CALL_FROM_ID: 'from-line',
+    ALERT_ROUTES: JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', email: [], sms: [], call: ['+16155550999'] } }) });
+  await post(toolCall('urgent-1', 'submit_service_request', intake));
+  const calls = sent.filter(s => s.url === 'https://api.vapi.ai/call');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].body.customer.number, '+16155550999');
+  assert.equal(calls[0].body.phoneNumberId, 'from-line');
+  assert.match(calls[0].body.assistant.firstMessage, /urgent job alert for Gold Star Plumbing\. Linda Harper, at 48 Birch Road\. water under kitchen sink\. Callback number: \(615\) 555-0142\./);
+  await post(toolCall('routine-1', 'submit_service_request', { ...intake, issue: 'Slow drain' }));
+  await post(toolCall('test-1', 'submit_service_request', { ...intake, is_test: true }));
+  assert.equal(sent.filter(s => s.url === 'https://api.vapi.ai/call').length, 1);
+});

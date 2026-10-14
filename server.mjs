@@ -68,10 +68,29 @@ Reference: ${id.slice(0, 8)}`
   };
 }
 
+// Spoken alert for urgent jobs: reads the job once, repeats on request, then hangs up.
+export function alertCall(route, details, phoneNumberId, to) {
+  const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
+  const phone = details.callback_phone ? formatPhone(details.callback_phone) : details.caller_id ? formatPhone(details.caller_id) : 'no number given';
+  const job = `${details.name}, at ${details.address || 'no address given'}. ${issue}. Callback number: ${phone}.`;
+  return {
+    phoneNumberId, customer: { number: to },
+    assistant: {
+      name: 'Urgent job alert', maxDurationSeconds: 90, endCallFunctionEnabled: true, firstMessageMode: 'assistant-speaks-first',
+      firstMessage: `Hi, this is an urgent job alert for ${route.business}. ${job} It's also in your email. Want me to repeat that?`,
+      voice: { provider: '11labs', voiceId: 'EXAVITQu4vr4xnSDxMaL', model: 'eleven_turbo_v2_5' },
+      model: { provider: 'openai', model: 'gpt-4.1', maxTokens: 120, messages: [{ role: 'system', content:
+        `You just delivered this urgent job alert for ${route.business}: ${job} If asked, repeat it slowly, especially the callback number. ` +
+        'You cannot do anything else. When they say thanks, no, or goodbye, say a short goodbye and end the call.' }] }
+    }
+  };
+}
+
 export function createApp(env = process.env, send = fetch) {
   const dataDir = env.RAILWAY_VOLUME_MOUNT_PATH || env.DATA_DIR;
   const key = env.VAPI_WEBHOOK_SECRET || '';
-  // ALERT_ROUTES: {"<assistantId>": {"business": "...", "sms": ["+1..."], "email": ["..."], "alertTests": false}}
+  // ALERT_ROUTES: {"<assistantId>": {"business": "...", "sms": ["+1..."], "email": ["..."], "call": ["+1..."], "alertTests": false}}
+  // "call" numbers get a spoken alert for URGENT jobs (needs VAPI_API_KEY and ALERT_CALL_FROM_ID).
   let routes = {};
   try { routes = JSON.parse(env.ALERT_ROUTES || '{}') || {}; } catch { routes = {}; }
   const routeFor = message => routes[assistantIdOf(message)] || null;
@@ -131,6 +150,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         method: 'POST', signal: AbortSignal.timeout(8000),
         headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': `${id}-alert-${kind}-${details.notes.length}` },
         body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: text.split('\n')[0], text: `${text}\n\nRequest reference: ${id}` }) }));
+    }
+    const urgent = /^\s*URGENT\b/i.test(details.issue);
+    if (kind === 'new' && urgent && env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID) {
+      for (const to of route.call || []) jobs.push(send('https://api.vapi.ai/call', {
+        method: 'POST', signal: AbortSignal.timeout(8000),
+        headers: { Authorization: `Bearer ${env.VAPI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(alertCall(route, details, env.ALERT_CALL_FROM_ID, to)) }));
     }
     if (!jobs.length) return 'not_configured';
     const settled = await Promise.allSettled(jobs);
@@ -223,10 +249,10 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.2.0', ready,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.3.0', ready,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
-        sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), alert_routes: Object.keys(routes).length
+        sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length
       });
     }
     if (path !== '/vapi/webhook') return reply(404, { error: 'Not found' });
