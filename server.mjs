@@ -54,7 +54,8 @@ export function formatPhone(value) {
 // matching the registered 10DLC campaign samples.
 const gsm = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[\u2018\u2019\u02BC]/g, "'").replace(/[\u201C\u201D]/g, '"')
   .replace(/[\u2013\u2014\u00B7\u2022]/g, '-').replace(/\u2026/g, '...').replace(/[^\n\x20-\x7E]/g, '');
-export function alertText(route, details, kind = 'new') {
+// channel 'email': same lines, but no SMS opt-out footer, no 280-character cut and no GSM-7 stripping.
+export function alertText(route, details, kind = 'new', channel = 'sms') {
   const urgent = /^\s*URGENT\b/i.test(details.issue);
   const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
@@ -65,6 +66,7 @@ export function alertText(route, details, kind = 'new') {
   if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' - ')}`);
   if (kind === 'new' && details.job_details) lines.push(`Details: ${details.job_details}`);
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
+  if (channel === 'email') return lines.join('\n');
   return `${gsm(lines.join('\n')).slice(0, 280)}\nReply STOP to opt out`;
 }
 
@@ -263,10 +265,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         }));
     }
     if (env.RESEND_API_KEY && env.EMAIL_FROM && (route.email || []).length) {
+      const emailText = alertText(route, details, kind, 'email');
       jobs.push(send('https://api.resend.com/emails', {
         method: 'POST', signal: AbortSignal.timeout(8000),
         headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': `${id}-alert-${kind}-${details.notes.length}` },
-        body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: text.split('\n')[0], text: `${text}\n\nRequest reference: ${id}` }) }));
+        body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: emailText.split('\n')[0], text: `${emailText}\n\nRequest reference: ${id}` }) }));
     }
     const urgent = /^\s*URGENT\b/i.test(details.issue);
     if (kind === 'new' && urgent && !holdCall) jobs.push(...phoneAlerts(route, details));

@@ -74,6 +74,23 @@ test('a hang-up before saving still reaches the office once', async t => {
   assert.equal(sent.length, before);
 });
 
+test('alert emails never carry the SMS opt-out line and are not cut short', async t => {
+  const { post, sent } = await fixture(t);
+  await post({ message: { type: 'end-of-call-report', durationSeconds: 45, analysis: { summary: 'Caller reported a leak and hung up.' },
+    call: { id: 'hang-mail', assistantId: 'client-a', type: 'inboundPhoneCall', customer: { number: '+16155550100' } } } });
+  const long = 'Water heater pilot keeps going out after about ten minutes. '.repeat(8).trim();
+  await post(toolCall('mail-new', 'submit_service_request', { ...intake, name: 'José Núñez', issue: long, job_details: 'Rheem 40-gal' }));
+  await post(toolCall('mail-new', 'add_request_note', { note: 'Gate code 4471' }));
+  const emails = sent.filter(s => s.url.includes('resend'));
+  assert.equal(emails.length, 3);
+  for (const e of emails) { assert.doesNotMatch(e.body.text, /STOP/); assert.doesNotMatch(e.body.subject, /STOP/); }
+  assert.equal(emails[0].body.subject, 'Anchorline AI: Caller hung up - Gold Star Plumbing');
+  assert.match(emails[0].body.text, /\(615\) 555-0100 \(caller ID\)\nHung up before finishing\. Summary: Caller reported a leak and hung up\.\n\nRequest reference: /);
+  assert.ok(emails[1].body.text.includes(long)); assert.match(emails[1].body.text, /José Núñez[\s\S]*Details: Rheem 40-gal/);
+  assert.match(emails[2].body.text, /Note: Gate code 4471/);
+  for (const s of sent.filter(s => s.url.includes('telnyx'))) assert.match(s.body.text, /\nReply STOP to opt out$/);
+});
+
 test('alert text stays short and marks urgency', () => {
   const text = alertText({ business: 'Maple Plumbing' }, { ...intake, issue: 'Slow drain '.repeat(60), notes: [] });
   assert.ok(text.length <= 302); assert.match(text, /Reply STOP to opt out$/); assert.match(text, /^Anchorline AI: New call - Maple Plumbing/); assert.match(text, /^[\n\x20-\x7E]+$/);
