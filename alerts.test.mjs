@@ -76,7 +76,7 @@ test('a hang-up before saving still reaches the office once', async t => {
 
 test('alert text stays short and marks urgency', () => {
   const text = alertText({ business: 'Maple Plumbing' }, { ...intake, issue: 'Slow drain '.repeat(60), notes: [] });
-  assert.ok(text.length <= 300); assert.match(text, /^New call - Maple Plumbing/);
+  assert.ok(text.length <= 302); assert.match(text, /Reply STOP to opt out$/); assert.match(text, /^New call - Maple Plumbing/);
 });
 
 test('a confirmed caller email gets a branded confirmation without promising a time', async t => {

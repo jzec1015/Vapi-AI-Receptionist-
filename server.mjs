@@ -39,7 +39,8 @@ export function alertText(route, details, kind = 'new') {
   if (details.address) lines.push(details.address);
   lines.push(kind === 'note' ? `Note: ${details.notes.at(-1)}` : issue);
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
-  return lines.join('\n').slice(0, 300);
+  // Carrier rules: every business text carries an opt-out line.
+  return `${lines.join('\n').slice(0, 280)}\nReply STOP to opt out`;
 }
 
 // Customer confirmation: what we received, never a promised appointment time.
