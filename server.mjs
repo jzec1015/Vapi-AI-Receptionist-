@@ -163,7 +163,7 @@ export function createApp(env = process.env, send = fetch) {
   if (dataDir) {
     mkdirSync(dataDir, { recursive: true });
     db = new DatabaseSync(join(dataDir, 'requests.sqlite'));
-    db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+    db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS requests (
         call_id TEXT PRIMARY KEY, id TEXT NOT NULL, created_at TEXT NOT NULL,
         details TEXT NOT NULL, result TEXT NOT NULL

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
+import { spawn } from 'node:child_process';
 import { createApp } from './server.mjs';
 import { createApp as createV150 } from './fixtures/server-v1.5.0.mjs';
 
@@ -87,6 +88,19 @@ test('a damaged row does not stop the server from starting', async t => {
   assert.equal((await (await fetch(app.base + '/healthz')).json()).ready, true);
   assert.deepEqual(rows(dir).find(r => r[0] === 'chat:broken'), ['chat:broken', null, 0]);
   assert.equal((await (await fetch(app.base + '/admin/requests/summary', { headers: { 'x-anchorline-key': key } })).json()).total, 6);
+});
+
+test('startup waits for a briefly locked database instead of crashing', async t => {
+  const dir = await v150Database(t);
+  // Another process (e.g. an ops script) holds the write lock for half a second while the server starts.
+  const holder = spawn(process.execPath, ['-e', `const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(process.argv[1]); db.exec('BEGIN IMMEDIATE'); console.log('locked');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500); db.exec('COMMIT');`, join(dir, 'requests.sqlite')], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const exited = once(holder, 'exit');
+  await once(holder.stdout, 'data');
+  const app = await start(t, createApp, dir);
+  assert.equal((await (await fetch(app.base + '/healthz')).json()).ready, true);
+  await exited;
 });
 
 test('restarting on an already migrated database changes nothing', async t => {
