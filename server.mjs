@@ -38,6 +38,8 @@ export function alertText(route, details, kind = 'new') {
   const lines = [`${urgent || kind === 'hangup' ? '🚨 ' : ''}${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} · ${phone}`];
   if (details.address) lines.push(details.address);
   lines.push(kind === 'note' ? `Note: ${details.notes.at(-1)}` : issue);
+  if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' · ')}`);
+  if (kind === 'new' && details.job_details) lines.push(`Details: ${details.job_details}`);
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
   // Carrier rules: every business text carries an opt-out line.
   return `${lines.join('\n').slice(0, 280)}\nReply STOP to opt out`;
@@ -207,6 +209,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     details.callback_phone = args.callback_phone || '';
     if (args.preferred_time != null && (typeof args.preferred_time !== 'string' || args.preferred_time.length > 200)) return failure('Invalid preferred time');
     details.preferred_time = (args.preferred_time || '').trim();
+    // Job context from the receptionist's follow-up questions, so the office can plan the day.
+    for (const field of ['job_type', 'job_size', 'job_details']) {
+      if (args[field] != null && (typeof args[field] !== 'string' || args[field].length > 500)) return failure(`Invalid ${field}`);
+      details[field] = (args[field] || '').trim();
+    }
     details.caller_id = callerNumberOf(message);
     details.notes = [];
     details.email = '';
@@ -250,7 +257,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.3.0', ready,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.4.0', ready,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
         sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length

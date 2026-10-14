@@ -119,3 +119,13 @@ test('urgent jobs phone the route owner; routine jobs and tests do not', async t
   await post(toolCall('test-1', 'submit_service_request', { ...intake, is_test: true }));
   assert.equal(sent.filter(s => s.url === 'https://api.vapi.ai/call').length, 1);
 });
+
+test('job type, size and details reach the office alert', async t => {
+  const { post, sent } = await fixture(t);
+  await post(toolCall('call-job', 'submit_service_request', { ...intake, issue: 'Water heater quote',
+    job_type: 'Replacement', job_size: 'Big job (half day+)', job_details: '50-gal gas tank, about 12 years old, leaking at base' }));
+  const text = sent.find(s => s.url.includes('telnyx')).body.text;
+  assert.match(text, /Job: Replacement · Big job \(half day\+\)/);
+  assert.match(text, /Details: 50-gal gas tank, about 12 years old, leaking at base/);
+  assert.match(text, /Reply STOP to opt out$/);
+});
