@@ -14,9 +14,34 @@ export function conversationKey(message) {
   return valid(message.chat?.id) ? `chat:${message.chat.id}` : null;
 }
 
+export function assistantIdOf(message) {
+  return message.call?.assistantId || message.assistant?.id || message.chat?.assistantId || null;
+}
+
+export function callerNumberOf(message) {
+  const number = message.call?.customer?.number || message.customer?.number;
+  return typeof number === 'string' && number.length <= 40 ? number : '';
+}
+
+// Plain-text office alert, kept short enough for two SMS segments.
+export function alertText(route, details, kind = 'new') {
+  const urgent = /^\s*URGENT\b/i.test(details.issue);
+  const head = kind === 'note' ? 'Update' : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
+  const phone = details.callback_phone || (details.caller_id ? `${details.caller_id} (caller ID)` : 'no number given');
+  const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
+  const lines = [`${urgent || kind === 'hangup' ? '🚨 ' : ''}${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} · ${phone}`];
+  if (details.address) lines.push(details.address);
+  lines.push(kind === 'note' ? `Note: ${details.notes.at(-1)}` : issue);
+  return lines.join('\n').slice(0, 300);
+}
+
 export function createApp(env = process.env, send = fetch) {
   const dataDir = env.RAILWAY_VOLUME_MOUNT_PATH || env.DATA_DIR;
   const key = env.VAPI_WEBHOOK_SECRET || '';
+  // ALERT_ROUTES: {"<assistantId>": {"business": "...", "sms": ["+1..."], "email": ["..."], "alertTests": false}}
+  let routes = {};
+  try { routes = JSON.parse(env.ALERT_ROUTES || '{}') || {}; } catch { routes = {}; }
+  const routeFor = message => routes[assistantIdOf(message)] || null;
   let db;
   if (dataDir) {
     mkdirSync(dataDir, { recursive: true });
@@ -47,7 +72,53 @@ export function createApp(env = process.env, send = fetch) {
       return response.ok ? 'accepted' : 'needs_review';
     } catch { return 'needs_review'; }
   }
-  async function submit(callId, args) {
+  // Office alerts for one client route. Returns a status string; never throws.
+  async function alert(route, details, id, kind) {
+    if (!route || (details.is_test && !route.alertTests)) return details.is_test ? 'suppressed_test' : 'not_configured';
+    const text = alertText(route, details, kind);
+    const jobs = [];
+    if (env.TELNYX_API_KEY && env.TELNYX_FROM) {
+      for (const to of route.sms || []) jobs.push(send('https://api.telnyx.com/v2/messages', {
+        method: 'POST', signal: AbortSignal.timeout(8000),
+        headers: { Authorization: `Bearer ${env.TELNYX_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: env.TELNYX_FROM, to, text }) }));
+    }
+    if (env.RESEND_API_KEY && env.EMAIL_FROM && (route.email || []).length) {
+      jobs.push(send('https://api.resend.com/emails', {
+        method: 'POST', signal: AbortSignal.timeout(8000),
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': `${id}-alert-${kind}-${details.notes.length}` },
+        body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: text.split('\n')[0], text: `${text}\n\nRequest reference: ${id}` }) }));
+    }
+    if (!jobs.length) return 'not_configured';
+    const settled = await Promise.allSettled(jobs);
+    return settled.every(s => s.status === 'fulfilled' && s.value.ok) ? 'sent' : 'needs_review';
+  }
+  async function addNote(callId, args, route) {
+    const row = db.prepare('SELECT id, details, result FROM requests WHERE call_id = ?').get(callId);
+    if (!row) return failure('No saved request yet; save the request first');
+    const note = typeof args?.note === 'string' ? args.note.trim() : '';
+    if (!note || note.length > 1000) return failure('Missing or invalid note');
+    const details = JSON.parse(row.details);
+    details.notes = [...(details.notes || []), note].slice(-20);
+    db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
+    return { saved: true, request_id: row.id, note_added: true, office_alert: await alert(route, details, row.id, 'note') };
+  }
+  // Safety net: a phone call that ended without a saved request still reaches the office.
+  async function hangup(callId, message, route) {
+    if (db.prepare('SELECT 1 FROM requests WHERE call_id = ?').get(callId)) return;
+    const callerId = callerNumberOf(message);
+    if (!callerId || !(Number(message.durationSeconds) >= 10)) return;
+    const summary = String(message.analysis?.summary || message.summary || '').trim().slice(0, 1000);
+    const details = { name: 'Unknown caller', address: '', issue: summary ? `Hung up before finishing. Summary: ${summary}` : 'Hung up before giving details',
+      is_test: false, callback_phone: '', caller_id: callerId, email: '', notes: [] };
+    const id = randomUUID();
+    const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
+    const inserted = db.prepare('INSERT OR IGNORE INTO requests VALUES (?, ?, ?, ?, ?)').run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result));
+    if (!inserted.changes) return;
+    result.office_alert = await alert(route, details, id, 'hangup');
+    db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
+  }
+  async function submit(callId, args, message = {}) {
     const old = db.prepare('SELECT result FROM requests WHERE call_id = ?').get(callId);
     if (old) return { ...JSON.parse(old.result), duplicate: true };
     if (!args || typeof args !== 'object' || Array.isArray(args)) return failure('Invalid parameters');
@@ -60,6 +131,8 @@ export function createApp(env = process.env, send = fetch) {
     details.is_test = args.is_test;
     if (args.callback_phone != null && (typeof args.callback_phone !== 'string' || args.callback_phone.length > 100)) return failure('Invalid callback phone');
     details.callback_phone = args.callback_phone || '';
+    details.caller_id = callerNumberOf(message);
+    details.notes = [];
     details.email = '';
     if (args.email_confirmed === true) {
       if (typeof args.email !== 'string' || args.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(args.email)) return failure('Invalid confirmed email');
@@ -71,6 +144,7 @@ export function createApp(env = process.env, send = fetch) {
       anchorline_email: env.OFFICE_EMAIL ? 'pending' : 'not_requested' };
     // Commit before any network operation. One request per Vapi call survives retries/restarts.
     db.prepare('INSERT INTO requests VALUES (?, ?, ?, ?, ?)').run(callId, id, new Date().toISOString(), JSON.stringify(details), JSON.stringify(result));
+    const officeAlert = alert(routeFor(message), details, id, 'new');
     if (details.is_test) {
       result.caller_email = details.email ? 'suppressed_test' : 'not_requested';
       result.anchorline_email = env.OFFICE_EMAIL ? 'suppressed_test' : 'not_requested';
@@ -79,12 +153,13 @@ export function createApp(env = process.env, send = fetch) {
         receipt(details.email, details, id, 'caller'), receipt(env.OFFICE_EMAIL, details, id, 'office')
       ]);
     }
+    result.office_alert = await officeAlert;
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
     return result;
   }
-  function once(callId, args) {
+  function once(callId, args, message) {
     if (inflight.has(callId)) return inflight.get(callId);
-    const task = submit(callId, args).finally(() => inflight.delete(callId));
+    const task = submit(callId, args, message).finally(() => inflight.delete(callId));
     inflight.set(callId, task);
     return task;
   }
@@ -99,9 +174,10 @@ export function createApp(env = process.env, send = fetch) {
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.0.1', ready,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.1.0', ready,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
-        email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL)
+        email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
+        sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), alert_routes: Object.keys(routes).length
       });
     }
     if (path !== '/vapi/webhook') return reply(404, { error: 'Not found' });
@@ -113,12 +189,18 @@ export function createApp(env = process.env, send = fetch) {
       const chunks = [];
       for await (const chunk of req) {
         length += chunk.length;
-        if (length > 262144) { reply(413, { error: 'Payload too large' }); return; }
+        // End-of-call reports carry the transcript, so allow more than tool calls need.
+        if (length > 2097152) { reply(413, { error: 'Payload too large' }); return; }
         chunks.push(chunk);
       }
       let body;
       try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { return reply(400, { error: 'Invalid JSON' }); }
       const message = body?.message;
+      if (message?.type === 'end-of-call-report') {
+        const callId = conversationKey(message);
+        if (callId && message.call) await hangup(callId, message, routeFor(message));
+        return reply(200, {});
+      }
       if (message?.type !== 'tool-calls') return reply(200, {});
       const calls = message.toolCallList ?? (Array.isArray(message.toolWithToolCallList)
         ? message.toolWithToolCallList.map(item => ({ ...item?.toolCall, name: item?.name })) : null);
@@ -127,13 +209,21 @@ export function createApp(env = process.env, send = fetch) {
       for (const tool of calls) {
         let result;
         const callId = conversationKey(message);
+        const name = tool.function?.name || tool.name;
         if (!callId) result = failure('Missing Vapi call, chat or session ID');
-        else if ((tool.function?.name || tool.name) !== 'submit_service_request') result = failure('Unknown tool');
+        else if (name === 'add_request_note') {
+          try {
+            let args = tool.function?.arguments ?? tool.parameters;
+            if (typeof args === 'string') args = JSON.parse(args);
+            result = await addNote(callId, args, routeFor(message));
+          } catch { result = failure('Unable to add note'); }
+        }
+        else if (name !== 'submit_service_request') result = failure('Unknown tool');
         else {
           try {
             let args = tool.function?.arguments ?? tool.parameters;
             if (typeof args === 'string') args = JSON.parse(args);
-            result = await once(callId, args);
+            result = await once(callId, args, message);
           } catch {
             // Never claim a save failed if SQLite already persisted it before an error.
             const saved = db.prepare('SELECT result FROM requests WHERE call_id = ?').get(callId);

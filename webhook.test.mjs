@@ -40,7 +40,7 @@ test('Vapi alternate envelope returns a correlated result and suppresses test re
 test('invalid JSON, oversized requests and malformed tool lists are rejected', async t => {
   const post = await fixture(t);
   assert.equal((await post('{')).status, 400);
-  assert.equal((await post(' '.repeat(262145))).status, 413);
+  assert.equal((await post(' '.repeat(2097153))).status, 413);
   for (const list of [[], {}, [{ id: '' }]]) {
     assert.equal((await post({ message: { type: 'tool-calls', toolCallList: list } })).status, 400);
   }

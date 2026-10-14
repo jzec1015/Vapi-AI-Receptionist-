@@ -25,6 +25,15 @@ Test calls (is_test:true) are saved but never send email. Provider acceptance do
 If a process stops during email delivery, status may remain pending; inspect before manually retrying to avoid duplicates.
 Past Base44 records are not automatically migrated.
 
+## Client alerts (v1.1)
+
+Each client assistant gets its own alert route, so demo and test lines never alert a client. Set ALERT_ROUTES in Railway as JSON keyed by Vapi assistant ID:
+`{"<assistantId>": {"business": "Maple Plumbing", "sms": ["+1..."], "email": ["office@..."], "alertTests": false}}`
+SMS uses TELNYX_API_KEY and TELNYX_FROM (a 10DLC-registered Telnyx number). Email alerts use RESEND_API_KEY and EMAIL_FROM.
+Requests starting with "URGENT -" are flagged in the alert. The caller ID is stored and used when no callback number was given.
+The add_request_note tool appends a note to the saved request and sends an update alert.
+To catch callers who hang up before a request is saved, set the assistant Server URL to this webhook with the x-anchorline-key header and enable the end-of-call-report server message. Calls of 10 seconds or more with a caller ID become a "Caller hung up" request.
+
 ## Verification
 
 Run `npm test`. `/healthz` checks process/database health, `/readyz` checks storage and webhook authentication configuration. Neither endpoint reveals records or credentials.
