@@ -23,11 +23,17 @@ export function callerNumberOf(message) {
   return typeof number === 'string' && number.length <= 40 ? number : '';
 }
 
+// US numbers read as (615) 555-0142; anything else is shown as given.
+export function formatPhone(value) {
+  const digits = String(value || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+  return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : String(value || '');
+}
+
 // Plain-text office alert, kept short enough for two SMS segments.
 export function alertText(route, details, kind = 'new') {
   const urgent = /^\s*URGENT\b/i.test(details.issue);
   const head = kind === 'note' ? 'Update' : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
-  const phone = details.callback_phone || (details.caller_id ? `${details.caller_id} (caller ID)` : 'no number given');
+  const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
   const lines = [`${urgent || kind === 'hangup' ? '🚨 ' : ''}${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} · ${phone}`];
   if (details.address) lines.push(details.address);
@@ -39,7 +45,7 @@ export function alertText(route, details, kind = 'new') {
 // Customer confirmation: what we received, never a promised appointment time.
 export function confirmationEmail(route, details, id) {
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
-  const phone = details.callback_phone || details.caller_id || 'The number you called from';
+  const phone = formatPhone(details.callback_phone || details.caller_id) || 'The number you called from';
   const when = details.preferred_time ? `${details.preferred_time} (the team will call to confirm)` : 'The team will call you to set a time';
   return {
     subject: `${route.business}: we received your request`,

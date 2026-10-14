@@ -32,7 +32,7 @@ test('a saved request texts and emails only that client route', async t => {
   const sms = sent.filter(s => s.url.includes('telnyx'));
   assert.equal(sms.length, 1); assert.equal(sms[0].body.to, '+15550000001');
   assert.match(sms[0].body.text, /^🚨 URGENT call - Gold Star Plumbing/);
-  assert.match(sms[0].body.text, /6155550142/);
+  assert.match(sms[0].body.text, /\(615\) 555-0142/);
   assert.equal(sent.filter(s => s.url.includes('resend')).length, 1);
   const other = await result(await post(toolCall('call-2', 'submit_service_request', intake, { assistantId: 'demo-line' })));
   assert.equal(other.office_alert, 'not_configured'); assert.equal(sent.length, 2);
@@ -47,7 +47,7 @@ test('test calls never alert a client unless the route opts in', async t => {
 test('caller ID backs up a missing callback number', async t => {
   const { post, sent } = await fixture(t);
   await post(toolCall('call-3', 'submit_service_request', { ...intake, callback_phone: '' }));
-  assert.match(sent[0].body.text, /\+16155550100 \(caller ID\)/);
+  assert.match(sent[0].body.text, /\(615\) 555-0100 \(caller ID\)/);
 });
 
 test('notes append to the saved request and send an update', async t => {
@@ -66,7 +66,7 @@ test('a hang-up before saving still reaches the office once', async t => {
   assert.equal((await post(report('hang-1', 45))).status, 200);
   await post(report('hang-1', 45));
   const sms = sent.filter(s => s.url.includes('telnyx'));
-  assert.equal(sms.length, 1); assert.match(sms[0].body.text, /^🚨 Caller hung up - Gold Star Plumbing[\s\S]*\+16155550100 \(caller ID\)[\s\S]*leak/);
+  assert.equal(sms.length, 1); assert.match(sms[0].body.text, /^🚨 Caller hung up - Gold Star Plumbing[\s\S]*\(615\) 555-0100 \(caller ID\)[\s\S]*leak/);
   await post(report('hang-short', 4));
   await post(toolCall('saved-call', 'submit_service_request', intake));
   const before = sent.length;
@@ -88,7 +88,7 @@ test('a confirmed caller email gets a branded confirmation without promising a t
   assert.equal(mail.from, 'Gold Star Plumbing <alerts@example.com>');
   assert.equal(mail.subject, 'Gold Star Plumbing: we received your request');
   assert.deepEqual(mail.reply_to, ['office@example.com']);
-  for (const part of ['Hi Linda Harper', 'Phone: 6155550142', 'Service address: 48 Birch Road', 'Issue: water under kitchen sink',
+  for (const part of ['Hi Linda Harper', 'Phone: (615) 555-0142', 'Service address: 48 Birch Road', 'Issue: water under kitchen sink',
     'Requested time: Thursday morning (the team will call to confirm)']) assert.ok(mail.text.includes(part), part);
   assert.doesNotMatch(mail.text, /URGENT/);
 });
