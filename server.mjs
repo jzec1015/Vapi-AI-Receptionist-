@@ -25,6 +25,7 @@ export function callerNumberOf(message) {
 }
 
 const digitsOf = value => String(value || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+const jsonList = value => { try { const list = JSON.parse(value || '[]'); return Array.isArray(list) ? list.filter(v => typeof v === 'string' && v) : []; } catch { return []; } };
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Why a request is test traffic, or null for a live request. Test requests are stored but
@@ -156,7 +157,10 @@ export function createApp(env = process.env, send = fetch) {
   // until the transfer is not answered, and is placed anyway after TRANSFER_FALLBACK_SECONDS unless the caller was connected.
   let routes = {};
   try { routes = JSON.parse(env.ALERT_ROUTES || '{}') || {}; } catch { routes = {}; }
-  const routeFor = message => routes[assistantIdOf(message)] || null;
+  // The route for an assistant: an ALERT_ROUTES entry wins; otherwise an active trial client row (SMS stays off
+  // until the 10DLC campaign covers trial clients). Every route lookup goes through here.
+  const routeOf = assistantId => routes[assistantId] || clientRoute(assistantId);
+  const routeFor = message => routeOf(assistantIdOf(message));
   const fallbackMs = Math.max(0, Number(env.TRANSFER_FALLBACK_SECONDS ?? 75) || 0) * 1000;
   const canTransfer = (route, details) => !!route && isE164(route.transfer) && /^\s*URGENT\b/i.test(details.issue) && (!details.is_test || !!route.alertTests);
   let db;
@@ -171,7 +175,18 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS transfers (
         call_id TEXT PRIMARY KEY, assistant_id TEXT, status TEXT NOT NULL, due_at INTEGER NOT NULL, updated_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS clients (
+        id TEXT PRIMARY KEY, assistant_id TEXT UNIQUE, phone_number_id TEXT, phone_number TEXT,
+        business TEXT NOT NULL, owner_name TEXT NOT NULL, owner_cell TEXT NOT NULL,
+        office_emails TEXT NOT NULL DEFAULT '[]', alert_call TEXT NOT NULL DEFAULT '[]', transfer TEXT, shop_number TEXT NOT NULL, state TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_verification' CHECK (status IN ('pending_verification', 'provisioning', 'active', 'ended')),
+        trial_ends_at TEXT, minute_cap INTEGER NOT NULL DEFAULT 300, minutes_used REAL NOT NULL DEFAULT 0, cap_alerted_at TEXT,
+        created_at TEXT NOT NULL, verified_at TEXT, verify_token_hash TEXT, verify_token_expires_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS client_calls (call_id TEXT PRIMARY KEY, client_id TEXT NOT NULL, minutes REAL NOT NULL, created_at TEXT NOT NULL);`);
+    // v1.7: trial clients live in their own new tables (above). v1.6.0 and v1.5.0 never read them, so a rollback
+    // ignores them and a later roll-forward finds them as they were.
     // v1.6: queryable assistant and test columns, so live data can be filtered and test rows purged safely.
     // They are VIRTUAL generated columns read from the details JSON, so the table still takes 5 values and a
     // rollback to v1.5.0 (which inserts with VALUES (?, ?, ?, ?, ?)) keeps saving requests. One transaction:
@@ -205,6 +220,35 @@ export function createApp(env = process.env, send = fetch) {
     get: callId => { const row = db?.prepare('SELECT result FROM bookings WHERE call_id = ?').get(callId); return row ? JSON.parse(row.result) : undefined; },
     set: (callId, result) => db?.prepare('INSERT OR IGNORE INTO bookings VALUES (?, ?, ?)').run(callId, new Date().toISOString(), JSON.stringify(result))
   });
+  const clientRow = assistantId => (db && assistantId ? db.prepare('SELECT * FROM clients WHERE assistant_id = ?').get(assistantId) : null) || null;
+  function clientRoute(assistantId) {
+    const row = clientRow(assistantId);
+    if (!row || row.status !== 'active') return null;
+    return { business: row.business, sms: [], email: jsonList(row.office_emails), call: jsonList(row.alert_call), transfer: row.transfer || undefined };
+  }
+  // Trial minutes: one usage row per call (Vapi may resend a report), added to the client's total in one transaction.
+  // The first report that takes minutes_used to the cap emails Anchorline once. Calls are never refused.
+  async function trackMinutes(callId, message) {
+    const client = clientRow(assistantIdOf(message));
+    if (!client) return '';
+    const seconds = Number(message.durationSeconds ?? message.call?.durationSeconds) || Number(message.durationMinutes) * 60 || 0;
+    const minutes = Math.max(0, seconds) / 60;
+    db.exec('BEGIN IMMEDIATE');
+    let crossed = false;
+    try {
+      const fresh = db.prepare('INSERT OR IGNORE INTO client_calls VALUES (?, ?, ?, ?)').run(callId, client.id, minutes, new Date().toISOString()).changes === 1;
+      if (fresh) db.prepare('UPDATE clients SET minutes_used = minutes_used + ? WHERE id = ?').run(minutes, client.id);
+      crossed = db.prepare('UPDATE clients SET cap_alerted_at = ? WHERE id = ? AND cap_alerted_at IS NULL AND minutes_used >= minute_cap')
+        .run(new Date().toISOString(), client.id).changes === 1;
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    const used = db.prepare('SELECT minutes_used, minute_cap FROM clients WHERE id = ?').get(client.id);
+    const capAlert = crossed ? ` cap_alert=${await officeNotice(`Trial over minute cap: ${client.business}`,
+      `${client.business} has used ${used.minutes_used.toFixed(1)} of ${used.minute_cap} trial minutes. Emma keeps answering.\n\n` +
+      `Client: ${client.id}\nOwner: ${client.owner_name} ${client.owner_cell}\nAssistant: ${client.assistant_id}\nTrial ends: ${client.trial_ends_at || 'not set'}`,
+      `${client.id}-minute-cap`)}` : '';
+    return ` minutes=${used.minutes_used.toFixed(1)}/${used.minute_cap}${capAlert}`;
+  }
   const savedRequest = callId => {
     const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
     return row ? { ...JSON.parse(row.details), request_id: row.id } : null;
@@ -236,6 +280,18 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         body: JSON.stringify({ from: branded ? `${route.business} <${env.EMAIL_FROM}>` : env.EMAIL_FROM, to: [to], ...message,
           ...(branded && route.email?.length ? { reply_to: route.email } : {}) })
       });
+      return response.ok ? 'accepted' : 'needs_review';
+    } catch { return 'needs_review'; }
+  }
+  // Operational email to Anchorline (OFFICE_EMAIL), same Resend path as the request receipts.
+  async function officeNotice(subject, text, idempotencyKey) {
+    if (!env.OFFICE_EMAIL) return 'not_requested';
+    if (!env.RESEND_API_KEY || !env.EMAIL_FROM) return 'needs_review';
+    try {
+      const response = await send('https://api.resend.com/emails', {
+        method: 'POST', signal: AbortSignal.timeout(8000),
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify({ from: env.EMAIL_FROM, to: [env.OFFICE_EMAIL], subject, text }) });
       return response.ok ? 'accepted' : 'needs_review';
     } catch { return 'needs_review'; }
   }
@@ -292,7 +348,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (!setTransfer(callId, 'alerting', ['pending', 'dialing'])) return transferRow(callId)?.status || 'no_transfer';
     const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
     const assistantId = db.prepare('SELECT assistant_id FROM transfers WHERE call_id = ?').get(callId)?.assistant_id;
-    const route = routes[assistantId];
+    const route = routeOf(assistantId);
     const outcome = row && route ? await settle(phoneAlerts(route, JSON.parse(row.details), true)) : 'not_configured';
     setTransfer(callId, 'alerted', ['alerting']);
     console.log(`transfer call=${callId} outcome=alert_${outcome} reason=${reason}`);
@@ -501,8 +557,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
           const forwarded = (message.endedReason ?? message.call?.endedReason) === 'assistant-forwarded-call';
           transfer = forwarded && setTransfer(callId, 'connected', ['pending', 'dialing']) ? ' transfer=connected' : ` transfer=alert_${await releaseAlert(callId, 'call_ended')}`;
         }
+        // Trial clients: count the call's minutes. A failure here never changes the reply to Vapi.
+        let usage = '';
+        if (callId && message.call) try { usage = await trackMinutes(callId, message); } catch { usage = ' minutes=error'; }
         // Operational log only: outcome and IDs, never caller details.
-        console.log(`end-of-call-report call=${callId} assistant=${assistantIdOf(message)} outcome=${outcome}${transfer}`);
+        console.log(`end-of-call-report call=${callId} assistant=${assistantIdOf(message)} outcome=${outcome}${transfer}${usage}`);
         return reply(200, {});
       }
       if (message?.type === 'transfer-destination-request') {
