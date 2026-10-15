@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { createBooking } from './booking.mjs';
+import { createTrials, migrateClients } from './trial.mjs';
 
 export function conversationKey(message) {
   const valid = value => typeof value === 'string' && value.length > 0 && value.length <= 200;
@@ -175,18 +176,10 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS transfers (
         call_id TEXT PRIMARY KEY, assistant_id TEXT, status TEXT NOT NULL, due_at INTEGER NOT NULL, updated_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS clients (
-        id TEXT PRIMARY KEY, assistant_id TEXT UNIQUE, phone_number_id TEXT, phone_number TEXT,
-        business TEXT NOT NULL, owner_name TEXT NOT NULL, owner_cell TEXT NOT NULL,
-        office_emails TEXT NOT NULL DEFAULT '[]', alert_call TEXT NOT NULL DEFAULT '[]', transfer TEXT, shop_number TEXT NOT NULL, state TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending_verification' CHECK (status IN ('pending_verification', 'provisioning', 'active', 'ended')),
-        trial_ends_at TEXT, minute_cap INTEGER NOT NULL DEFAULT 300, minutes_used REAL NOT NULL DEFAULT 0, cap_alerted_at TEXT,
-        created_at TEXT NOT NULL, verified_at TEXT, verify_token_hash TEXT, verify_token_expires_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS client_calls (call_id TEXT PRIMARY KEY, client_id TEXT NOT NULL, minutes REAL NOT NULL, created_at TEXT NOT NULL);`);
-    // v1.7: trial clients live in their own new tables (above). v1.6.0 and v1.5.0 never read them, so a rollback
-    // ignores them and a later roll-forward finds them as they were.
+      CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);`);
+    // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
+    // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
+    migrateClients(db);
     // v1.6: queryable assistant and test columns, so live data can be filtered and test rows purged safely.
     // They are VIRTUAL generated columns read from the details JSON, so the table still takes 5 values and a
     // rollback to v1.5.0 (which inserts with VALUES (?, ?, ?, ?, ?)) keeps saving requests. One transaction:
@@ -231,12 +224,16 @@ export function createApp(env = process.env, send = fetch) {
   async function trackMinutes(callId, message) {
     const client = clientRow(assistantIdOf(message));
     if (!client) return '';
+    // Test calls (TEST_* lists, or the owner calling from their own cell) still use minutes but are left out of results emails.
+    const callerId = callerNumberOf(message);
+    const isTest = !!testReason(env, { callId, assistantId: client.assistant_id, callerId }) || (!!callerId && digitsOf(callerId) === digitsOf(client.owner_cell));
     const seconds = Number(message.durationSeconds ?? message.call?.durationSeconds) || Number(message.durationMinutes) * 60 || 0;
     const minutes = Math.max(0, seconds) / 60;
     db.exec('BEGIN IMMEDIATE');
     let crossed = false;
     try {
-      const fresh = db.prepare('INSERT OR IGNORE INTO client_calls VALUES (?, ?, ?, ?)').run(callId, client.id, minutes, new Date().toISOString()).changes === 1;
+      const fresh = db.prepare('INSERT OR IGNORE INTO client_calls (call_id, client_id, minutes, created_at, is_test) VALUES (?, ?, ?, ?, ?)')
+        .run(callId, client.id, minutes, new Date().toISOString(), isTest ? 1 : 0).changes === 1;
       if (fresh) db.prepare('UPDATE clients SET minutes_used = minutes_used + ? WHERE id = ?').run(minutes, client.id);
       crossed = db.prepare('UPDATE clients SET cap_alerted_at = ? WHERE id = ? AND cap_alerted_at IS NULL AND minutes_used >= minute_cap')
         .run(new Date().toISOString(), client.id).changes === 1;
@@ -259,6 +256,8 @@ export function createApp(env = process.env, send = fetch) {
     return expected.length >= 32 && supplied.length === expected.length && timingSafeEqual(supplied, expected);
   };
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
+  // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
+  const trials = createTrials({ env, send, db, key, officeNotice, testReason });
   const inflight = new Map();
   async function receipt(to, details, id, recipient, route = null) {
     if (!to) return 'not_requested';
@@ -532,6 +531,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       const test = groups.filter(g => g.is_test).reduce((sum, g) => sum + g.n, 0);
       return reply(200, { total, live: total - test, test, by_assistant: groups.map(g => ({ ...g, is_test: !!g.is_test })) });
     }
+    if (path.startsWith('/trial/') || path === '/admin/trials' || path.startsWith('/admin/trials/')) {
+      try { if (await trials.handle(req, res)) return; } catch (error) {
+        console.warn(`trial route failed: ${error?.name || 'Error'}`);
+        if (!res.headersSent) return reply(500, { error: 'Request failed' });
+        return res.end();
+      }
+    }
     if (path !== '/vapi/webhook') return reply(404, { error: 'Not found' });
     if (req.method !== 'POST') return reply(405, { error: 'POST required' });
     if (!db || key.length < 32) return reply(503, failure('Webhook not configured'));
@@ -560,6 +566,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         // Trial clients: count the call's minutes. A failure here never changes the reply to Vapi.
         let usage = '';
         if (callId && message.call) try { usage = await trackMinutes(callId, message); } catch { usage = ' minutes=error'; }
+        if (callId && message.call) try { usage += trials.callEnded(callId, message, callerNumberOf(message)); } catch { usage += ' forwarding=error'; }
         // Operational log only: outcome and IDs, never caller details.
         console.log(`end-of-call-report call=${callId} assistant=${assistantIdOf(message)} outcome=${outcome}${transfer}${usage}`);
         return reply(200, {});
@@ -567,6 +574,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       if (message?.type === 'transfer-destination-request') {
         const answer = transferRequest(message);
         console.log(`transfer-destination-request call=${conversationKey(message)} assistant=${assistantIdOf(message)} outcome=${answer.error ? 'refused' : 'dialing'}`);
+        return reply(200, answer);
+      }
+      // A trial number with no assistant (trial ended): ring the shop's own line. Unknown numbers get {} (fallbackDestination).
+      if (message?.type === 'assistant-request') {
+        let answer = {};
+        try { answer = trials.assistantRequest(message); } catch { answer = {}; }
+        console.log(`assistant-request outcome=${answer.destination ? 'shop' : answer.assistantId ? 'assistant' : 'fallback'}`);
         return reply(200, answer);
       }
       if (message?.type === 'transfer-update') {
@@ -629,8 +643,14 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   // Held urgent alerts are checked every few seconds, and again after a restart (rows live in SQLite).
   const sweeper = db ? setInterval(() => sweepTransfers().catch(() => {}), 5000) : null;
   sweeper?.unref();
+  // Trials: hourly (results emails, trial end, stuck provisioning), and once a minute after startup.
+  const trialSweep = () => trials.sweep().catch(() => console.warn('trial sweep failed'));
+  const trialSweeper = db ? setInterval(trialSweep, 3600000) : null;
+  const trialStart = db ? setTimeout(trialSweep, 60000) : null;
+  trialSweeper?.unref(); trialStart?.unref();
   server.sweepTransfers = sweepTransfers;
-  server.on('close', () => { clearInterval(sweeper); db?.close(); });
+  server.trials = trials;
+  server.on('close', () => { clearInterval(sweeper); clearInterval(trialSweeper); clearTimeout(trialStart); db?.close(); });
   return server;
 }
 
