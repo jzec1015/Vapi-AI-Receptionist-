@@ -356,7 +356,7 @@ test('a failed trial migration turns trials off but Gold Star keeps working', as
   const routes = JSON.stringify({ 'gold-star': { business: 'Gold Star Plumbing', email: ['owner@example.com'] } });
   const { base, signup } = await fixture(t, { ALERT_ROUTES: routes }, dir);
   const health = await (await fetch(`${base}/healthz`)).json();
-  assert.equal(health.status, 'ok'); assert.equal(health.trials_enabled, false);
+  assert.equal(health.status, 'ok'); assert.equal(health.trials_enabled, false); assert.equal(health.version, '1.7.0');
   assert.equal((await signup(form())).status, 503);
   const saved = await fetch(`${base}/vapi/webhook`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': key },
     body: JSON.stringify({ message: { type: 'tool-calls', call: { id: 'g-1', assistantId: 'gold-star', customer: { number: '+16155550100' } },
