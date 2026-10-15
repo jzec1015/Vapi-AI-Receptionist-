@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { createBooking } from './booking.mjs';
-import { createTrials, migrateClients } from './trial.mjs';
+import { createTrials, migrateClients, inService } from './trial.mjs';
 
 export function conversationKey(message) {
   const valid = value => typeof value === 'string' && value.length > 0 && value.length <= 200;
@@ -165,6 +165,7 @@ export function createApp(env = process.env, send = fetch) {
   const fallbackMs = Math.max(0, Number(env.TRANSFER_FALLBACK_SECONDS ?? 75) || 0) * 1000;
   const canTransfer = (route, details) => !!route && isE164(route.transfer) && /^\s*URGENT\b/i.test(details.issue) && (!details.is_test || !!route.alertTests);
   let db;
+  let trialsEnabled = false;
   if (dataDir) {
     mkdirSync(dataDir, { recursive: true });
     db = new DatabaseSync(join(dataDir, 'requests.sqlite'));
@@ -179,7 +180,8 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);`);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
     // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
-    migrateClients(db);
+    // A failed trial migration switches trials off (healthz trials_enabled: false) but never stops the server.
+    try { migrateClients(db); trialsEnabled = true; } catch (error) { console.warn(`trial migration failed, trials disabled: ${error?.message || 'error'}`); }
     // v1.6: queryable assistant and test columns, so live data can be filtered and test rows purged safely.
     // They are VIRTUAL generated columns read from the details JSON, so the table still takes 5 values and a
     // rollback to v1.5.0 (which inserts with VALUES (?, ?, ?, ?, ?)) keeps saving requests. One transaction:
@@ -213,10 +215,11 @@ export function createApp(env = process.env, send = fetch) {
     get: callId => { const row = db?.prepare('SELECT result FROM bookings WHERE call_id = ?').get(callId); return row ? JSON.parse(row.result) : undefined; },
     set: (callId, result) => db?.prepare('INSERT OR IGNORE INTO bookings VALUES (?, ?, ?)').run(callId, new Date().toISOString(), JSON.stringify(result))
   });
-  const clientRow = assistantId => (db && assistantId ? db.prepare('SELECT * FROM clients WHERE assistant_id = ?').get(assistantId) : null) || null;
+  const clientRow = assistantId => (db && trialsEnabled && assistantId ? db.prepare('SELECT * FROM clients WHERE assistant_id = ?').get(assistantId) : null) || null;
+  // Active trials, and ended trials in their grace period (Emma keeps answering and emailing the office).
   function clientRoute(assistantId) {
     const row = clientRow(assistantId);
-    if (!row || row.status !== 'active') return null;
+    if (!inService(row)) return null;
     return { business: row.business, sms: [], email: jsonList(row.office_emails), call: jsonList(row.alert_call), transfer: row.transfer || undefined };
   }
   // Trial minutes: one usage row per call (Vapi may resend a report), added to the client's total in one transaction.
@@ -244,7 +247,9 @@ export function createApp(env = process.env, send = fetch) {
       `${client.business} has used ${used.minutes_used.toFixed(1)} of ${used.minute_cap} trial minutes. Emma keeps answering.\n\n` +
       `Client: ${client.id}\nOwner: ${client.owner_name} ${client.owner_cell}\nAssistant: ${client.assistant_id}\nTrial ends: ${client.trial_ends_at || 'not set'}`,
       `${client.id}-minute-cap`)}` : '';
-    return ` minutes=${used.minutes_used.toFixed(1)}/${used.minute_cap}${capAlert}`;
+    // Twice the cap ends the trial at once (no grace period).
+    const usageEnd = await trials.usageCheck(client.id);
+    return ` minutes=${used.minutes_used.toFixed(1)}/${used.minute_cap}${capAlert}${usageEnd}`;
   }
   const savedRequest = callId => {
     const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
@@ -257,7 +262,7 @@ export function createApp(env = process.env, send = fetch) {
   };
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
-  const trials = createTrials({ env, send, db, key, officeNotice, testReason });
+  const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   const inflight = new Map();
   async function receipt(to, details, id, recipient, route = null) {
     if (!to) return 'not_requested';
@@ -513,7 +518,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.6.0', ready,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.6.0', ready, trials_enabled: trialsEnabled,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
         sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length, booking_routes: booking.routeCount,
@@ -645,8 +650,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   sweeper?.unref();
   // Trials: hourly (results emails, trial end, stuck provisioning), and once a minute after startup.
   const trialSweep = () => trials.sweep().catch(() => console.warn('trial sweep failed'));
-  const trialSweeper = db ? setInterval(trialSweep, 3600000) : null;
-  const trialStart = db ? setTimeout(trialSweep, 60000) : null;
+  const trialSweeper = trialsEnabled ? setInterval(trialSweep, 3600000) : null;
+  const trialStart = trialsEnabled ? setTimeout(trialSweep, 60000) : null;
   trialSweeper?.unref(); trialStart?.unref();
   server.sweepTransfers = sweepTransfers;
   server.trials = trials;
