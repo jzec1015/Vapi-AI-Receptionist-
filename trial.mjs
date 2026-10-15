@@ -40,24 +40,35 @@ const FIELDS = {
   never_say: { max: 500, optional: true }, hours: { max: 200, optional: true }
 };
 const KNOWN = new Set(['business', ...Object.keys(FIELDS), 'owner_cell', 'office_email', 'shop_number', 'state', 'sms_consent', 'terms_accepted', 'website']);
-const ABBREVIATIONS = new Set(['co', 'inc', 'llc', 'ltd', 'corp', 'bros', 'jr', 'sr', 'st', 'mt', 'ft']);
+const ABBREVIATIONS = new Set(['mr', 'mrs', 'ms', 'dr', 'st', 'jr', 'sr', 'co', 'inc', 'llc', 'ltd', 'corp', 'bros', 'mt', 'ft']);
+const COMPANY = new Set(['inc', 'llc', 'ltd', 'corp', 'co']);
 
 // The business name is spoken in the first message and sits in the trusted first line of the prompt, so it is held
-// to a business-name shape: letters, digits, spaces, & ' - and a period only to end an abbreviation (Co., Inc.).
-// No sentence punctuation, URLs, @, digits-only names or more than 8 words. Returns an error or null.
+// to a business-name shape: letters, digits, spaces, & ' and joining hyphens (A-1, Mid-Tn); a period only on an
+// initial (B., J.R.) or an abbreviation (Mr., Dr., St., Co., Inc.); a comma only right before Inc/LLC/Ltd/Corp/Co.
+// No sentence punctuation (! ? : ; or a free-standing dash), URLs, @, digits-only names or more than 8 words.
+// Returns an error or null.
 export function businessError(text) {
   if (text.length < 2 || text.length > 60) return 'Must be 2-60 characters';
-  if (!/^[\p{L}\p{M}\p{N} &'.-]+$/u.test(text)) return "Use only letters, numbers, spaces and & ' - .";
+  if (!/^[\p{L}\p{M}\p{N} &'.,-]+$/u.test(text)) return "Use only letters, numbers, spaces and & ' - . ,";
   if (!/\p{L}/u.test(text)) return 'Must contain letters';
   const words = text.split(/\s+/);
   if (words.length > 8) return 'Use at most 8 words';
-  for (const word of words) {
-    if (/^(https?|www)\b/i.test(word)) return 'No web addresses';
-    if (word.includes('.') && !(/^[\p{L}]+\.$/u.test(word) && ABBREVIATIONS.has(word.slice(0, -1).toLowerCase())))
-      return 'A period is only allowed to end an abbreviation like Co. or Inc.';
+  for (const [i, raw] of words.entries()) {
+    if (/^(https?|www)\b/i.test(raw)) return 'No web addresses';
+    const comma = raw.endsWith(',');
+    const word = comma ? raw.slice(0, -1) : raw;
+    if (word.includes(',') || (comma && !COMPANY.has(String(words[i + 1] || '').replace(/\.$/, '').toLowerCase())))
+      return 'A comma is only allowed before Inc, LLC, Ltd, Corp or Co';
+    if (!word || /^-|-$/.test(word)) return 'A hyphen must join two parts of a word';
+    if (word.includes('.') && !/^(\p{L}\.)+$/u.test(word) && !(/^\p{L}+\.$/u.test(word) && ABBREVIATIONS.has(word.slice(0, -1).toLowerCase())))
+      return 'A period is only allowed on an initial or an abbreviation like Co. or Inc.';
   }
   return null;
 }
+// Two keys match when one contains the other as whole words (so "gold star services" matches "gold star").
+// Keys under 4 characters only match exactly.
+export const similarKeys = (a, b) => !!a && !!b && (a === b || (Math.min(a.length, b.length) >= 4 && (` ${a} `.includes(` ${b} `) || ` ${b} `.includes(` ${a} `))));
 // For duplicate / impersonation checks: "Gold Star Plumbing, LLC" and "gold-star" compare equal.
 export const businessKey = name => String(name || '').normalize('NFKD').replace(/[\u0300-\u036F]/g, '').toLowerCase()
   .replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(w => w && !['llc', 'inc', 'co', 'plumbing'].includes(w)).join(' ');
@@ -145,8 +156,10 @@ export function assistantConfig(client, { serverUrl, secret }) {
   return { ...config, name: vapiName(client.business), metadata: { anchorline_client_id: client.id, anchorline_trial: true } };
 }
 // Emma (an active trial, or an ended one in its grace period) still answers calls and emails the office.
-export const inService = (c, now = Date.now()) => !!c && !c.released_at &&
-  (c.status === 'active' || (c.status === 'ended' && !!c.grace_ends_at && Date.parse(c.grace_ends_at) > now));
+// After the grace period ends Emma keeps answering until the release has actually happened (released_at), so a
+// slow or failed release never leaves callers without office alerts.
+export const inService = c => !!c && !c.released_at && (c.status === 'active' || (c.status === 'ended' && !!c.grace_ends_at));
+const inGrace = (c, now) => inService(c) && c.status === 'ended' && Date.parse(c.grace_ends_at) > now;
 
 // ---------- schema ----------
 const CLIENT_COLUMNS = `
@@ -166,7 +179,8 @@ const ADDED_COLUMNS = ['signup_email TEXT', 'city TEXT', 'services TEXT', 'not_o
   'provision_error TEXT', 'provision_error_notified_at TEXT', 'provision_attempts INTEGER NOT NULL DEFAULT 0', 'review_notified_at TEXT',
   'lease_owner TEXT', 'lease_expires_at TEXT', 'live_notified_at TEXT', 'day1_sent_at TEXT', 'day7_sent_at TEXT', 'day12_sent_at TEXT',
   'ended_at TEXT', 'end_reason TEXT', 'grace_ends_at TEXT', 'end_notified_at TEXT', 'grace3_sent_at TEXT', 'grace7_sent_at TEXT', 'grace12_sent_at TEXT',
-  'vapi_number_deleted_at TEXT', 'telnyx_released_at TEXT', 'assistant_deleted_at TEXT', 'released_at TEXT', 'final_notified_at TEXT', 'release_error TEXT'];
+  'vapi_number_deleted_at TEXT', 'telnyx_released_at TEXT', 'assistant_deleted_at TEXT', 'released_at TEXT', 'final_notified_at TEXT', 'release_error TEXT',
+  'release_attempts INTEGER NOT NULL DEFAULT 0', 'manual_release_notified_at TEXT'];
 
 // Creates or upgrades the trial tables in one transaction. The step-1 clients table had no 'waitlisted' status;
 // SQLite cannot change a CHECK in place, so that table is rebuilt (copy, drop, rename) inside the transaction and a
@@ -232,6 +246,10 @@ export function createTrials({ env, send, db, key, officeNotice, testReason, rou
   const pollMs = Math.max(0, Number(env.TRIAL_POLL_MS ?? 3000) || 0);
   const pollTries = Math.max(1, Number(env.TRIAL_POLL_TRIES ?? 5) || 1);
   const instance = randomUUID();
+  let capNoticeDay = '';
+  let credentialCache = '';
+  let connectionCache = '';
+  const background = new Set();
   const webhookUrl = () => `${base}/vapi/webhook`;
   const log = text => console.log(`trial ${text}`);
   const row = id => db.prepare('SELECT * FROM clients WHERE id = ?').get(id) || null;
@@ -306,9 +324,9 @@ Anchorline AI`, `${c.id}-waitlisted`);
   function lookalike(business) {
     const keyOf = businessKey(business);
     if (!keyOf) return 'generic business name';
-    if (Object.values(routes).some(r => r && businessKey(r.business) === keyOf)) return 'matches an Anchorline client';
+    if (Object.values(routes).some(r => r && similarKeys(businessKey(r.business), keyOf))) return 'matches an Anchorline client';
     const others = db.prepare("SELECT business FROM clients WHERE status <> 'ended'").all();
-    return others.some(o => businessKey(o.business) === keyOf) ? 'matches an existing trial' : null;
+    return others.some(o => similarKeys(businessKey(o.business), keyOf)) ? 'matches an existing trial' : null;
   }
 
   async function signup(input, ipHash, now = Date.now()) {
@@ -320,8 +338,17 @@ Anchorline AI`, `${c.id}-waitlisted`);
     const since = iso(now - DAY);
     if (db.prepare('SELECT COUNT(*) AS n FROM clients WHERE signup_ip_hash = ? AND created_at > ?').get(ipHash, since).n >= 3)
       return { status: 429, body: { error: 'Too many signups from this network today. Please email us instead.', field: null } };
-    if (db.prepare('SELECT COUNT(*) AS n FROM clients WHERE created_at > ?').get(since).n >= perDay)
+    const today = db.prepare('SELECT COUNT(*) AS n FROM clients WHERE created_at > ?').get(since).n;
+    if (today >= perDay) {
+      // Jake hears once a day, so an attack or a busy day is visible.
+      const day = iso(now).slice(0, 10);
+      if (capNoticeDay !== day) {
+        capNoticeDay = day;
+        await officeNotice(`Signup cap reached (${today} today)`, `${today} trial signups in the last 24 hours reached TRIAL_SIGNUPS_PER_DAY (${perDay}). ` +
+          `Further signups get a 429 until the count drops. Raise TRIAL_SIGNUPS_PER_DAY if this is real demand.`, `signup-cap-${day}`);
+      }
       return { status: 429, body: { error: "We've had a lot of signups today. Please try again tomorrow, or email us and we'll set you up.", field: null } };
+    }
     // One trial per shop: any earlier row for this office email, shop line or owner cell blocks a new one, except an
     // unverified signup whose link expired.
     const earlier = db.prepare(`SELECT status FROM clients WHERE (signup_email = ? OR shop_number = ? OR owner_cell = ?)
@@ -451,9 +478,10 @@ SMS consent: ${c.sms_consent ? 'yes' : 'no'}`, `${id}-signup`);
     let numbers = await searchNumbers({ 'filter[national_destination_code]': area });
     if (!numbers.length) numbers = await searchNumbers({ 'filter[administrative_area]': c.state });
     if (!numbers.length) throw new StepError('number_search', `no local numbers in ${area} or ${c.state}`);
+    const connectionId = await telnyxConnection();
     stillProvisioning(c.id); // last check before money is spent
     const order = await telnyx('number_order', 'number_orders', { method: 'POST', body: { phone_numbers: [{ phone_number: numbers[0] }],
-      customer_reference: ref, ...(env.TELNYX_CONNECTION_ID ? { connection_id: env.TELNYX_CONNECTION_ID } : {}) } });
+      customer_reference: ref, connection_id: connectionId } });
     const orderId = order?.data?.id;
     if (typeof orderId !== 'string' || !orderId) throw new StepError('number_order', 'no order id returned');
     set(c.id, { telnyx_order_id: orderId, phone_number: order.data.phone_numbers?.[0]?.phone_number || numbers[0] });
@@ -472,16 +500,46 @@ SMS consent: ${c.sms_consent ? 'yes' : 'no'}`, `${id}-signup`);
   // fallbackDestination (used by Vapi when Emma cannot take the call) is the owner's cell, never the shop line:
   // the shop line forwards to Emma, so sending callers back there would loop.
   const fallback = c => digitsOf(c.owner_cell) !== digitsOf(c.shop_number) ? { fallbackDestination: { type: 'number', number: c.owner_cell } } : {};
+  // The Vapi credential for the Telnyx account: VAPI_TELNYX_CREDENTIAL_ID, or else the one on the alert-call line
+  // (ALERT_CALL_FROM_ID, a Telnyx number already imported into Vapi), read once and cached.
+  async function telnyxCredential() {
+    if (env.VAPI_TELNYX_CREDENTIAL_ID) return env.VAPI_TELNYX_CREDENTIAL_ID;
+    if (credentialCache) return credentialCache;
+    if (env.ALERT_CALL_FROM_ID) {
+      let line = null;
+      try { line = await vapi('credential', `phone-number/${encodeURIComponent(env.ALERT_CALL_FROM_ID)}`); } catch { line = null; }
+      if (line?.provider === 'telnyx' && typeof line.credentialId === 'string' && line.credentialId) {
+        credentialCache = line.credentialId;
+        log('telnyx credential source=ALERT_CALL_FROM_ID phone number');
+        return credentialCache;
+      }
+    }
+    throw new StepError('config', 'missing VAPI_TELNYX_CREDENTIAL_ID (not found on the ALERT_CALL_FROM_ID number either)');
+  }
+  // The Telnyx connection new numbers join, so they route calls like the working alert line: TELNYX_CONNECTION_ID,
+  // or else the connection of TELNYX_REFERENCE_NUMBER (default +16153142826), read once and cached.
+  async function telnyxConnection() {
+    if (env.TELNYX_CONNECTION_ID) return env.TELNYX_CONNECTION_ID;
+    if (connectionCache) return connectionCache;
+    const reference = env.TELNYX_REFERENCE_NUMBER || '+16153142826';
+    const found = await telnyx('connection', `phone_numbers?${new URLSearchParams({ 'filter[phone_number]': reference })}`);
+    const line = (found?.data || []).find(n => n?.phone_number === reference && n.connection_id);
+    if (!line) throw new StepError('config', `missing TELNYX_CONNECTION_ID (${reference} not found in Telnyx)`);
+    connectionCache = String(line.connection_id);
+    log(`telnyx connection source=${reference}`);
+    return connectionCache;
+  }
   async function importNumber(c) {
-    need('VAPI_API_KEY', 'VAPI_TELNYX_CREDENTIAL_ID', 'PUBLIC_BASE_URL');
+    need('VAPI_API_KEY', 'PUBLIC_BASE_URL');
     if (dry) { log(`dry-run client=${c.id} would POST https://api.vapi.ai/phone-number provider=telnyx`); return set(c.id, { phone_number_id: `dry-phone-${c.id}` }); }
     if (c.import_pending_at) {
       const list = await vapi('phone_import', 'phone-number?limit=100');
       const found = (Array.isArray(list) ? list : []).find(p => p?.id && p.number === c.phone_number);
       if (found) { log(`client=${c.id} adopted existing Vapi phone number`); return set(c.id, { phone_number_id: found.id }); }
     } else set(c.id, { import_pending_at: iso(Date.now()) });
+    const credentialId = await telnyxCredential();
     const id = (await vapi('phone_import', 'phone-number', { method: 'POST', body: { provider: 'telnyx', number: c.phone_number,
-      credentialId: env.VAPI_TELNYX_CREDENTIAL_ID, assistantId: c.assistant_id, name: vapiName(c.business), ...fallback(c),
+      credentialId, assistantId: c.assistant_id, name: vapiName(c.business), ...fallback(c),
       server: { url: webhookUrl(), headers: { 'x-anchorline-key': key } } } }))?.id;
     if (typeof id !== 'string' || !id) throw new StepError('phone_import', 'no phone number id returned');
     set(c.id, { phone_number_id: id });
@@ -560,7 +618,7 @@ Anchorline AI`, `${c.id}-live`);
     const changed = db.prepare(`UPDATE clients SET status = 'ended', ended_at = ?, end_reason = ?, grace_ends_at = ?, lease_owner = NULL WHERE id = ? AND status <> 'ended'`)
       .run(iso(now), reason, iso(graceEnds), id).changes === 1;
     // Usage over the limit during the grace period cuts the grace short.
-    if (!changed && reason === 'usage' && inService(before, now)) set(id, { end_reason: 'usage', grace_ends_at: iso(now) });
+    if (!changed && reason === 'usage' && inService(before)) set(id, { end_reason: 'usage', grace_ends_at: iso(now) });
     else if (!changed) return null;
     const c = row(id);
     log(`ended client=${id} reason=${reason}`);
@@ -627,15 +685,26 @@ Anchorline AI`, `${c.id}-${kind}-${c.ended_at}`);
         else { need('VAPI_API_KEY'); await vapi('release', `phone-number/${encodeURIComponent(c.phone_number_id)}`, { method: 'DELETE', gone: true }); }
         set(c.id, { vapi_number_deleted_at: iso(Date.now()) });
       }
-      if (c.telnyx_order_id && c.phone_number && !c.telnyx_released_at) {
+      // A number the lookup cannot find is not assumed gone: retried up to MAX_ATTEMPTS sweeps, then Jake releases it by hand.
+      if (c.telnyx_order_id && c.phone_number && !c.telnyx_released_at && !c.manual_release_notified_at) {
+        let number = null;
         if (dry) log(`dry-run client=${c.id} would DELETE the Telnyx number`);
         else {
           need('TELNYX_API_KEY');
-          const found = await telnyx('release', `phone_numbers?${new URLSearchParams({ 'filter[phone_number]': c.phone_number })}`);
-          const number = (found?.data || []).find(n => n?.id && n.phone_number === c.phone_number);
-          if (number) await telnyx('release', `phone_numbers/${encodeURIComponent(number.id)}`, { method: 'DELETE', gone: true });
+          const found = await telnyx('release', `phone_numbers?${new URLSearchParams({ 'filter[phone_number]': c.phone_number, 'page[size]': '250' })}`);
+          number = (found?.data || []).find(n => n?.id && n.phone_number === c.phone_number) || null;
         }
-        set(c.id, { telnyx_released_at: iso(Date.now()) });
+        if (dry || number) {
+          if (number) await telnyx('release', `phone_numbers/${encodeURIComponent(number.id)}`, { method: 'DELETE', gone: true });
+          set(c.id, { telnyx_released_at: iso(Date.now()) });
+        } else {
+          const attempts = c.release_attempts + 1;
+          set(c.id, { release_attempts: attempts });
+          if (attempts < MAX_ATTEMPTS) throw new StepError('release', `Telnyx number ${c.phone_number} not found`);
+          if (claim(c.id, 'manual_release_notified_at', now))
+            await officeNotice(`Manual release needed: ${c.phone_number}`, `Telnyx did not list ${c.phone_number} after ${attempts} tries, so it was not released automatically. ` +
+              `Release it in the Telnyx portal. The Vapi number and assistant are removed as usual.\n\n${summary(c)}`, `${c.id}-manual-release`);
+        }
       }
       if (c.assistant_id && !c.assistant_deleted_at) {
         if (dry) log(`dry-run client=${c.id} would DELETE https://api.vapi.ai/assistant/${c.assistant_id}`);
@@ -720,11 +789,17 @@ Anchorline AI`, `${c.id}-${kind}-${c.trial_ends_at}`);
     }
     return done;
   }
-  // Minutes at twice the cap end the trial at once (no grace). Called after each metered call.
-  async function usageCheck(clientId, now = Date.now()) {
+  // Minutes at twice the cap end the trial at once (no grace). Called after each metered call; the ending and release
+  // run after the webhook has replied to Vapi (setImmediate), never inside its response time.
+  const ending = new Set();
+  function usageCheck(clientId, now = Date.now()) {
     const c = clientId ? row(clientId) : null;
-    if (!c || c.minutes_used < 2 * c.minute_cap || c.end_reason === 'usage' || !['active', 'ended'].includes(c.status) || c.released_at) return '';
-    return ` usage_end=${await endTrial(c.id, now, 'usage')}`;
+    if (!c || ending.has(c.id) || c.minutes_used < 2 * c.minute_cap || c.end_reason === 'usage' || !['active', 'ended'].includes(c.status) || c.released_at) return '';
+    ending.add(c.id);
+    const task = new Promise(resolve => setImmediate(resolve)).then(() => endTrial(c.id, now, 'usage'))
+      .catch(() => log(`usage end client=${c.id} failed`)).finally(() => { ending.delete(c.id); background.delete(task); });
+    background.add(task);
+    return ' usage_end=scheduled';
   }
 
   // ---------- calls ----------
@@ -817,7 +892,7 @@ Anchorline AI`, `${c.id}-${kind}-${c.trial_ends_at}`);
   function statusPage(c, now) {
     const v = statusView(c, now);
     const intro = c.status === 'ended'
-      ? (inService(c, now) ? `<p>The trial has ended. Emma is still catching your calls until ${escapeHtml(dateText(c.grace_ends_at))}. Not keeping her? Undo the call forwarding on your shop line before then. Keeping her? Reply to any of our emails.</p>`
+      ? (inGrace(c, now) ? `<p>The trial has ended. Emma is still catching your calls until ${escapeHtml(dateText(c.grace_ends_at))}. Not keeping her? Undo the call forwarding on your shop line before then. Keeping her? Reply to any of our emails.</p>`
         : '<p>This trial has ended and Emma\'s number is switched off. If your shop line still forwards to it, undo the forwarding now.</p>')
       : { provisioning: '<p>Emma is being set up with her own phone number. This usually takes a few minutes; this page refreshes by itself.</p>',
         active: '<p>Emma is live and ready to answer your calls.</p>',
@@ -961,6 +1036,6 @@ ${waiting ? `<p>All our trial spots for ${escapeHtml(c.business)}'s area are tak
     return false;
   }
 
-  const idle = () => Promise.all([...running.values()]);
+  const idle = () => Promise.all([...running.values(), ...background]);
   return { handle, signup, verify, provision, sweep, assistantRequest, callEnded, usageCheck, endTrial, statusKey, idle, inService };
 }

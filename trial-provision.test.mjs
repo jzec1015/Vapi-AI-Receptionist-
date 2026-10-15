@@ -21,7 +21,10 @@ const env = { VAPI_WEBHOOK_SECRET: key, RESEND_API_KEY: 'fixture-only', EMAIL_FR
 // A fake Vapi + Telnyx. `fail` maps a step to an HTTP status, 'network', or 'lost' (the provider did the work but the
 // reply never arrived). Like a careless API, the order list ignores its filter, so the code must check the reference.
 function fakeApis() {
-  const state = { fail: {}, orders: [], assistants: [], vapiNumbers: [], owned: [], deleted: [], hooks: {},
+  // owned: numbers on the Telnyx account; the alert line +16153142826 is already there on connection conn-615.
+  const state = { fail: {}, orders: [], assistants: [], vapiNumbers: [], deleted: [], hooks: {},
+    owned: [{ id: 'tn-ref', phone_number: '+16153142826', connection_id: 'conn-615' }],
+    alertLine: { id: 'alert-line', provider: 'telnyx', number: '+16153142826', credentialId: 'cred-from-alert-line' },
     numbers: { '720': ['+17205550777', '+17205550778'], CO: ['+19705550100'] }, orderStatus: 'success', calls: [] };
   const answer = (step, body) => {
     const failure = state.fail[step];
@@ -40,6 +43,8 @@ function fakeApis() {
     if (u.host === 'api.vapi.ai' && u.pathname === '/assistant' && init.method === 'POST')
       return created('assistant', () => { if (state.fail.assistant && state.fail.assistant !== 'lost') return {}; const a = { id: `asst-${state.assistants.length + 1}`, metadata: call.body.metadata }; state.assistants.push(a); return a; });
     if (u.host === 'api.vapi.ai' && u.pathname === '/phone-number' && init.method === 'GET') return answer('import_list', state.vapiNumbers);
+    if (u.host === 'api.vapi.ai' && u.pathname.startsWith('/phone-number/') && init.method === 'GET')
+      return id === state.alertLine?.id ? answer('alert_line', state.alertLine) : new Response('{}', { status: 404 });
     if (u.host === 'api.vapi.ai' && u.pathname === '/phone-number' && init.method === 'POST')
       return created('import', () => { if (state.fail.import && state.fail.import !== 'lost') return {}; const p = { id: `pn-${state.vapiNumbers.length + 1}`, number: call.body.number }; state.vapiNumbers.push(p); return p; });
     if (u.host === 'api.vapi.ai' && init.method === 'DELETE') { const r = answer(`delete_${u.pathname.split('/')[1]}`, {}); if (r.ok) state.deleted.push(u.pathname); return r; }
@@ -55,7 +60,7 @@ function fakeApis() {
         phone_numbers: [{ phone_number: call.body.phone_numbers[0].phone_number, status: 'pending' }] };
       if (state.fail.order === 'lost') { state.orders.push(order); throw new TypeError('fetch failed'); }
       const r = answer('order', { data: order });
-      if (r.ok) { state.orders.push(order); state.owned.push({ id: `tn-${state.owned.length + 1}`, phone_number: order.phone_numbers[0].phone_number }); }
+      if (r.ok) { state.orders.push(order); state.owned.push({ id: `tn-${state.owned.length}`, phone_number: order.phone_numbers[0].phone_number, connection_id: call.body.connection_id }); }
       return r;
     }
     if (u.host === 'api.telnyx.com' && u.pathname.startsWith('/v2/number_orders/')) return answer('order_status', { data: { ...state.orders.find(o => o.id === id), status: state.orderStatus } });
@@ -145,7 +150,8 @@ test('happy path: verify buys a local number, imports it into Vapi with the owne
   assert.equal(search.headers.Authorization, 'Bearer fixture-telnyx');
   assert.equal(new URL(search.url).searchParams.get('filter[national_destination_code]'), '720');
   const order = apis.calls.find(x => x.method === 'POST' && x.url === 'https://api.telnyx.com/v2/number_orders');
-  assert.deepEqual(order.body, { phone_numbers: [{ phone_number: '+17205550777' }], customer_reference: `anchorline-trial-${c.id}` });
+  assert.deepEqual(order.body, { phone_numbers: [{ phone_number: '+17205550777' }], customer_reference: `anchorline-trial-${c.id}`, connection_id: 'conn-615' });
+  assert.equal(new URL(apis.calls.find(x => x.url.startsWith('https://api.telnyx.com/v2/phone_numbers?')).url).searchParams.get('filter[phone_number]'), '+16153142826');
   const imported = apis.calls.find(x => x.method === 'POST' && x.url === 'https://api.vapi.ai/phone-number');
   assert.deepEqual(imported.body, { provider: 'telnyx', number: '+17205550777', credentialId: 'cred-telnyx', assistantId: 'asst-1',
     name: "O'Brien & Sons Plumbing - Emma (trial)", fallbackDestination: { type: 'number', number: '+17205550144' },
@@ -268,7 +274,7 @@ test('a missing env var stops at that step; after a restart with it set, provisi
   const first = await fixture(t, { VAPI_TELNYX_CREDENTIAL_ID: '' }, { apis, dir, keep: true });
   const c = await first.verified();
   assert.equal(c.status, 'provisioning');
-  assert.equal(c.provision_error, 'config: missing VAPI_TELNYX_CREDENTIAL_ID');
+  assert.match(c.provision_error, /^config: missing VAPI_TELNYX_CREDENTIAL_ID/);
   assert.deepEqual([c.assistant_id, c.phone_number, c.phone_number_id], ['asst-1', '+17205550777', null]);
   await first.app.trials.sweep();
   assert.equal(officeMails(apis, /^Trial provisioning stuck: /).length, 1, 'Jake is told once');
@@ -432,8 +438,8 @@ test('at trial end Emma keeps answering for a 14-day grace period with reminders
   row = client();
   assert.ok(row.released_at && row.vapi_number_deleted_at && row.telnyx_released_at && row.assistant_deleted_at);
   assert.deepEqual(apis.deleted, ['/phone-number/pn-1', '/v2/phone_numbers/tn-1', '/assistant/asst-1']);
-  assert.equal(apis.calls.find(x => x.url.startsWith('https://api.telnyx.com/v2/phone_numbers?')).url,
-    'https://api.telnyx.com/v2/phone_numbers?filter%5Bphone_number%5D=%2B17205550777');
+  assert.equal(apis.calls.filter(x => x.url.startsWith('https://api.telnyx.com/v2/phone_numbers?')).at(-1).url,
+    'https://api.telnyx.com/v2/phone_numbers?filter%5Bphone_number%5D=%2B17205550777&page%5Bsize%5D=250');
   assert.equal(ownerMails(apis, /is now switched off/).length, 1);
   assert.equal(officeMails(apis, /^Trial released: /).length, 1);
   await app.trials.sweep(end + 16 * DAY);
@@ -456,7 +462,7 @@ test('a failed release step is retried by the next sweep without repeating the p
   assert.deepEqual(await app.trials.sweep(end + 15 * DAY + 3600000), [`release:${c.id}:released`]);
   assert.equal(apis.count('DELETE', '/phone-number/pn-1'), 1);
   assert.deepEqual(apis.deleted, ['/phone-number/pn-1', '/v2/phone_numbers/tn-1', '/assistant/asst-1']);
-  // Already gone at the provider (404) counts as released.
+  // Already gone at the provider (404) counts as released (the Vapi assistant here).
   const gone = fakeApis(); gone.fail.delete_assistant = 404;
   const other = await fixture(t, {}, { apis: gone });
   const d = await other.verified();
@@ -464,10 +470,92 @@ test('a failed release step is retried by the next sweep without repeating the p
   assert.deepEqual(await other.app.trials.sweep(Date.parse(d.trial_ends_at) + 15 * DAY), [`release:${d.id}:released`]);
 });
 
+test('a Telnyx number the lookup cannot find is retried 5 times, then Jake is asked once to release it by hand', async t => {
+  const apis = fakeApis();
+  const { app, verified, client } = await fixture(t, {}, { apis });
+  const c = await verified();
+  const end = Date.parse(c.trial_ends_at);
+  await app.trials.sweep(end + 1);
+  apis.owned = apis.owned.filter(n => n.phone_number !== c.phone_number);
+  for (let i = 1; i <= 4; i++) {
+    assert.deepEqual(await app.trials.sweep(end + 15 * DAY + i * 3600000), [`release:${c.id}:retry`]);
+    assert.equal(client().release_error, 'release: Telnyx number +17205550777 not found'); assert.equal(client().released_at, null);
+  }
+  assert.deepEqual(await app.trials.sweep(end + 16 * DAY), [`release:${c.id}:released`]);
+  const row = client();
+  assert.equal(row.telnyx_released_at, null, 'not claimed as released'); assert.ok(row.manual_release_notified_at); assert.ok(row.released_at);
+  assert.equal(apis.count('DELETE', '/assistant/asst-1'), 1);
+  assert.equal(apis.calls.filter(x => x.method === 'DELETE' && x.url.includes('telnyx')).length, 0);
+  const manual = officeMails(apis, /^Manual release needed: \+17205550777$/);
+  assert.equal(manual.length, 1);
+  await app.trials.sweep(end + 17 * DAY);
+  assert.equal(officeMails(apis, /^Manual release needed/).length, 1);
+});
+
+test('after the grace period Emma keeps routing alerts until the release has really happened', async t => {
+  const apis = fakeApis();
+  const { app, verified, client, post } = await fixture(t, {}, { apis });
+  const c = await verified();
+  const end = Date.parse(c.trial_ends_at);
+  await app.trials.sweep(end + 1);
+  apis.fail['delete_phone-number'] = 500;
+  t.mock.timers.enable({ apis: ['Date'], now: end + 15 * DAY });
+  assert.deepEqual(await app.trials.sweep(end + 15 * DAY), [`release:${c.id}:retry`]);
+  const saved = await post({ message: { type: 'tool-calls', call: { id: 'after-grace', assistantId: 'asst-1', customer: { number: '+17205550250' } },
+    toolCallList: [{ id: 't', function: { name: 'submit_service_request', arguments: { name: 'A', address: 'B', issue: 'C', is_test: false, email_status: 'declined' } } }] } });
+  assert.equal(JSON.parse((await saved.json()).results[0].result).office_alert, 'sent');
+  delete apis.fail['delete_phone-number'];
+  assert.deepEqual(await app.trials.sweep(end + 15 * DAY + 3600000), [`release:${c.id}:released`]);
+  assert.ok(client().released_at);
+});
+
+test('the Telnyx credential comes from the alert-call line when VAPI_TELNYX_CREDENTIAL_ID is unset', async t => {
+  const logs = [];
+  t.mock.method(console, 'log', line => logs.push(String(line)));
+  const apis = fakeApis();
+  const { app, verified } = await fixture(t, { VAPI_TELNYX_CREDENTIAL_ID: '', ALERT_CALL_FROM_ID: 'alert-line' }, { apis });
+  const c = await verified();
+  assert.equal(c.status, 'active');
+  assert.equal(apis.calls.find(x => x.method === 'POST' && x.url === 'https://api.vapi.ai/phone-number').body.credentialId, 'cred-from-alert-line');
+  assert.ok(logs.some(l => l.includes('telnyx credential source=ALERT_CALL_FROM_ID')));
+  await verified({ business: 'Second Shop', office_email: 'b@x.example', shop_number: '7205550166', owner_cell: '7205550167' }, '203.0.113.2');
+  await app.trials.idle();
+  assert.equal(apis.count('GET', '/phone-number/alert-line'), 1, 'read once, then cached');
+  // Not a Telnyx line, or no such line: the usual missing-env path, and Jake is told.
+  for (const alertLine of [{ id: 'alert-line', provider: 'vapi', credentialId: 'x' }, null]) {
+    const other = fakeApis(); other.alertLine = alertLine;
+    const f = await fixture(t, { VAPI_TELNYX_CREDENTIAL_ID: '', ALERT_CALL_FROM_ID: 'alert-line' }, { apis: other });
+    const d = await f.verified();
+    assert.equal(d.status, 'provisioning');
+    assert.match(d.provision_error, /^config: missing VAPI_TELNYX_CREDENTIAL_ID/);
+    assert.equal(officeMails(other, /^Trial provisioning stuck/).length, 1);
+  }
+});
+
+test('new numbers join the connection of +16153142826, or TELNYX_CONNECTION_ID when set; no connection, no purchase', async t => {
+  const set = fakeApis();
+  await (await fixture(t, { TELNYX_CONNECTION_ID: 'conn-env' }, { apis: set })).verified();
+  assert.equal(set.calls.find(x => x.method === 'POST' && x.url.endsWith('/number_orders')).body.connection_id, 'conn-env');
+  assert.equal(set.calls.filter(x => x.url.startsWith('https://api.telnyx.com/v2/phone_numbers?')).length, 0);
+  const missing = fakeApis(); missing.owned = [];
+  const d = await (await fixture(t, {}, { apis: missing })).verified();
+  assert.equal(d.status, 'provisioning');
+  assert.equal(d.provision_error, 'config: missing TELNYX_CONNECTION_ID (+16153142826 not found in Telnyx)');
+  assert.equal(missing.count('POST', '/number_orders'), 0);
+  assert.equal(officeMails(missing, /^Trial provisioning stuck/).length, 1);
+});
+
 test('minutes at twice the cap end the trial at once and release it, with no grace period', async t => {
-  const { apis, sql, client, report, c } = await liveTrial(t);
+  const { app, apis, sql, client, report, c } = await liveTrial(t);
   sql('UPDATE clients SET minute_cap = 6');
+  const logs = [];
+  t.mock.method(console, 'log', line => logs.push(String(line)));
+  const deletedBefore = apis.deleted.length;
   await report('big-1', '+17205550220', 200); // 8.75 + 3.33 = 12.1 >= 12
+  // The webhook replied before the release ran: it is scheduled, not done inside the response.
+  assert.ok(logs.some(l => /call=big-1 .*usage_end=scheduled/.test(l)));
+  assert.equal(deletedBefore, 0);
+  await app.trials.idle();
   const row = client();
   assert.equal(row.status, 'ended'); assert.equal(row.end_reason, 'usage'); assert.ok(row.released_at);
   assert.deepEqual(apis.deleted, ['/phone-number/pn-1', '/v2/phone_numbers/tn-1', '/assistant/asst-1']);
@@ -475,6 +563,7 @@ test('minutes at twice the cap end the trial at once and release it, with no gra
   assert.equal(officeMails(apis, /^Trial ended for usage: /).length, 1);
   assert.equal(ownerMails(apis, /still catching/).length, 0);
   await report('big-2', '+17205550221', 200);
+  await app.trials.idle();
   assert.equal(apis.deleted.length, 3);
   assert.equal(c.id, row.id);
 });
@@ -504,7 +593,7 @@ test('assistant-request: live and grace trials get their assistant; others get {
   const add = (id, status, fields = {}) => sql(`INSERT INTO clients (id, assistant_id, phone_number_id, phone_number, business, owner_name, owner_cell, shop_number, state, status, created_at, grace_ends_at, released_at)
     VALUES (?, ?, ?, ?, 'Shop', 'Al', '+16155550400', '+16155550500', 'TN', ?, '2026-10-01T00:00:00Z', ?, ?)`, id, `asst-${id}`, `pn-${id}`, `+1615555${id.padStart(4, '0')}`,
     status, fields.grace ?? null, fields.released ?? null);
-  add('1', 'ended', { grace: '2000-01-01T00:00:00Z' }); add('2', 'active'); add('3', 'provisioning'); add('4', 'ended', { grace: future }); add('5', 'ended', { grace: future, released: '2026-10-02T00:00:00Z' });
+  add('1', 'ended', { grace: '2000-01-01T00:00:00Z', released: '2026-10-02T00:00:00Z' }); add('6', 'ended', { grace: '2000-01-01T00:00:00Z' }); add('2', 'active'); add('3', 'provisioning'); add('4', 'ended', { grace: future }); add('5', 'ended', { grace: future, released: '2026-10-02T00:00:00Z' });
   let caller = 0;
   const ask = async message => { const r = await post({ message: { type: 'assistant-request', customer: { number: `+1720555${String(++caller).padStart(4, '0')}` }, ...message } });
     assert.equal(r.status, 200); return r.json(); };
@@ -515,6 +604,7 @@ test('assistant-request: live and grace trials get their assistant; others get {
   assert.deepEqual(await ask({ phoneNumber: { id: 'pn-3' } }), {});
   assert.deepEqual(await ask({ phoneNumber: { id: 'pn-4' } }), { assistantId: 'asst-4' });
   assert.deepEqual(await ask({ phoneNumber: { id: 'pn-5' } }), {});
+  assert.deepEqual(await ask({ phoneNumber: { id: 'pn-6' } }), { assistantId: 'asst-6' }, 'grace over but not yet released: Emma still answers');
   assert.deepEqual(await ask({ phoneNumber: { id: 'pn-unknown', number: '+19999999999' } }), {});
   assert.deepEqual(await ask({}), {});
   // Loop guard: the same caller reaching the same Emma number again within 2 minutes.
