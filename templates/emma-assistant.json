@@ -1,0 +1,75 @@
+{
+  "name": "{{BUSINESS}} - Emma (trial)",
+  "voice": {
+    "model": "eleven_turbo_v2_5",
+    "speed": 0.95,
+    "style": 0,
+    "voiceId": "EXAVITQu4vr4xnSDxMaL",
+    "provider": "11labs",
+    "stability": 0.55,
+    "similarityBoost": 0.8,
+    "useSpeakerBoost": true,
+    "optimizeStreamingLatency": 2
+  },
+  "model": {
+    "model": "gpt-4.1",
+    "toolIds": [
+      "da782f13-0ce0-4c1d-9cb9-1df881c17a97",
+      "d39115a3-e858-4f79-9bcd-ce28b1aa7814",
+      "178c7380-ea94-410f-afd1-e5544ce3dcad"
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "{{PROMPT}}"
+      }
+    ],
+    "provider": "openai",
+    "maxTokens": 150,
+    "temperature": 0.4
+  },
+  "firstMessage": "Hi, thanks for calling {{BUSINESS}}. This is Emma. This call may be recorded so we get your details right. How can I help?",
+  "endCallFunctionEnabled": true,
+  "endCallMessage": "",
+  "transcriber": {
+    "model": "nova-3",
+    "language": "en",
+    "provider": "deepgram"
+  },
+  "silenceTimeoutSeconds": 30,
+  "serverMessages": [
+    "end-of-call-report"
+  ],
+  "maxDurationSeconds": 600,
+  "backgroundSound": "office",
+  "firstMessageMode": "assistant-speaks-first",
+  "analysisPlan": {
+    "summaryPlan": {
+      "enabled": false
+    },
+    "successEvaluationPlan": {
+      "enabled": false
+    }
+  },
+  "backgroundDenoisingEnabled": true,
+  "startSpeakingPlan": {
+    "waitSeconds": 0.2,
+    "transcriptionEndpointingPlan": {
+      "onPunctuationSeconds": 0.4,
+      "onNoPunctuationSeconds": 1.5,
+      "onNumberSeconds": 1
+    }
+  },
+  "stopSpeakingPlan": {
+    "numWords": 1,
+    "voiceSeconds": 0.2,
+    "backoffSeconds": 1
+  },
+  "server": {
+    "url": "{{SERVER_URL}}",
+    "timeoutSeconds": 40,
+    "headers": {
+      "x-anchorline-key": "{{WEBHOOK_SECRET}}"
+    }
+  }
+}
