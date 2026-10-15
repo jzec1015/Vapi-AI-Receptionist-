@@ -11,7 +11,8 @@ still proves v1.5.0 behaviour with today's production variables.
 ## Flow
 
 1. `POST /trial/signup` → client row `pending_verification` (or `waitlisted` when `TRIAL_MAX_ACTIVE` trials are
-   provisioning/active, or when the name looks like Gold Star / an existing trial: `review_reason` set, Jake gets
+   provisioning/active, or when the name looks like Gold Star / an existing trial (normalised names equal, or one
+   containing the other as whole words, keys of 4+ characters): `review_reason` set, Jake gets
    "Needs review: possible duplicate/impersonation"), verify email to the owner, "New trial signup: <business>" to `OFFICE_EMAIL`.
 2. Owner clicks `GET /trial/verify?token=…` → the cap is checked again in one transaction with the status change:
    under the cap → `provisioning` (starts in the background); at the cap → `waitlisted` (waitlist email, Jake told).
@@ -45,9 +46,11 @@ still proves v1.5.0 behaviour with today's production variables.
 6. Grace over: Vapi phone number deleted (`DELETE /phone-number/{id}`), Telnyx number released
    (`GET /v2/phone_numbers?filter[phone_number]=…` then `DELETE /v2/phone_numbers/{id}`), assistant deleted
    (`DELETE /assistant/{id}`), each step recorded (404 counts as done) and retried by the sweep; `released_at` set;
-   final "switched off" email to the owner and Jake.
+   final "switched off" email to the owner and Jake. Until `released_at` is set Emma keeps answering and alerting,
+   even after `grace_ends_at`. A Telnyx number the lookup cannot find is retried for 5 sweeps, then Jake gets
+   "Manual release needed: <number>" once and the rest of the release completes.
 7. Usage: when `minutes_used` reaches 2 × `minute_cap` the trial ends at once (`end_reason = usage`, no grace) and
-   is released; owner and Jake are emailed.
+   is released; owner and Jake are emailed. This runs after the webhook has replied to Vapi (setImmediate).
 
 ## Endpoints
 
@@ -63,8 +66,10 @@ still proves v1.5.0 behaviour with today's production variables.
 | `POST /admin/trials/<id>/retry` | same | provisioning client: resets the attempt counter and runs provisioning now |
 | `POST /vapi/webhook` `assistant-request` | `x-anchorline-key` | active or in-grace trial → its `assistantId`; anything else → `{}` (Vapi uses `fallbackDestination`); never the shop line. Same caller + same Emma number twice within 2 min → a transient assistant that says one line and hangs up (10 s max) |
 
-Signup body (unknown fields are refused): `business` (2–60 characters, at most 8 words, letters/digits/spaces/`& ' -`,
-a period only ending an abbreviation such as `Co.` `Inc.` `LLC.` `St.`; no sentence punctuation, URLs or `@`),
+Signup body (unknown fields are refused): `business` (2–60 characters, at most 8 words, letters/digits/spaces/`& '`,
+hyphens only joining a word (`A-1`, `Mid-Tn`), periods only on initials (`B.`, `J.R.`) or abbreviations
+(mr/mrs/ms/dr/st/jr/sr/co/inc/llc/ltd/corp/bros/mt/ft), a comma only right before Inc/LLC/Ltd/Corp/Co
+(`Smith & Sons, Inc.`); no `! ? : ;`, free-standing dashes, URLs or `@`),
 `owner_name`, `city` (letters, digits, ordinary punctuation),
 `owner_cell`, `shop_number` (US numbers: 10 plain digits as the website form sends them, `+1XXXXXXXXXX` or formatted
 like `(615) 555-0142`; stored as E.164; NANP area code and exchange cannot start with 0 or 1), `office_email`,
@@ -76,7 +81,7 @@ Refused: a shop line or owner cell that is an Anchorline number (Gold Star's Emm
 line `+16153142826`, `TELNYX_FROM`, `ANCHORLINE_NUMBERS`, any Emma trial number) → 400; any earlier trial row for
 the same office email, shop line or owner cell → 409 (an ended one: "This shop already had a trial — reply to Jake
 to talk about keeping Emma"), except an unverified signup whose link expired; more than 3 per IP or
-`TRIAL_SIGNUPS_PER_DAY` overall in 24 h → 429.
+`TRIAL_SIGNUPS_PER_DAY` overall in 24 h → 429 (Jake gets "Signup cap reached (N today)" once a day).
 
 ## Security notes
 
@@ -108,14 +113,15 @@ owner's cell, the shop line, a `TEST_CALLER_NUMBERS` entry, and not saved as a t
 | variable | needed for |
 | --- | --- |
 | `PUBLIC_BASE_URL` | e.g. `https://vapi-ai-receptionist-production-b0f4.up.railway.app`: verify links, assistant/number server URL. Signup returns 503 without it |
-| `VAPI_TELNYX_CREDENTIAL_ID` | Vapi credential id of the Telnyx account (Vapi dashboard → Integrations) for the number import |
+| `VAPI_TELNYX_CREDENTIAL_ID` | optional: Vapi credential id of the Telnyx account. When unset it is read once from the alert-call line (`GET /phone-number/{ALERT_CALL_FROM_ID}` → `credentialId` when `provider` is `telnyx`) and cached; if neither works, provisioning stops with "missing env" and Jake is emailed |
 | `ADMIN_PASSWORD` | admin dashboard (12+ characters; 503 otherwise) |
 | `OFFICE_EMAIL` | Jake's notices (already set for receipts if used) |
 | `TRIAL_MAX_ACTIVE` | default 5; signups and verifications beyond it are waitlisted |
 | `TRIAL_SIGNUPS_PER_DAY` | default 20; global signups per 24 h before 429 |
 | `ANCHORLINE_NUMBERS` | optional, comma-separated: more of our own numbers a trial may not use |
 | `TRIAL_DRY_RUN` | `1` = log each Vapi/Telnyx call and fake ids (emails still go out). Unset in production |
-| `TELNYX_CONNECTION_ID` | optional: `connection_id` on the number order (see limitations) |
+| `TELNYX_CONNECTION_ID` | optional: `connection_id` for new numbers. When unset it is read once from the Telnyx number `TELNYX_REFERENCE_NUMBER` (default `+16153142826`, the working alert line) via `GET /v2/phone_numbers?filter[phone_number]=`, so new numbers route like it; if not found, nothing is bought and Jake is emailed |
+| `TELNYX_REFERENCE_NUMBER` | optional, default `+16153142826` |
 | `TRIAL_POLL_MS`, `TRIAL_POLL_TRIES` | optional: order polling (default 3000 ms × 5) |
 | existing | `VAPI_API_KEY`, `TELNYX_API_KEY`, `RESEND_API_KEY`, `EMAIL_FROM`, `VAPI_WEBHOOK_SECRET` |
 
@@ -124,7 +130,7 @@ owner's cell, the shop line, a `TEST_CALLER_NUMBERS` entry, and not saved as a t
 1. Deploy with `TRIAL_DRY_RUN=1`, `TRIAL_MAX_ACTIVE=1`, `PUBLIC_BASE_URL`, `ADMIN_PASSWORD`, `OFFICE_EMAIL`.
 2. Sign up from the website with your own shop details; check both emails, the verify page, the status page and `/admin/trials`.
 3. End the dry-run client from the dashboard (its fake ids are never sent to Vapi).
-4. Set `VAPI_TELNYX_CREDENTIAL_ID`, confirm the Telnyx account has balance, unset `TRIAL_DRY_RUN`.
+4. Confirm `ALERT_CALL_FROM_ID` is set (the Telnyx credential and connection are read from the alert line; or set `VAPI_TELNYX_CREDENTIAL_ID` / `TELNYX_CONNECTION_ID`), confirm the Telnyx account has balance, unset `TRIAL_DRY_RUN`.
 5. One real signup: confirm in Vapi that the assistant matches Emma (voice, tools, endpointing), the number is
    imported with the shop as fallback, and a call to it reaches Emma and saves a request.
 6. Test call forwarding from the shop line and check "Forwarding confirmed" flips.
@@ -136,8 +142,9 @@ owner's cell, the shop line, a `TEST_CALLER_NUMBERS` entry, and not saved as a t
 
 - Not verified against live APIs: whether deleting a Telnyx-imported number in Vapi also releases it at Telnyx (the
   code releases it at Telnyx explicitly), the shape of `assistant-request` payloads (`phoneNumber` vs
-  `call.phoneNumberId`; both handled), whether the transient loop-guard assistant is accepted as written, and whether
-  a Telnyx number needs a `connection_id` (`TELNYX_CONNECTION_ID`) for Vapi to receive calls. Check in steps 5 and 7.
+  `call.phoneNumberId`; both handled), whether the transient loop-guard assistant is accepted as written, and
+  whether the alert line's Telnyx connection is the right one for Vapi-imported trial numbers (it is how the
+  working 615 line is set up). Check in steps 5 and 7.
 - The loop guard only sees calls that come through `assistant-request`. Live and grace numbers have their assistant
   attached (so calls do not depend on this server answering within 7.5 s); for them a repeat is only logged
   (`loop=suspected` on the end-of-call log line). The original loop (ended trial → shop line) no longer exists.
