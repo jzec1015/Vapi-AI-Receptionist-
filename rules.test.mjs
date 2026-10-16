@@ -27,7 +27,8 @@ const SAID = {
   warranty_company: ["I'm calling from American Home Shield", 'this would go through my home warranty'],
   renter: ["I rent this place", 'my landlord said to call you'],
   spanish: ['¿habla español?', 'Spanish please'],
-  existing_customer: ['I am calling about my appointment tomorrow', 'your guy was here Tuesday'],
+  existing_customer: ['I am calling about my appointment tomorrow', 'your guy was here Tuesday',
+    'I had an appointment scheduled for today and the plumber hasn\'t shown up', 'job type: existing customer'],
   past_job: ['it is leaking again after you fixed it', "I'm not happy with the work"],
   wants_owner: ['can I talk to the owner', 'I want to speak to a real person'],
   price_asked: ['how much do you charge to come out', 'can I get a quote'],
@@ -54,7 +55,7 @@ test('everyday calls do not trip an emergency', () => {
 });
 
 test('a negation right before a trigger does not count', () => {
-  for (const p of ['no gas smell, just a clog', 'it is not flooding, just a drip', "there's no sewage, it's slow", 'nothing is frozen'])
+  for (const p of ['no one\'s been hurt or shocked', 'nobody got burned', 'no one has been hurt', 'no gas smell, just a clog', 'it is not flooding, just a drip', "there's no sewage, it's slow", 'nothing is frozen'])
     assert.deepEqual(ruleTags(p), [], p);
 });
 

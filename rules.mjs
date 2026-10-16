@@ -35,7 +35,7 @@ export const TRIGGERS = [
   T('renter', 'Renter: get the landlord or property manager OK', false, 'i rent|we rent|renting|renter|tenant|landlord|property manag\\w*'),
   T('spanish', 'Spanish speaker: call back in Spanish if you can', false, 'spanish|español|espanol|habla\\w*|no hablo'),
   T('existing_customer', 'Existing customer or appointment (Emma cannot see the schedule)', false,
-    "(?:my|our|the) appointment|already (?:scheduled|booked)|running late|(?:tech|plumber|guy|y'?all|you guys) (?:was|were|came) (?:here|out)|you (?:were|was) (?:just )?(?:here|out)"),
+    "existing customer|(?:my|our|the|an|had an) appointment|appointment (?:scheduled|for today|today|this morning|this afternoon)|already (?:scheduled|booked)|running late|(?:hasn'?t|has not|never|didn'?t) (?:shown up|showed up|show up|come|came)|(?:tech|plumber|guy|y'?all|you guys) (?:was|were|came) (?:here|out)|you (?:were|was) (?:just )?(?:here|out)"),
   T('past_job', 'Unhappy about a past job', false, "still (?:leaking|broken|not working)|(?:leaking|broke) again|redo|not happy with|complain\\w*|warranty on (?:the|your) work"),
   T('wants_owner', 'Asked for the owner or a person', false, '(?:talk|speak) (?:to|with) (?:the )?(?:owner|boss|manager|a (?:real )?(?:person|human)|somebody|someone)'),
   T('price_asked', 'Asked about price', false, 'how much|price|pricing|cost|estimate|quote|charge|fee'),
@@ -53,7 +53,7 @@ export const tagLabel = tag => LABELS[tag] || tag;
 
 // "not flooding", "no gas smell", "nothing is frozen": a negation right before the phrase (at most one filler word, same
 // clause) cancels it. "No, it's flooding" and "I don't know, the pipe burst" still count.
-const NEGATED = /\b(?:no|not|never|isn'?t|aren'?t|wasn'?t|don'?t|doesn'?t|didn'?t|without|nothing|nobody)\s+(?:(?:really|any|a|the|actually|currently|even|is|are|was|been)\s+)?$/;
+const NEGATED = /\b(?:no[ -]?one(?:'s)?|nobody(?:'s)?|no|not|never|isn'?t|aren'?t|wasn'?t|don'?t|doesn'?t|didn'?t|without|nothing|nobody)\s+(?:(?:really|any|a|the|actually|currently|even|is|are|was|been|has|have|had)\s+)?$/;
 const sentenceAt = (text, i) => {
   const start = Math.max(...['.', '?', '!'].map(c => text.lastIndexOf(c, i))) + 1;
   const end = text.slice(i).search(/[.?!]/);
