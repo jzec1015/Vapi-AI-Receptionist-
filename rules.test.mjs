@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { ruleTags, callerWords, outOfArea, inBusinessHours, shouldRing } from './rules.mjs';
-import { createApp } from './server.mjs';
+import { createApp, transcriptOf, readbackProblem } from './server.mjs';
 
 // How Middle Tennessee callers actually say it (research notes: emma/research/plumber-rules-research-2026-10-16.md).
 const SAID = {
@@ -102,7 +102,9 @@ async function fixture(t, route) {
   const post = body => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': key }, body: JSON.stringify(body) });
   const save = async (id, args, said = []) => JSON.parse((await (await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': key },
     body: JSON.stringify({ message: { type: 'tool-calls', call: { id, assistantId: 'shop-a', customer: { number: '+16155550100' } },
-      artifact: { messages: said.map(message => ({ role: 'user', message })) },
+      // The caller's words, then the callback read-back and their yes, so the server's read-back check passes.
+      artifact: { messages: said.length ? [...said.map(message => ({ role: 'user', message })),
+        { role: 'bot', message: "So that's 6 1 5, 5 5 5, 0 1 4 2?" }, { role: 'user', message: 'Yes.' }] : [] },
       toolCallList: [{ id: 'tool-1', function: { name: 'submit_service_request', arguments: args } }] } }) })).json()).results[0].result);
   return { post, save, sent, rings: () => sent.filter(s => s.url === 'https://api.vapi.ai/call'), emails: () => sent.filter(s => s.url.includes('resend')) };
 }
@@ -118,6 +120,31 @@ test('a number that was not read back goes back once, then saves with a flag', a
   assert.match(first.error, /read the callback number back first/);
   assert.equal((await save('rb', { ...job, callback_read_back: false })).saved, true);
   assert.match(emails()[0].body.text, /Flags: Callback number was not read back/);
+});
+
+test('the transcript decides the read-back: a read-back with no answer goes back once, then saves with a flag', async t => {
+  const { save, post, emails } = await fixture(t, { business: 'Riverbend Plumbing', email: ['office@example.com'], hours: always });
+  const body = (id, messages) => ({ message: { type: 'tool-calls', call: { id, assistantId: 'shop-a', customer: { number: '+16155550100' } },
+    artifact: { messages }, toolCallList: [{ id: 'tool-1', function: { name: 'submit_service_request', arguments: job } }] } });
+  const asked = [{ role: 'user', message: 'six one five five five five oh one four two' }, { role: 'bot', message: "So that's 6 1 5, 5 5 5, 0 1 4 2?" }];
+  const first = await save('tx', job, []);
+  assert.equal(first.saved, true, 'an empty transcript falls back to Emma\'s flag');
+  const refused = JSON.parse((await (await post(body('tx2', asked))).json()).results[0].result);
+  assert.equal(refused.saved, false);
+  assert.match(refused.error, /wait for the caller to say yes/);
+  const second = JSON.parse((await (await post(body('tx2', asked))).json()).results[0].result);
+  assert.equal(second.saved, true);
+  assert.match(emails().at(-1).body.text, /Flags: Callback number was not read back/);
+});
+
+test('transcriptOf finds the conversation wherever the payload carries it', () => {
+  const m = [{ role: 'user', message: 'hi' }];
+  assert.deepEqual(transcriptOf({ artifact: { messages: m } }), m);
+  assert.deepEqual(transcriptOf({ call: { artifact: { messages: m } } }), m);
+  assert.deepEqual(transcriptOf({ artifact: { messages: [], messagesOpenAIFormatted: [{ role: 'user', content: 'hi' }] } }), [{ role: 'user', content: 'hi' }]);
+  assert.deepEqual(transcriptOf({ artifact: { messages: [] } }), [], 'empty, not missing');
+  assert.equal(transcriptOf({}), null);
+  assert.equal(readbackProblem([{ role: 'user', content: '615 555 0142' }, { role: 'assistant', content: "So that's six one five, five five five, oh one four two?" }, { role: 'user', content: 'yes' }], '6155550142', false), null, 'OpenAI-format roles work');
 });
 
 test('an emergency in the caller\'s words makes the job URGENT even when Emma left the prefix off', async t => {

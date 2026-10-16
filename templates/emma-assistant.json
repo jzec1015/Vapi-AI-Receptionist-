@@ -9,7 +9,7 @@
     "stability": 0.55,
     "similarityBoost": 0.8,
     "useSpeakerBoost": true,
-    "optimizeStreamingLatency": 2
+    "optimizeStreamingLatency": 3
   },
   "model": {
     "model": "gpt-4.1",
@@ -28,7 +28,7 @@
     "maxTokens": 150,
     "temperature": 0.4
   },
-  "firstMessage": "Hi, thanks for calling {{BUSINESS}}. I'm Emma, {{OWNER_POSSESSIVE}} AI assistant. This call may be recorded so we get your details right. If it's an emergency, just say so and I'll ring {{OWNER_FIRST}} right away. How can I help?",
+  "firstMessage": "Thanks for calling {{BUSINESS}}, this is Emma, {{OWNER_POSSESSIVE}} AI assistant. Calls are recorded. Emergency? Just say so and I'll ring {{OWNER_FIRST}}. What's going on?",
   "endCallFunctionEnabled": false,
   "endCallMessage": "",
   "transcriber": {
@@ -53,11 +53,11 @@
   },
   "backgroundDenoisingEnabled": true,
   "startSpeakingPlan": {
-    "waitSeconds": 0.2,
+    "waitSeconds": 0.05,
     "transcriptionEndpointingPlan": {
-      "onPunctuationSeconds": 0.4,
+      "onPunctuationSeconds": 0.15,
       "onNoPunctuationSeconds": 1.5,
-      "onNumberSeconds": 1
+      "onNumberSeconds": 1.0
     }
   },
   "stopSpeakingPlan": {
@@ -76,7 +76,7 @@
     {
       "on": "customer.speech.timeout",
       "options": {
-        "timeoutSeconds": 8,
+        "timeoutSeconds": 10,
         "triggerMaxCount": 2,
         "triggerResetMode": "onUserSpeech"
       },

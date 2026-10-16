@@ -52,13 +52,65 @@ export function formatPhone(value) {
 }
 
 // Lock-screen email subjects: what, where, who to call, e.g. "URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142".
-// A house number that speech recognition clearly garbled: over 6 digits, or 3+ separate digit groups before the
-// street ("2 42 4 0 Elm Street"). Deliberately narrow; "24240 Elm" and "100 200 Main" pass.
+// A house number that speech recognition clearly garbled: over 6 digits, or 3+ digit groups of mixed sizes before the
+// street ("2 42 4 0 Elm Street"). Deliberately narrow: the model often spaces out single digits, so "5 0 1 Woodland"
+// (= 501) passes, as do "24240 Elm" and "100 200 Main".
 export const garbledHouseNumber = address => {
   const lead = String(address || '').trim().match(/^(\d+(?:[\s-]+\d+)*)(?=\s|,|$)/);
   if (!lead) return false;
   const groups = lead[1].split(/[\s-]+/);
+  if (groups.every(g => g.length === 1)) return groups.length > 6;
   return groups.some(g => g.length > 6) || (groups.length >= 3 && groups.every(g => g.length <= 2));
+};
+
+// Digits in what Emma said, written or spoken ("six one five, oh one", "double five" -> "615015" / "55").
+const DIGIT_WORDS = { zero: '0', oh: '0', o: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
+export const spokenDigits = text => {
+  let out = '', double = false;
+  for (const word of String(text || '').toLowerCase().match(/\d|[a-z]+/g) || []) {
+    const d = /\d/.test(word) ? word : DIGIT_WORDS[word];
+    if (word === 'double') { double = true; continue; }
+    if (d) out += double ? d + d : d;
+    double = false;
+  }
+  return out;
+};
+
+// The conversation so far on a Vapi tool-calls message, wherever this payload carries it: null when none is there.
+export const transcriptOf = (message = {}) => {
+  for (const list of [message.artifact?.messages, message.call?.artifact?.messages, message.messages,
+    message.artifact?.messagesOpenAIFormatted, message.call?.artifact?.messagesOpenAIFormatted]) {
+    if (Array.isArray(list) && list.length) return list;
+  }
+  return [message.artifact?.messages, message.call?.artifact?.messages, message.messages].some(Array.isArray) ? [] : null;
+};
+
+// Was the callback number read back and answered? Needs the transcript (transcriptOf); without one it can't tell, so it
+// never blocks. Returns null when the save may go ahead, else 'no_readback' or 'no_answer'.
+export const readbackProblem = (messages, phone, urgent) => {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  const last4 = digitsOf(phone).slice(-4);
+  if (last4.length < 4) return null;
+  const turns = messages.filter(m => ['bot', 'assistant', 'user'].includes(m?.role) && typeof (m.message ?? m.content) === 'string');
+  let readback = -1;
+  turns.forEach((m, i) => { if (m.role !== 'user' && spokenDigits(m.message ?? m.content).includes(last4)) readback = i; });
+  if (readback < 0) return urgent ? null : 'no_readback';
+  return turns.slice(readback + 1).some(m => m.role === 'user') ? null : 'no_answer';
+};
+
+// Was the email spelled back (the part before the @) and answered before Emma marked it confirmed? Same rules as
+// readbackProblem: needs the transcript, never blocks without one.
+const EMAIL_DIGITS = { zero: '0', oh: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
+const spelled = text => (String(text || '').toLowerCase().match(/[a-z]+|\d/g) || []).map(w => EMAIL_DIGITS[w] ?? w).join('');
+export const emailReadbackProblem = (messages, email) => {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  const local = String(email || '').split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (local.length < 2) return null;
+  const turns = messages.filter(m => ['bot', 'assistant', 'user'].includes(m?.role) && typeof (m.message ?? m.content) === 'string');
+  let back = -1;
+  turns.forEach((m, i) => { if (m.role !== 'user' && spelled(m.message ?? m.content).includes(local)) back = i; });
+  if (back < 0) return 'no_spellback';
+  return turns.slice(back + 1).some(m => m.role === 'user') ? null : 'no_answer';
 };
 
 // At most 90 characters; the phone number is never cut, the address keeps its first part (street), the issue gets the rest.
@@ -363,7 +415,10 @@ export function createApp(env = process.env, send = fetch) {
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
   // Calls already told once that the house number looked garbled; the second save goes through so no caller is lost.
   const addressWarned = new Set();
+  // Calls already sent back once for a missing phone read-back; the second save goes through with a flag on the alert.
   const readBackWarned = new Set();
+  // Calls already sent back once for marking an email confirmed before spelling it back.
+  const emailWarned = new Set();
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   const inflight = new Map();
@@ -712,12 +767,20 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     return { saved: true, request_id: row.id, note_added: true, office_alert, ...(upgrade ? { urgent: true } : {}) };
   }
   // An email given after the request was saved: only accepted once spelled back and confirmed, then the confirmation goes out.
-  async function addEmail(callId, args, route) {
+  async function addEmail(callId, args, route, message = {}) {
     const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
     if (!row) return failure('No saved request yet; save the request first');
     if (args?.confirmed_after_spelling_back !== true) return failure('Not added: spell the email back letter by letter and get a clear yes first.');
     const email = typeof args?.email === 'string' ? args.email.trim() : '';
     if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return failure('Invalid email');
+    // confirmed_after_spelling_back is Emma's claim; the transcript must show the spell-back and an answer (once, then accepted).
+    const emailCheck = emailReadbackProblem(transcriptOf(message), email);
+    if (emailCheck && !emailWarned.has(callId)) {
+      if (emailWarned.size > 10000) emailWarned.clear();
+      emailWarned.add(callId);
+      console.log(`email-readback-refused call=${callId} reason=${emailCheck}`);
+      return failure('Not added yet: spell the email back letter by letter and wait for the caller to say yes, then add it again.');
+    }
     const details = JSON.parse(row.details);
     details.email = email;
     db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
@@ -810,18 +873,30 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       if (args[field] != null && (typeof args[field] !== 'string' || args[field].length > 500)) return failure(`Invalid ${field}`);
       details[field] = (args[field] || '').trim();
     }
-    // A number given but not read back (callback_read_back false) goes back once with the read-back line; the second try
-    // saves with a flag on the alert, so no caller is lost. Older tool definitions without the field are not checked.
+    // The callback number must be read back and answered before saving. Vapi's live transcript decides when the tool call
+    // carries one; otherwise Emma's own callback_read_back flag does. One refusal per call, then the save goes through with
+    // a flag on the alert, so no caller is lost. Urgent jobs and the caller's own number are never blocked.
     const ownNumber = !!details.callback_phone && digitsOf(details.callback_phone) === digitsOf(callerNumberOf(message));
-    if (details.callback_phone && args.callback_read_back === false && !ownNumber && !readBackWarned.has(callId)) {
+    const transcript = transcriptOf(message);
+    console.log(`readback-check call=${callId} transcript=${transcript == null ? 'missing' : transcript.length ? `n=${transcript.length}` : 'empty'}`);
+    const urgentIssue = /^\s*URGENT\b/i.test(details.issue);
+    // After three read-backs Emma saves anyway with "unconfirmed" in job_details; that is flagged, never sent back.
+    const gaveUp = /unconfirmed/i.test(details.job_details);
+    const readback = !details.callback_phone || ownNumber ? null
+      : transcript?.length ? readbackProblem(transcript, details.callback_phone, urgentIssue)
+      : args.callback_read_back === false ? 'not_read_back' : null;
+    if (readback && !gaveUp && !readBackWarned.has(callId)) {
       if (readBackWarned.size > 10000) readBackWarned.clear();
       readBackWarned.add(callId);
-      return failure('Not saved: read the callback number back first ("So that\'s six one five, ...?"), wait for a yes, then save again with callback_read_back true.');
+      console.log(`readback-refused call=${callId} reason=${readback}`);
+      return failure(readback === 'no_answer'
+        ? 'Not saved yet: you just read the number back. Stop and wait for the caller to say yes, then save again.'
+        : 'Not saved: read the callback number back first ("So that\'s six one five, ...?"), wait for a yes, then save again with callback_read_back true.');
     }
     // Plumber rules (rules.mjs): what the caller said plus Emma's summary. An emergency trigger makes the job URGENT even
     // when Emma left the prefix off; flags (renter, warranty company, Spanish...) go on the owner's alert.
     const tags = ruleTags(`${details.issue} ${details.job_type} ${details.job_details} ${callerWords(message)}`);
-    if (details.callback_phone && args.callback_read_back === false && !ownNumber) tags.push('callback_unconfirmed');
+    if (readback) tags.push('callback_unconfirmed');
     const route = routeFor(message);
     if (route?.service_area && /\w/.test(details.address) && !/^not given$/i.test(details.address) && outOfArea(details.address, route.service_area)) tags.push('out_of_area');
     details.rule_tags = tags;
@@ -839,7 +914,16 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     details.email = '';
     if (args.email_confirmed === true) {
       if (typeof args.email !== 'string' || args.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(args.email)) return failure('Invalid confirmed email');
-      details.email = args.email;
+      // Marked confirmed but never spelled back and answered: sent back once; the second try saves without sending to it.
+      const emailCheck = transcript?.length ? emailReadbackProblem(transcript, args.email) : null;
+      if (emailCheck && !emailWarned.has(callId)) {
+        if (emailWarned.size > 10000) emailWarned.clear();
+        emailWarned.add(callId);
+        console.log(`email-readback-refused call=${callId} reason=${emailCheck}`);
+        return failure('Not saved yet: spell the email back letter by letter, wait for the caller to say yes, then save again.');
+      }
+      if (emailCheck) details.job_details = `${details.job_details} Email given but not confirmed: ${args.email}`.trim();
+      else details.email = args.email;
     }
     classify(details, callId, message);
     const id = randomUUID();
@@ -986,7 +1070,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
           try {
             let args = tool.function?.arguments ?? tool.parameters;
             if (typeof args === 'string') args = JSON.parse(args);
-            result = await addEmail(callId, args, routeFor(message));
+            result = await addEmail(callId, args, routeFor(message), message);
           } catch { result = failure('Unable to add email'); }
         }
         else if (name === 'transfer_no_answer') {

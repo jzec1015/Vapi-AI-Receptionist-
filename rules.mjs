@@ -76,7 +76,7 @@ export function ruleTags(text) {
 
 // What the caller has said so far, from a Vapi tool-calls message (artifact.messages, roles 'user'/'customer').
 export function callerWords(message = {}) {
-  const list = message.artifact?.messages || message.messages || message.call?.artifact?.messages || [];
+  const list = message.artifact?.messages || message.messages || message.call?.artifact?.messages || message.artifact?.messagesOpenAIFormatted || [];
   return Array.isArray(list) ? list.filter(m => m && ['user', 'customer'].includes(m.role))
     .map(m => (typeof m.message === 'string' ? m.message : typeof m.content === 'string' ? m.content : '')).join(' ').slice(0, 20000) : '';
 }

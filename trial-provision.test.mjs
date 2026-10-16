@@ -103,16 +103,16 @@ test('the assistant is Emma\'s production config with the shop substituted in an
   const config = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key });
   assert.equal(config.name, "O'Brien & Sons Plumbing - Emma (trial)");
   assert.deepEqual(config.metadata, { anchorline_client_id: 'client-1', anchorline_trial: true });
-  assert.equal(config.firstMessage, "Hi, thanks for calling O'Brien & Sons Plumbing. I'm Emma, the owner's AI assistant. This call may be recorded so we get your details right. If it's an emergency, just say so and I'll ring the owner right away. How can I help?");
+  assert.equal(config.firstMessage, "Thanks for calling O'Brien & Sons Plumbing, this is Emma, the owner's AI assistant. Calls are recorded. Emergency? Just say so and I'll ring the owner. What's going on?");
   const named = assistantConfig({ ...shop, owner_name: 'pat Obrien' }, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key });
-  assert.match(named.firstMessage, /I'm Emma, Pat's AI assistant\. .* I'll ring Pat right away\./);
+  assert.match(named.firstMessage, /this is Emma, Pat's AI assistant\. .* I'll ring Pat\./);
   assert.match(named.model.messages[0].content, /I'm letting Pat know right away/);
   assert.doesNotMatch(named.model.messages[0].content + named.firstMessage, /\{\{OWNER_/);
   assert.match(assistantConfig({ ...shop, owner_name: '<b>' }, { serverUrl: 'x', secret: key }).firstMessage, /the owner's AI assistant/);
   assert.deepEqual(config.model.toolIds, ['da782f13-0ce0-4c1d-9cb9-1df881c17a97', 'd39115a3-e858-4f79-9bcd-ce28b1aa7814', '178c7380-ea94-410f-afd1-e5544ce3dcad']);
   assert.deepEqual([config.model.provider, config.model.model, config.voice.provider, config.voice.voiceId, config.transcriber.model],
     ['openai', 'gpt-4.1', '11labs', 'EXAVITQu4vr4xnSDxMaL', 'nova-3']);
-  assert.deepEqual(config.startSpeakingPlan.transcriptionEndpointingPlan, { onPunctuationSeconds: 0.4, onNoPunctuationSeconds: 1.5, onNumberSeconds: 1 });
+  assert.deepEqual(config.startSpeakingPlan.transcriptionEndpointingPlan, { onPunctuationSeconds: 0.15, onNoPunctuationSeconds: 1.5, onNumberSeconds: 1 });
   assert.deepEqual(config.server, { url: 'https://receptionist.example/vapi/webhook', timeoutSeconds: 40, headers: { 'x-anchorline-key': key } });
   assert.deepEqual(config.serverMessages, ['end-of-call-report']);
   assert.equal(config.id, undefined);
