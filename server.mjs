@@ -187,6 +187,7 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
   // Flags from the plumber rules (rules.mjs): renter, warranty company, Spanish speaker, out of area...
   const flags = (details.rule_tags || []).filter(t => !URGENT_TAGS.has(t)).map(tagLabel);
+  if (details.refusal_flag) flags.unshift(details.refusal_flag);
   if (kind !== 'note' && flags.length) lines.push(`Flags: ${flags.join('; ')}`);
   // Email only: the call recording (from Vapi's end-of-call report) near the top, when the server has it.
   if (channel === 'email' && details.recording_url) lines.splice(1, 0, `Recording: ${details.recording_url}`);
@@ -323,6 +324,9 @@ export function createApp(env = process.env, send = fetch) {
       );
       CREATE TABLE IF NOT EXISTS call_log (call_id TEXT PRIMARY KEY, assistant_id TEXT, ended_at TEXT NOT NULL, seconds REAL, is_test INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS call_log_day ON call_log (assistant_id, ended_at);
+      -- v1.8: the last save Emma tried that the server refused (read-back, house number, email checks), so a caller who
+      -- hangs up right after a refusal is still saved by the end-of-call net. New table only: older versions ignore it.
+      CREATE TABLE IF NOT EXISTS refused_saves (call_id TEXT PRIMARY KEY, args TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS digests (
         assistant_id TEXT NOT NULL, day TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, sent_at TEXT,
         PRIMARY KEY (assistant_id, day)
@@ -413,6 +417,12 @@ export function createApp(env = process.env, send = fetch) {
     return expected.length >= 32 && supplied.length === expected.length && timingSafeEqual(supplied, expected);
   };
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
+  // What the owner's alert says when a refused save was saved after the caller hung up.
+  const refusalFlag = reason => 'Caller hung up before Emma finished: ' + (
+    /callback number|say yes/i.test(reason) && !/email/i.test(reason) ? 'callback number not confirmed, check it'
+    : /house number/i.test(reason) ? 'house number may be wrong, check it'
+    : /email/i.test(reason) ? 'email not confirmed, no confirmation sent'
+    : `details not confirmed (${String(reason).slice(0, 120)})`);
   // Calls already told once that the house number looked garbled; the second save goes through so no caller is lost.
   const addressWarned = new Set();
   // Calls already sent back once for a missing phone read-back; the second save goes through with a flag on the alert.
@@ -806,20 +816,39 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   async function hangup(callId, message, route) {
     if (db.prepare('SELECT 1 FROM requests WHERE call_id = ?').get(callId)) return 'already_saved';
     if (message.call?.type === 'outboundPhoneCall') return 'outbound';
+    // Emma tried to save and the server sent it back (e.g. "wait for the caller's yes"), then the caller hung up: save
+    // what she had, with a flag saying what was not confirmed. Works without caller ID (the payload has the callback number).
+    const refused = db.prepare('SELECT args, reason FROM refused_saves WHERE call_id = ?').get(callId);
+    let refusedArgs = null;
+    if (refused) {
+      try { refusedArgs = JSON.parse(refused.args); } catch { refusedArgs = null; }
+      if (refusedArgs) {
+        const result = await submit(callId, refusedArgs, message, refusalFlag(refused.reason));
+        if (result.saved) return `refused_save_recovered alert=${result.office_alert}`;
+      }
+    }
     const callerId = callerNumberOf(message);
-    if (!callerId) return 'no_caller_id';
+    const words = callerWords(message);
+    const backup = refusedArgs && typeof refusedArgs === 'object' ? refusedArgs : {};
+    const backupPhone = typeof backup.callback_phone === 'string' ? backup.callback_phone.slice(0, 100) : '';
+    if (!callerId && !backupPhone && !(words.trim() && Number(message.durationSeconds) >= 10)) return 'no_caller_id';
     const greeting = !(Number(message.durationSeconds) >= 10);
     if (greeting && !route) return 'too_short';
     if (greeting && db.prepare(`SELECT 1 FROM requests WHERE assistant_id IS ? AND created_at >= ? AND json_extract(details, '$.caller_id') = ?`)
       .get(assistantIdOf(message), new Date(Date.now() - 1800000).toISOString(), callerId)) return 'repeat_caller';
     const summary = String(message.analysis?.summary || message.summary || '').trim().slice(0, 1000);
     // A caller who said "test call" is a test; never alert a client about it.
-    const said = `${message.artifact?.transcript || message.transcript || ''} ${summary}`;
-    const issue = greeting ? 'Hung up during the greeting, before giving any details' : summary ? `Hung up before finishing. Summary: ${summary}` : 'Hung up before giving details';
+    const said = `${message.artifact?.transcript || message.transcript || ''} ${summary} ${words}`;
+    const issue = greeting ? 'Hung up during the greeting, before giving any details' : summary ? `Hung up before finishing. Summary: ${summary}`
+      : words.trim() ? `Hung up before finishing. Caller said: ${words.trim().slice(0, 500)}` : 'Hung up before giving details';
+    const text = (v, n) => typeof v === 'string' ? v.trim().slice(0, n) : '';
     // A gas caller is told to hang up and leave: the summary's emergency words still put "URGENT" on the hang-up alert.
     const tags = ruleTags(said);
-    const details = { name: 'Unknown caller', address: '', issue: tags.some(t => URGENT_TAGS.has(t)) ? `URGENT - ${issue}` : issue, rule_tags: tags,
-      is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [],
+    const details = { name: text(backup.name, 200) || 'Unknown caller', address: text(backup.address, 500),
+      issue: tags.some(t => URGENT_TAGS.has(t)) ? `URGENT - ${issue}` : issue, rule_tags: tags,
+      is_test: /test call/i.test(said) || backup.is_test === true, callback_phone: backupPhone, caller_id: callerId || '', email: '', notes: [],
+      ...(text(backup.issue, 1000) ? { job_details: `Emma had: ${text(backup.issue, 1000)}` } : {}),
+      ...(refused ? { refusal_flag: refusalFlag(refused.reason) } : {}),
       ...(greeting ? { greeting_hangup: true } : {}), ...(recordingOf(message) ? { recording_url: recordingOf(message) } : {}) };
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
@@ -848,10 +877,16 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const seconds = Number(message.durationSeconds ?? message.call?.durationSeconds);
     db.prepare('INSERT OR IGNORE INTO call_log VALUES (?, ?, ?, ?, ?)').run(callId, assistantId || null, new Date().toISOString(), Number.isFinite(seconds) ? seconds : null, test ? 1 : 0);
   }
-  async function submit(callId, args, message = {}) {
+  // forced: the caller hung up after a refused save (end-of-call net). The one-time checks no longer send it back, and
+  // the alert carries `forced` as a flag saying what was not confirmed.
+  async function submit(callId, args, message = {}, forced = '') {
     const old = db.prepare('SELECT result FROM requests WHERE call_id = ?').get(callId);
     if (old) return { ...JSON.parse(old.result), duplicate: true };
     if (!args || typeof args !== 'object' || Array.isArray(args)) return failure('Invalid parameters');
+    if (forced) {
+      for (const set of [addressWarned, readBackWarned, emailWarned]) set.add(callId);
+      if (args.email_status === 'skipped_emergency') args = { ...args, email_status: 'declined' };
+    }
     const details = {};
     for (const field of ['name', 'address', 'issue']) {
       if (typeof args[field] !== 'string' || !args[field].trim() || args[field].length > 4000) return failure(`Missing or invalid ${field}`);
@@ -910,10 +945,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       details.issue = `URGENT - ${details.issue}`;
       details.urgent_source = 'rules';
     }
-    // Skipping the email question is only allowed for emergencies.
-    if (args.email_status === 'skipped_emergency' && !/^\s*URGENT\b/i.test(details.issue))
+    // Skipping the email question is only allowed for emergencies, existing customers, and calls that are not a job
+    // (sales, job seekers): none of those get a confirmation email.
+    const noEmailNeeded = notAJob || tags.includes('existing_customer');
+    if (args.email_status === 'skipped_emergency' && !noEmailNeeded && !/^\s*URGENT\b/i.test(details.issue))
       return failure('Not saved: this is not an urgent job, so ask the caller for their email first, then save again.');
     details.caller_id = callerNumberOf(message);
+    if (forced) details.refusal_flag = forced;
     details.notes = [];
     details.email = '';
     if (args.email_confirmed === true) {
@@ -961,7 +999,14 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   }
   function once(callId, args, message) {
     if (inflight.has(callId)) return inflight.get(callId);
-    const task = submit(callId, args, message).finally(() => inflight.delete(callId));
+    const task = submit(callId, args, message).then(result => {
+      try {
+        if (result?.saved) db.prepare('DELETE FROM refused_saves WHERE call_id = ?').run(callId);
+        else if (result?.error && args && typeof args === 'object' && !Array.isArray(args) && JSON.stringify(args).length <= 20000)
+          db.prepare('INSERT OR REPLACE INTO refused_saves VALUES (?, ?, ?, ?)').run(callId, JSON.stringify(args), String(result.error).slice(0, 500), new Date().toISOString());
+      } catch { console.warn('refused-save bookkeeping failed'); }
+      return result;
+    }).finally(() => inflight.delete(callId));
     inflight.set(callId, task);
     return task;
   }
