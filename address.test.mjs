@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
-import { createApp, garbledHouseNumber, spokenDigits, readbackProblem, emailReadbackProblem } from './server.mjs';
+import { createApp, garbledHouseNumber, houseNumberProblem, spokenDigits, readbackProblem, emailReadbackProblem } from './server.mjs';
 
 const key = 'synthetic-test-key-not-used-in-production';
 const details = { name: 'Synthetic Test', address: '2 42 4 0 Elm Street, Nashville', issue: 'Synthetic verification', is_test: true };
@@ -87,4 +87,32 @@ test('after three read-backs Emma can save a number marked unconfirmed without b
   const args = { ...details, address: '501 Woodland Street, Nashville', callback_phone: '615-555-0144', job_details: 'Callback number unconfirmed - verify on callback' };
   const live = { message: { ...payload('gu', args).message, artifact: { messages: said(['user', '615 555 0144'], ['bot', 'Okay.']) } } };
   assert.equal((await post(live)).saved, true);
+});
+
+// Round 3: the caller said "2 42 4 0 Elm Street" and Emma saved "240 Elm Street" without the caller ever saying 240.
+const garbledThenGuess = said(['bot', "What's the address?"], ['user', "No. It's 2 42 4 0 Elm Street,"], ['bot', 'Got it, 240 Elm Street.']);
+
+test('a clean-looking house number guessed from a garbled one is caught from the transcript', () => {
+  assert.equal(houseNumberProblem(garbledThenGuess, '240 Elm Street, Nashville'), 'unconfirmed');
+  // The caller later says it plainly, spaced or not.
+  assert.equal(houseNumberProblem([...garbledThenGuess, ...said(['user', "It's 2 4 0."])], '240 Elm Street'), null);
+  assert.equal(houseNumberProblem([...garbledThenGuess, ...said(['user', 'Two forty. 240.'])], '240 Elm Street'), null);
+  // Emma reads it back digit by digit and the caller says yes.
+  assert.equal(houseNumberProblem([...garbledThenGuess, ...said(['bot', 'Just the number: two, four, zero?'], ['user', 'Yes, that\'s it.'])], '240 Elm Street'), null);
+  // A read-back the caller corrects is not a yes; a different number said later is not this one.
+  assert.equal(houseNumberProblem([...garbledThenGuess, ...said(['bot', 'Two four zero?'], ['user', 'No, 2 4 2 4 0.'])], '240 Elm Street'), 'unconfirmed');
+  // Nothing garbled, no transcript, or no house number: never blocks.
+  assert.equal(houseNumberProblem(said(['user', 'It is 240 Elm Street.']), '240 Elm Street'), null);
+  assert.equal(houseNumberProblem(said(['user', 'My number is 6 1 5 5 5 5 0 1 4 4 and I live on Elm.']), '240 Elm Street'), null);
+  assert.equal(houseNumberProblem(null, '240 Elm Street'), null);
+  assert.equal(houseNumberProblem(garbledThenGuess, 'Elm Street, Nashville'), null);
+});
+
+test('the guessed house number is sent back once, then saved', async t => {
+  const post = await fixture(t);
+  const body = id => { const p = payload(id, { ...details, address: '240 Elm Street, Nashville' }); p.message.artifact = { messages: garbledThenGuess }; return p; };
+  const first = await post(body('guess'));
+  assert.equal(first.saved, false);
+  assert.match(first.error, /house number/);
+  assert.equal((await post(body('guess'))).saved, true);
 });

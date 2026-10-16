@@ -63,6 +63,35 @@ export const garbledHouseNumber = address => {
   return groups.some(g => g.length > 6) || (groups.length >= 3 && groups.every(g => g.length <= 2));
 };
 
+// The caller gave a garbled house number ("2 42 4 0 Elm") and Emma saved a clean-looking one ("240 Elm") that the
+// caller never said plainly or confirmed afterwards (round 3). Needs the transcript; never blocks without one, or when
+// the saved address has no house number. Returns null when the save may go ahead, else 'unconfirmed'.
+// "2 42 4 0": 3+ groups of 1-2 digits, mixed sizes, 6 digits or fewer, so a phone number said digit by digit
+// ("6 1 5 5 5 5 0 1 4 4 and…") or a plain "5 0 1" never counts.
+const mixedGroups = n => {
+  const groups = n.split(/[\s-]+/);
+  return groups.length >= 3 && groups.every(g => g.length <= 2) && groups.some(g => g.length === 2) && groups.join('').length <= 6;
+};
+const YES = /^\W*(yes|yeah|yep|yup|correct|right|that's right|that is right|exactly|uh-huh)\b/i;
+export const houseNumberProblem = (messages, address) => {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  const saved = String(address || '').match(/^\s*(\d+)\b/)?.[1];
+  if (!saved) return null;
+  const turns = messages.filter(m => ['bot', 'assistant', 'user'].includes(m?.role) && typeof (m.message ?? m.content) === 'string');
+  const text = m => m.message ?? m.content;
+  let garbled = -1;
+  turns.forEach((m, i) => {
+    if (m.role === 'user' && (text(m).match(/\d+(?:[\s-]+\d+)+(?=\s+[a-z])/gi) || []).some(mixedGroups)) garbled = i;
+  });
+  if (garbled < 0) return null;
+  const plain = new RegExp(`(?<!\\d[\\s-]*)(${saved}|${saved.split('').join('[\\s-]+')})(?![\\s-]*\\d)`);
+  const later = turns.slice(garbled + 1);
+  if (later.some(m => m.role === 'user' && plain.test(text(m)))) return null;
+  const readBack = later.findIndex(m => m.role !== 'user' && spokenDigits(text(m)).includes(saved));
+  if (readBack >= 0 && later.slice(readBack + 1).some(m => m.role === 'user' && YES.test(text(m)))) return null;
+  return 'unconfirmed';
+};
+
 // Digits in what Emma said, written or spoken ("six one five, oh one", "double five" -> "615015" / "55").
 const DIGIT_WORDS = { zero: '0', oh: '0', o: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
 export const spokenDigits = text => {
@@ -894,7 +923,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     }
     if (typeof args.is_test !== 'boolean') return failure('is_test must be boolean');
     details.is_test = args.is_test;
-    if (garbledHouseNumber(details.address) && !addressWarned.has(callId)) {
+    if ((garbledHouseNumber(details.address) || houseNumberProblem(transcriptOf(message), details.address)) && !addressWarned.has(callId)) {
       if (addressWarned.size > 10000) addressWarned.clear();
       addressWarned.add(callId);
       return failure('Not saved: the house number sounds garbled. Say "Sorry, I want to make sure I have the house number right. Could you say just the number again?", read it back digit by digit, then save again.');
