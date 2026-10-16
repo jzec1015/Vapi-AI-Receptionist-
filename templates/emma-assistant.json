@@ -82,8 +82,8 @@
     "customEndpointingRules": [
       {
         "type": "assistant",
-        "regex": "(number|phone|callback|address|street|spell|zip)",
-        "timeoutSeconds": 2
+        "regex": "(number to reach|phone number|callback number|best number|good number)",
+        "timeoutSeconds": 1.5
       }
     ]
   },
