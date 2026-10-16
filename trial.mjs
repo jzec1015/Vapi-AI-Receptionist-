@@ -17,6 +17,9 @@ const SITE = 'https://anchorlineappai.com';
 const OWN_NUMBERS = ['+19305009061', '+16153142826'];
 const ASSISTANT_TEMPLATE = readFileSync(new URL('./templates/emma-assistant.json', import.meta.url), 'utf8');
 const PROMPT_TEMPLATE = readFileSync(new URL('./templates/emma-prompt.txt', import.meta.url), 'utf8');
+// The website's fonts, inlined into the trial pages (their CSP allows no font requests, only data: fonts).
+const DM_SANS = readFileSync(new URL('./templates/fonts/dm-sans.woff2', import.meta.url)).toString('base64');
+const MANROPE = readFileSync(new URL('./templates/fonts/manrope.woff2', import.meta.url)).toString('base64');
 
 export const sha256 = value => createHash('sha256').update(String(value)).digest('hex');
 export const newToken = () => randomBytes(32).toString('hex');
@@ -214,15 +217,19 @@ class StepError extends Error {
 class Stopped extends Error {}
 
 // ---------- HTML ----------
-// Same palette as the website (landing-page/src/plumbing-home.css). Fonts are the system stack: the CSP allows no font files.
-const CSS = `:root{--bg:#f4f2ed;--card:#fff;--ink:#10201a;--ink-2:#33443b;--muted:#56655d;--line:#dcdfd8;--green:#2b5943;--green-ink:#fff;
+// Same palette, fonts and logo as the website (landing-page/src/plumbing-home.css).
+const CSS = `@font-face{font-family:'DM Sans';font-weight:400 700;font-display:swap;src:url(data:font/woff2;base64,${DM_SANS}) format('woff2')}
+@font-face{font-family:'Manrope';font-weight:400 800;font-display:swap;src:url(data:font/woff2;base64,${MANROPE}) format('woff2')}
+:root{--display:'Manrope',system-ui,sans-serif;--bg:#f4f2ed;--card:#fff;--ink:#10201a;--ink-2:#33443b;--muted:#56655d;--line:#dcdfd8;--green:#2b5943;--green-ink:#fff;
 --signal:#b9ec4f;--signal-ink:#3d6b17;--soft:#eef2e7;--urgent:#c2410c;--shadow:0 2px 6px #10201a10,0 18px 44px #10201a14}
 @media (prefers-color-scheme:dark){:root{--bg:#0b1510;--card:#13211a;--ink:#eef2e7;--ink-2:#cfd9cf;--muted:#9fb0a5;--line:#26372d;--green:#b9ec4f;--green-ink:#0b1510;
 --signal-ink:#b9ec4f;--soft:#1a2b22;--shadow:none}}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--ink);
-font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+font:16px/1.55 'DM Sans',system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
 a{color:inherit}.top{padding:18px 16px;border-bottom:1px solid var(--line)}.top .in{max-width:600px;margin:0 auto}
-.logo{display:inline-flex;align-items:center;gap:9px;font-weight:800;font-size:17px;letter-spacing:-.01em;text-decoration:none}.logo svg{color:var(--green)}
+.logo{display:inline-flex;align-items:center;gap:8px;font:700 21px/1 var(--display);letter-spacing:-.03em;text-decoration:none}.logo svg{color:var(--green);width:24px;height:24px}
+.logo b{font:600 10px/1 ui-monospace,Menlo,Consolas,monospace;letter-spacing:0;border:1px solid var(--line);border-radius:5px;padding:4px 5px;color:var(--muted)}
+h1,.num,.eyebrow{font-family:var(--display)}
 main{flex:1;width:100%;max-width:600px;margin:0 auto;padding:clamp(24px,6vw,56px) 16px 32px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:clamp(22px,5vw,36px);box-shadow:var(--shadow)}
 .eyebrow{font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--signal-ink);margin:0 0 10px}
@@ -243,12 +250,13 @@ dt{color:var(--muted)}dd{font-weight:700;text-align:right}.muted{color:var(--mut
 footer{padding:22px 16px 30px;text-align:center;font-size:14px;color:var(--muted)}footer a{color:var(--muted)}
 .wide{max-width:none}table{border-collapse:collapse;width:100%;font-size:14px;background:var(--card)}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}
 form{display:inline}button{font:inherit;font-size:13px;margin:2px;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer}`;
-const CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
-const LOGO = `<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-<circle cx="12" cy="5" r="2.5"/><path d="M12 7.5V21M7 11h10M4 14a8 7 0 0 0 16 0"/></svg>`;
+const CSP = "default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+// The website's anchor mark (landing-page/src/plumbing-home.mjs, icon.anchor) and wordmark.
+const LOGO = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 0v16m-7-7a7 7 0 0 0 14 0M8 9h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+<span>anchorline</span><b>AI</b>`;
 export const page = (title, body, { refresh = 0, wide = false } = {}) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><meta name="color-scheme" content="light dark">${refresh ? `<meta http-equiv="refresh" content="${refresh}">` : ''}
-<title>${escapeHtml(title)}</title><style>${CSS}</style></head><body><header class="top"><div class="in"><a class="logo" href="${SITE}">${LOGO}Anchorline AI</a></div></header>
+<title>${escapeHtml(title)}</title><style>${CSS}</style></head><body><header class="top"><div class="in"><a class="logo" href="${SITE}" aria-label="Anchorline AI home">${LOGO}</a></div></header>
 <main${wide ? ' class="wide"' : ''}>${body}</main><footer>Questions? Reply to any of our emails. &middot; <a href="${SITE}">anchorlineappai.com</a></footer></body></html>`;
 // The four setup steps a trial owner goes through; `done` is how many are finished, the next one is highlighted.
 export const steps = done => `<ol class="steps">${['Email confirmed', 'Emma gets a local phone number', 'Forward your shop line to Emma', 'Emma answers your missed calls']
@@ -919,21 +927,25 @@ Anchorline AI`, `${c.id}-${kind}-${c.trial_ends_at}`);
   function statusPage(c, now) {
     const v = statusView(c, now);
     const intro = c.status === 'ended'
-      ? (inGrace(c, now) ? `<p>The trial has ended. Emma is still catching your calls until ${escapeHtml(dateText(c.grace_ends_at))}. Not keeping her? Undo the call forwarding on your shop line before then. Keeping her? Reply to any of our emails.</p>`
+      ? (inGrace(c, now) ? `<p>The trial has ended. Emma is still catching your calls until ${escapeHtml(dateText(c.grace_ends_at))}. Not keeping her? Undo the call forwarding on your shop line before then.</p>`
         : '<p>This trial has ended and Emma\'s number is switched off. If your shop line still forwards to it, undo the forwarding now.</p>')
       : { provisioning: '<p>Emma is being set up with her own phone number. This usually takes a few minutes; this page refreshes by itself.</p>',
-        active: '<p>Emma is live and ready to answer your calls.</p>',
+        active: c.forwarding_confirmed_at ? '<p>Emma is live and catching the calls your shop misses.</p>'
+          : '<p>Emma is ready. One step left: forward your shop line to her, so the calls nobody picks up reach her instead of voicemail.</p>',
         waitlisted: "<p>You're on the waiting list. We'll email you as soon as a trial spot opens up.</p>" }[c.status] || '<p>Your trial is not active yet.</p>';
     const live = v.emma_number ? `<div class="numbox"><p class="label">Emma's number</p><div class="num">${escapeHtml(formatPhone(v.emma_number))}</div>
-<a class="btn" href="${escapeHtml(v.call_link)}">Call Emma now</a><a class="btn alt" href="${escapeHtml(v.forwarding_link)}">Forward your shop line to Emma</a></div>` : '';
-    const [label, tone] = { active: ['Live', 'live'], provisioning: ['Setting up', 'wait'], waitlisted: ['On the waiting list', 'wait'],
+${v.forwarding_confirmed ? `<a class="btn${c.status === 'ended' ? ' alt' : ''}" href="${escapeHtml(v.call_link)}">Call Emma now</a><a class="btn alt" href="${escapeHtml(v.forwarding_link)}">Forwarding help</a>`
+  : `<a class="btn" href="${escapeHtml(v.forwarding_link)}">Forward your shop line to Emma</a><a class="btn alt" href="${escapeHtml(v.call_link)}">Call Emma now</a>`}</div>` : '';
+    const [label, tone] = { active: c.forwarding_confirmed_at ? ['Live', 'live'] : ['Ready, waiting for forwarding', 'wait'], provisioning: ['Setting up', 'wait'], waitlisted: ['On the waiting list', 'wait'],
       pending_verification: ['Waiting for email confirmation', 'wait'], ended: [inGrace(c, now) ? 'Trial ended, still answering' : 'Trial ended', 'off'] }[c.status] || [c.status, ''];
     const progress = c.status === 'ended' || c.status === 'waitlisted' ? ''
       : steps(c.status === 'pending_verification' ? 0 : !c.phone_number ? 1 : !v.forwarding_confirmed ? 2 : 4);
+    // An ended trial's one question is whether they keep her: a reply to Jake, with the shop named in the subject.
+    const keep = c.status === 'ended' && env.OFFICE_EMAIL ? `<a class="btn" href="mailto:${escapeHtml(env.OFFICE_EMAIL)}?subject=${escapeHtml(encodeURIComponent(`Keep Emma for ${c.business}`))}">I want to keep Emma</a>` : '';
+    const facts = c.status === 'waitlisted' ? '' : `<dl>${v.days_left != null ? `<dt>Days left</dt><dd>${v.days_left}</dd>` : ''}
+<dt>Minutes used</dt><dd>${v.minutes_used} of ${v.minute_cap}</dd><dt>Forwarding confirmed</dt><dd>${v.forwarding_confirmed ? 'Yes' : 'Not yet'}</dd></dl>`;
     return page(`Emma for ${c.business}`, `<div class="card"><p class="eyebrow">Free 14-day trial</p><h1>Emma for ${escapeHtml(c.business)}</h1>
-<span class="pill ${tone}">${escapeHtml(label)}</span>${intro}${live}${progress}
-<dl>${v.days_left != null ? `<dt>Days left</dt><dd>${v.days_left}</dd>` : ''}
-<dt>Minutes used</dt><dd>${v.minutes_used} of ${v.minute_cap}</dd><dt>Forwarding confirmed</dt><dd>${v.forwarding_confirmed ? 'Yes' : 'Not yet'}</dd></dl>
+<span class="pill ${tone}">${escapeHtml(label)}</span>${intro}${keep ? `${keep}<div style="height:18px"></div>` : ''}${live}${progress}${facts}
 <p class="muted" style="margin-top:16px">Keep this page's link private. It shows your trial details.</p></div>`, { refresh: c.status === 'provisioning' ? 20 : 0 });
   }
 
