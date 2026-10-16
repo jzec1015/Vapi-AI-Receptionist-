@@ -32,7 +32,7 @@ Each client assistant gets its own alert route, so demo and test lines never ale
 SMS uses TELNYX_API_KEY and TELNYX_FROM (a 10DLC-registered Telnyx number). Email alerts use RESEND_API_KEY and EMAIL_FROM.
 Requests starting with "URGENT -" are flagged in the alert. The caller ID is stored and used when no callback number was given.
 The add_request_note tool appends a note to the saved request and sends an update alert.
-To catch callers who hang up before a request is saved, set the assistant Server URL to this webhook with the x-anchorline-key header and enable the end-of-call-report server message. Calls of 10 seconds or more with a caller ID become a "Caller hung up" request.
+To catch callers who hang up before a request is saved, set the assistant Server URL to this webhook with the x-anchorline-key header and enable the end-of-call-report server message. Calls of 10 seconds or more with a caller ID become a "Caller hung up" request. Shorter calls (the caller hung up during the greeting) become a "Caller hung up during greeting – (615) ... – call them back" lead on lines with an alert route, once per caller number per 30 minutes (v1.8).
 
 ## Emergency live transfer (v1.6)
 
@@ -40,6 +40,19 @@ Add `"transfer": "+1..."` (owner's cell, E.164) to a route in ALERT_ROUTES. For 
 Emma's transfer tool has no fixed destination, so Vapi sends `transfer-destination-request` to this webhook. The reply is a `warm-transfer-experimental` destination: the owner hears the saved job (name, address, issue, callback number) and must accept before the caller is connected. Voicemail, no answer or a decline returns the caller to Emma (`fallbackPlan.endCallEnabled: false`).
 The held alert call goes out, once, when Emma calls `transfer_no_answer`, when the call ends without being forwarded, or after TRANSFER_FALLBACK_SECONDS (default 75) unless Vapi reports the call as forwarded. Only one transfer attempt per call; test calls transfer only when the route has `alertTests: true`.
 Add `transfer-destination-request` and `transfer-update` to the assistant's serverMessages.
+
+## Urgent escalation, lock-screen subjects and daily digest (v1.8)
+
+Route fields (ALERT_ROUTES; all optional):
+`{"<assistantId>": {"business": "...", "email": ["office@..."], "call": ["+1..."], "backup": "+1...", "digest": ["owner@..."], "alertTests": false}}`
+- `backup` (E.164): rung when the urgent alert call to the `call` numbers is not answered.
+- `digest`: `false` turns the daily digest off; a list adds recipients to `email` for the digest only.
+
+Urgent jobs: about 150 s after the spoken alert call is placed, the server asks Vapi (`GET /call/<id>`, VAPI_API_KEY) how it ended. Only `assistant-ended-call`, `assistant-said-end-call-phrase`, or `customer-ended-call` after 15 s or more counts as answered; no answer, busy, voicemail, silence timeout, max duration, a refused call, an error, or no result after 10 minutes count as not answered. Not answered: an `UNANSWERED URGENT – <issue> – <street> – <phone>` email goes to the route's `email` (and OFFICE_EMAIL), the `backup` number is rung, and the `call` numbers are rung once more about 5 minutes after the first ring (skipped if the backup answered). If Vapi does send the alert call's own end-of-call report to this webhook, its outcome is used directly and it never becomes a hang-up lead. Every ring and outcome is logged (`alert-call`, `alert-outcome`, `escalation`) and kept in SQLite (`alert_calls`, `escalations`), so restarts resume where they stopped. Test calls never ring, so they never escalate.
+
+Owner emails have lock-screen subjects, at most 90 characters: `URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142`, `New job – water heater quote – <street> – <phone>`, `Caller hung up – <phone> – call them back`. Bodies are unchanged, plus a `Recording:` line near the top when Vapi's end-of-call report carried a recording link (hang-up leads and the unanswered email; job alerts go out during the call, before a recording exists).
+
+Daily digest: from 7am America/Chicago each route's `email` (plus `digest`) gets yesterday's calls Emma answered, jobs saved, urgent jobs with how their alert calls went, and hang-ups to call back, also on a zero-call day ("Emma answered 0 forwarded calls yesterday — she's on and working"). Trial clients in service get it too. Sent once per route per day (table `digests`; up to 5 tries, 15 minutes apart); a server that is down at 7 sends it later that day. Call counts need the end-of-call-report server message on the assistant (calls are logged in `call_log`).
 
 ## Verification
 

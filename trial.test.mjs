@@ -59,7 +59,7 @@ test('an active trial client gets office emails and alert calls, never SMS', asy
   const saved = await result(await post(toolCall('call-a', 'asst-a', { ...intake, issue: 'URGENT - pipe burst', email_status: 'skipped_emergency' })));
   assert.equal(saved.saved, true); assert.equal(saved.office_alert, 'sent'); assert.equal(saved.live_transfer, 'available');
   assert.equal(sent.filter(s => s.url.includes('telnyx')).length, 0);
-  assert.deepEqual(alerts(sent).map(s => [s.body.to, s.body.subject]), [[['desk@trial.example'], 'Anchorline AI: URGENT call - Trial a Plumbing']]);
+  assert.deepEqual(alerts(sent).map(s => [s.body.to, s.body.subject]), [[['desk@trial.example'], 'URGENT – pipe burst – 48 Birch Road – (615) 555-0142']]);
   // The spoken alert waits for the live transfer to the client's transfer number.
   const answer = await (await post({ message: { type: 'transfer-destination-request', call: call('call-a', 'asst-a') } })).json();
   assert.equal(answer.destination.number, '+16155550402');

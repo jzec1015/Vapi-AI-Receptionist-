@@ -65,7 +65,10 @@ async function run(t, factory, steps) {
 }
 const isAlert = s => (s.url.includes('telnyx')) || (s.url.includes('resend') && s.headers['Idempotency-Key'].includes('-alert-'));
 // Office alert wording is allowed to differ; who gets what, from whom, and with which idempotency key may not.
-const shape = s => isAlert(s) ? { url: s.url, method: s.method, headers: s.headers, to: s.body.to, from: s.body.from } : s;
+// v1.8 adds one sentence to the spoken alert's system prompt (never end a voicemail; ending the call now means "heard").
+const V18_VOICEMAIL = ' If you only hear a voicemail greeting, a beep or a recording, never end the call yourself; just wait.';
+const spoken = s => s.url === 'https://api.vapi.ai/call' ? JSON.parse(JSON.stringify(s).replace(V18_VOICEMAIL, '')) : s;
+const shape = s => isAlert(s) ? { url: s.url, method: s.method, headers: s.headers, to: s.body.to, from: s.body.from } : spoken(s);
 
 for (const [name, steps] of Object.entries(scenarios)) {
   test(`with today's production variables, a ${name} does what v1.5.0 does`, async t => {

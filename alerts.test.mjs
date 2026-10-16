@@ -84,7 +84,7 @@ test('alert emails never carry the SMS opt-out line and are not cut short', asyn
   const emails = sent.filter(s => s.url.includes('resend'));
   assert.equal(emails.length, 3);
   for (const e of emails) { assert.doesNotMatch(e.body.text, /STOP/); assert.doesNotMatch(e.body.subject, /STOP/); }
-  assert.equal(emails[0].body.subject, 'Anchorline AI: Caller hung up - Gold Star Plumbing');
+  assert.equal(emails[0].body.subject, 'Caller hung up – (615) 555-0100 – call them back');
   assert.match(emails[0].body.text, /\(615\) 555-0100 \(caller ID\)\nHung up before finishing\. Summary: Caller reported a leak and hung up\.\n\nRequest reference: /);
   assert.ok(emails[1].body.text.includes(long)); assert.match(emails[1].body.text, /José Núñez[\s\S]*Details: Rheem 40-gal/);
   assert.match(emails[2].body.text, /Note: Gate code 4471/);

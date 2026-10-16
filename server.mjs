@@ -50,6 +50,61 @@ export function formatPhone(value) {
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : String(value || '');
 }
 
+// Lock-screen email subjects: what, where, who to call, e.g. "URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142".
+// At most 90 characters; the phone number is never cut, the address keeps its first part (street), the issue gets the rest.
+const SEP = ' \u2013 ';
+const clip = (text, n) => {
+  text = String(text || '').replace(/\s+/g, ' ').trim();
+  if (text.length <= n) return text;
+  if (n < 4) return '';
+  const cut = text.slice(0, n - 1);
+  const words = /\s/.test(text[n - 1]) ? cut : cut.replace(/\s+\S*$/, '');
+  return `${(words || cut).replace(/[\s,.;:-]+$/, '')}\u2026`;
+};
+export function subjectLine(head, topic, address, phone, max = 90) {
+  const room = max - head.length - phone.length - SEP.length * 3;
+  const street = String(address || '').split(',')[0];
+  let place = clip(street, 28);
+  let what = clip(topic, room - place.length);
+  if (what.length < 12 && place) { place = clip(street, room - 12); what = clip(topic, room - place.length); }
+  return [head, what, place, phone].filter(Boolean).join(SEP).slice(0, max);
+}
+export function alertSubject(details, kind = 'new') {
+  const urgent = /^\s*URGENT\b/i.test(details.issue);
+  const phone = formatPhone(details.callback_phone || details.caller_id) || 'no number given';
+  if (kind === 'hangup') return `Caller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${SEP}call them back`;
+  if (kind === 'unanswered') return subjectLine('UNANSWERED URGENT', details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
+  const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : urgent ? 'URGENT' : 'New job';
+  return subjectLine(head, kind === 'note' ? details.notes.at(-1) : details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
+}
+
+// Did a person hear an alert call? Judged from Vapi's endedReason, the only outcome Vapi reports. Everything else
+// (customer-did-not-answer, customer-busy, voicemail, silence-timed-out, exceeded-max-duration, failed to connect,
+// errors, unknown) counts as not answered: a needless backup call is cheap, an unseen urgent job is not.
+// customer-ended-call counts only after 15 s (long enough to hear the job); a voicemail that hangs up by itself after
+// 15 s is the known gap (Vapi cannot tell it from a person without voicemail detection).
+export function answeredCall(endedReason, seconds) {
+  return ['assistant-ended-call', 'assistant-said-end-call-phrase'].includes(endedReason) || (endedReason === 'customer-ended-call' && Number(seconds) >= 15);
+}
+
+// Calendar days for the daily digest are America/Chicago days (DST-safe, from Intl).
+const TZ = 'America/Chicago';
+const zoned = ms => Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: TZ, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric',
+  hour: 'numeric', minute: 'numeric', second: 'numeric' }).formatToParts(ms).filter(p => p.type !== 'literal').map(p => [p.type, Number(p.value)]));
+function zonedMidnight(y, m, d) {
+  const wall = Date.UTC(y, m - 1, d);
+  let t = wall;
+  for (let i = 0; i < 2; i++) { const p = zoned(t); t = wall - (Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - t); }
+  return t;
+}
+// Yesterday (Chicago) as an ISO window for created_at comparisons, plus the local hour now.
+export function digestWindow(now = Date.now()) {
+  const p = zoned(now);
+  const y = new Date(Date.UTC(p.year, p.month - 1, p.day - 1));
+  return { hour: p.hour, day: y.toISOString().slice(0, 10), label: y.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' }),
+    start: new Date(zonedMidnight(y.getUTCFullYear(), y.getUTCMonth() + 1, y.getUTCDate())).toISOString(), end: new Date(zonedMidnight(p.year, p.month, p.day)).toISOString() };
+}
+
 // Plain-text office alert. GSM-7 only (no emoji, no smart quotes) so a full alert is at most
 // 3 SMS segments; one non-GSM character would switch the whole text to UCS-2 (70 chars/segment).
 // Carrier rules: the sender brand (Anchorline AI) is named and every text carries an opt-out line,
@@ -68,6 +123,8 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' - ')}`);
   if (kind === 'new' && details.job_details) lines.push(`Details: ${details.job_details}`);
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
+  // Email only: the call recording (from Vapi's end-of-call report) near the top, when the server has it.
+  if (channel === 'email' && details.recording_url) lines.splice(1, 0, `Recording: ${details.recording_url}`);
   if (channel === 'email') return lines.join('\n');
   return `${gsm(lines.join('\n')).slice(0, 280)}\nReply STOP to opt out`;
 }
@@ -100,11 +157,13 @@ Reference: ${id.slice(0, 8)}`
 
 // Spoken alert for urgent jobs: reads the job once, repeats on request, then hangs up.
 // missedTransfer: the caller was offered a live transfer that nobody picked up.
-export function alertCall(route, details, phoneNumberId, to, missedTransfer = false) {
+// stage: primary, backup (the primary ring went unanswered) or retry (the primary, once more).
+export function alertCall(route, details, phoneNumberId, to, missedTransfer = false, stage = 'primary') {
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : details.caller_id ? formatPhone(details.caller_id) : 'no number given';
   const job = `${details.name}, at ${details.address || 'no address given'}. ${issue}. Callback number: ${phone}.`;
-  const missed = missedTransfer ? ' I tried to put them through to you live but couldn\'t reach you, so please call them back.' : '';
+  const missed = (missedTransfer ? ' I tried to put them through to you live but couldn\'t reach you, so please call them back.' : '') +
+    (stage === 'backup' ? ' I couldn\'t reach the main number, so I\'m calling you as the backup.' : stage === 'retry' ? ' This is my second try; I couldn\'t reach you a few minutes ago.' : '');
   return {
     phoneNumberId, customer: { number: to },
     assistant: {
@@ -113,7 +172,9 @@ export function alertCall(route, details, phoneNumberId, to, missedTransfer = fa
       voice: { provider: '11labs', voiceId: 'EXAVITQu4vr4xnSDxMaL', model: 'eleven_turbo_v2_5' },
       model: { provider: 'openai', model: 'gpt-4.1', maxTokens: 120, messages: [{ role: 'system', content:
         `You just delivered this urgent job alert for ${route.business}: ${job} If asked, repeat it slowly, especially the callback number. ` +
-        'You cannot do anything else. When they say thanks, no, or goodbye, say a short goodbye and end the call.' }] }
+        'You cannot do anything else. When they say thanks, no, or goodbye, say a short goodbye and end the call. ' +
+        // Ending the call is read as "a person heard it" (answeredCall), so a voicemail must never be ended by the assistant.
+        'If you only hear a voicemail greeting, a beep or a recording, never end the call yourself; just wait.' }] }
     }
   };
 }
@@ -156,12 +217,18 @@ export function createApp(env = process.env, send = fetch) {
   // "call" numbers get a spoken alert for URGENT jobs (needs VAPI_API_KEY and ALERT_CALL_FROM_ID).
   // "transfer": "+1..." (owner's cell) enables a live warm transfer for URGENT jobs. The spoken alert call then waits
   // until the transfer is not answered, and is placed anyway after TRANSFER_FALLBACK_SECONDS unless the caller was connected.
+  // "backup": "+1..." (E.164) is rung when the urgent alert call is not answered; the "call" numbers are then rung once more
+  // about 5 minutes after the first ring, and "email" gets an "UNANSWERED URGENT – ..." email (see escalate).
+  // "digest": false turns off the 7am (America/Chicago) daily digest to "email"; "digest": ["..."] adds recipients to it.
   let routes = {};
   try { routes = JSON.parse(env.ALERT_ROUTES || '{}') || {}; } catch { routes = {}; }
   // The route for an assistant: an ALERT_ROUTES entry wins; otherwise an active trial client row (SMS stays off
   // until the 10DLC campaign covers trial clients). Every route lookup goes through here.
   const routeOf = assistantId => routes[assistantId] || clientRoute(assistantId);
   const routeFor = message => routeOf(assistantIdOf(message));
+  // Urgent escalation timing. Alert calls last at most 90 s (maxDurationSeconds), so the first ring is judged 150 s after it
+  // was placed; a ring Vapi still cannot report after 10 minutes counts as not answered. The retry is ~5 minutes after the first ring.
+  const CHECK_MS = 150000, RECHECK_MS = 30000, RETRY_MS = 300000, GIVE_UP_MS = 600000;
   const fallbackMs = Math.max(0, Number(env.TRANSFER_FALLBACK_SECONDS ?? 75) || 0) * 1000;
   const canTransfer = (route, details) => !!route && isE164(route.transfer) && /^\s*URGENT\b/i.test(details.issue) && (!details.is_test || !!route.alertTests);
   let db;
@@ -177,7 +244,23 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS transfers (
         call_id TEXT PRIMARY KEY, assistant_id TEXT, status TEXT NOT NULL, due_at INTEGER NOT NULL, updated_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS bookings (call_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, result TEXT NOT NULL);
+      -- v1.8: urgent alert calls (one row per job, stage and number, claimed before Vapi is called), the escalation of
+      -- each urgent job, every customer call Emma answered, and sent daily digests. New tables only: v1.7.1 ignores them.
+      CREATE TABLE IF NOT EXISTS alert_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, call_id TEXT NOT NULL, stage TEXT NOT NULL, to_number TEXT NOT NULL, placed_at INTEGER NOT NULL,
+        vapi_call_id TEXT, outcome TEXT, ended_reason TEXT, UNIQUE (call_id, stage, to_number)
+      );
+      CREATE INDEX IF NOT EXISTS alert_calls_vapi ON alert_calls (vapi_call_id);
+      CREATE TABLE IF NOT EXISTS escalations (
+        call_id TEXT PRIMARY KEY, status TEXT NOT NULL, check_at INTEGER NOT NULL, emailed TEXT, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS call_log (call_id TEXT PRIMARY KEY, assistant_id TEXT, ended_at TEXT NOT NULL, seconds REAL, is_test INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS call_log_day ON call_log (assistant_id, ended_at);
+      CREATE TABLE IF NOT EXISTS digests (
+        assistant_id TEXT NOT NULL, day TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, sent_at TEXT,
+        PRIMARY KEY (assistant_id, day)
+      );`);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
     // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
     // A failed trial migration switches trials off (healthz trials_enabled: false) but never stops the server.
@@ -299,17 +382,54 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       return response.ok ? 'accepted' : 'needs_review';
     } catch { return 'needs_review'; }
   }
-  // Spoken alert calls to a route's "call" numbers (urgent jobs only).
-  function phoneAlerts(route, details, missedTransfer = false) {
+  // Email to a route's own addresses (Resend). Returns accepted, needs_review or not_configured; never throws.
+  async function mail(to, subject, text, idempotencyKey) {
+    if (!to?.length || !env.RESEND_API_KEY || !env.EMAIL_FROM) return 'not_configured';
+    try {
+      const response = await send('https://api.resend.com/emails', {
+        method: 'POST', signal: AbortSignal.timeout(8000),
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify({ from: env.EMAIL_FROM, to, subject, text }) });
+      return response.ok ? 'accepted' : 'needs_review';
+    } catch { return 'needs_review'; }
+  }
+  const last4 = number => String(number).slice(-4);
+  // Spoken alert calls for one stage of an urgent job (primary, backup, retry). Each job+stage+number is claimed in
+  // SQLite before Vapi is called, so a restart or an overlapping sweep never rings anyone twice. The Vapi call id is
+  // kept so the sweep can ask Vapi how the call ended. Returns Responses for settle().
+  function placeCalls(callId, route, details, stage, numbers, missedTransfer = false) {
     if (!env.VAPI_API_KEY || !env.ALERT_CALL_FROM_ID) return [];
-    return (route.call || []).map(to => send('https://api.vapi.ai/call', {
-      method: 'POST', signal: AbortSignal.timeout(8000),
-      headers: { Authorization: `Bearer ${env.VAPI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(alertCall(route, details, env.ALERT_CALL_FROM_ID, to, missedTransfer)) }));
+    return numbers.map(async to => {
+      if (db.prepare('INSERT OR IGNORE INTO alert_calls (call_id, stage, to_number, placed_at) VALUES (?, ?, ?, ?)').run(callId, stage, to, Date.now()).changes !== 1) return { ok: true };
+      let response, vapiId = null;
+      try {
+        response = await send('https://api.vapi.ai/call', {
+          method: 'POST', signal: AbortSignal.timeout(8000),
+          headers: { Authorization: `Bearer ${env.VAPI_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(alertCall(route, details, env.ALERT_CALL_FROM_ID, to, missedTransfer, stage)) });
+        if (response.ok) try { const id = (await response.clone().json())?.id; if (typeof id === 'string' && id.length <= 200) vapiId = id; } catch {}
+      } catch {}
+      // Refused or unreachable: that ring is already known to be unanswered.
+      if (response?.ok) db.prepare('UPDATE alert_calls SET vapi_call_id = ? WHERE call_id = ? AND stage = ? AND to_number = ?').run(vapiId, callId, stage, to);
+      else db.prepare("UPDATE alert_calls SET outcome = 'unanswered', ended_reason = 'not_placed' WHERE call_id = ? AND stage = ? AND to_number = ?").run(callId, stage, to);
+      console.log(`alert-call call=${callId} stage=${stage} to=..${last4(to)} placed=${response?.ok ? 'yes' : 'no'} http=${response?.status || 'error'} vapi=${vapiId || 'none'}`);
+      if (!response) throw new Error('alert call failed');
+      return response;
+    });
+  }
+  // The first spoken alert for an urgent job, with its escalation row (checked by sweepEscalations). When Vapi refused
+  // every ring, the check is due at once: nobody is being rung.
+  function ring(callId, route, details, missedTransfer = false) {
+    const numbers = (route.call || []).filter(Boolean);
+    if (!env.VAPI_API_KEY || !env.ALERT_CALL_FROM_ID || !numbers.length) return [];
+    db.prepare('INSERT OR IGNORE INTO escalations (call_id, status, check_at, updated_at) VALUES (?, ?, ?, ?)').run(callId, 'ringing', Date.now() + CHECK_MS, new Date().toISOString());
+    return placeCalls(callId, route, details, 'primary', numbers, missedTransfer).map(job => job.finally(() => db.prepare(`UPDATE escalations SET check_at = ?
+      WHERE call_id = ? AND status = 'ringing' AND NOT EXISTS (SELECT 1 FROM alert_calls WHERE call_id = ? AND stage = 'primary' AND (outcome IS NULL OR outcome = 'answered'))`)
+      .run(Date.now(), callId, callId)));
   }
   // Office alerts for one client route. Returns a status string; never throws.
   // holdCall: a live transfer will be tried first, so the spoken alert call waits for its outcome.
-  async function alert(route, details, id, kind, holdCall = false) {
+  async function alert(route, details, id, kind, holdCall = false, callId = '') {
     if (!route || (details.is_test && !route.alertTests)) return details.is_test ? 'suppressed_test' : 'not_configured';
     const text = alertText(route, details, kind);
     const jobs = [];
@@ -329,10 +449,10 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       jobs.push(send('https://api.resend.com/emails', {
         method: 'POST', signal: AbortSignal.timeout(8000),
         headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': `${id}-alert-${kind}-${details.notes.length}` },
-        body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: emailText.split('\n')[0], text: `${emailText}\n\nRequest reference: ${id}` }) }));
+        body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: alertSubject(details, kind), text: `${emailText}\n\nRequest reference: ${id}` }) }));
     }
     const urgent = /^\s*URGENT\b/i.test(details.issue);
-    if (kind === 'new' && urgent && !holdCall) jobs.push(...phoneAlerts(route, details));
+    if (kind === 'new' && urgent && !holdCall && callId) jobs.push(...ring(callId, route, details));
     return settle(jobs);
   }
   async function settle(jobs) {
@@ -353,21 +473,24 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
     const assistantId = db.prepare('SELECT assistant_id FROM transfers WHERE call_id = ?').get(callId)?.assistant_id;
     const route = routeOf(assistantId);
-    const outcome = row && route ? await settle(phoneAlerts(route, JSON.parse(row.details), true)) : 'not_configured';
+    const outcome = row && route ? await settle(ring(callId, route, JSON.parse(row.details), true)) : 'not_configured';
     setTransfer(callId, 'alerted', ['alerting']);
     console.log(`transfer call=${callId} outcome=alert_${outcome} reason=${reason}`);
     return outcome;
   }
   // Was the caller handed to the owner? Asks Vapi for the call; any doubt counts as not connected.
   async function transferConnected(callId) {
-    if (!env.VAPI_API_KEY) return false;
+    const call = await vapiCall(callId);
+    return call?.status === 'forwarding' || call?.endedReason === 'assistant-forwarded-call';
+  }
+  // GET a Vapi call; null on any error.
+  async function vapiCall(id) {
+    if (!env.VAPI_API_KEY) return null;
     try {
-      const response = await send(`https://api.vapi.ai/call/${encodeURIComponent(callId)}`, {
+      const response = await send(`https://api.vapi.ai/call/${encodeURIComponent(id)}`, {
         method: 'GET', signal: AbortSignal.timeout(8000), headers: { Authorization: `Bearer ${env.VAPI_API_KEY}` } });
-      if (!response.ok) return false;
-      const call = await response.json();
-      return call?.status === 'forwarding' || call?.endedReason === 'assistant-forwarded-call';
-    } catch { return false; }
+      return response.ok ? await response.json() : null;
+    } catch { return null; }
   }
   // Backstop: held alerts whose window passed without a connected transfer get their call.
   async function sweepTransfers(now = Date.now()) {
@@ -379,6 +502,161 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       outcomes.push(await releaseAlert(call_id, 'timeout'));
     }
     return outcomes;
+  }
+  // ---------- urgent escalation ----------
+  // How an alert call ended. Vapi does not send this server the alert call's end-of-call report unless the org or
+  // phone number points its Server URL here, so the sweep asks Vapi (GET /call/<id>) and also takes a report when one
+  // arrives (alertReport). Returns answered, unanswered, or null while it is not known yet.
+  function recordOutcome(row, endedReason, seconds) {
+    const outcome = answeredCall(endedReason, seconds) ? 'answered' : 'unanswered';
+    if (db.prepare('UPDATE alert_calls SET outcome = ?, ended_reason = ? WHERE id = ? AND outcome IS NULL').run(outcome, endedReason, row.id).changes)
+      console.log(`alert-outcome call=${row.call_id} stage=${row.stage} to=..${last4(row.to_number)} outcome=${outcome} reason=${endedReason}`);
+    return db.prepare('SELECT outcome FROM alert_calls WHERE id = ?').get(row.id).outcome;
+  }
+  async function resolveCall(row, now) {
+    if (row.outcome) return row.outcome;
+    const age = now - row.placed_at;
+    if (!row.vapi_call_id) return age >= 30000 ? recordOutcome(row, 'no_call_id', 0) : null;
+    const call = await vapiCall(row.vapi_call_id);
+    if (call?.status === 'ended') return recordOutcome(row, String(call.endedReason || 'unknown'), (Date.parse(call.endedAt) - Date.parse(call.startedAt)) / 1000);
+    return age >= GIVE_UP_MS ? recordOutcome(row, call ? `still_${call.status || 'unknown'}` : 'unknown', 0) : null;
+  }
+  // An alert call's own end-of-call report: record the outcome; it is not a customer call (no hang-up lead, no minutes).
+  function alertReport(callId, message) {
+    const row = db.prepare('SELECT * FROM alert_calls WHERE vapi_call_id = ?').get(callId);
+    if (!row) return null;
+    return recordOutcome(row, String(message.endedReason ?? message.call?.endedReason ?? 'unknown'), Number(message.durationSeconds ?? message.call?.durationSeconds));
+  }
+  const setEscalation = (callId, status, from) => db.prepare(`UPDATE escalations SET status = ?, updated_at = ? WHERE call_id = ? AND status IN (${from.map(() => '?').join(', ')})`)
+    .run(status, new Date().toISOString(), callId, ...from).changes === 1;
+  // The owner's "nobody picked up" email, to the route's emails and Anchorline (OFFICE_EMAIL). Kept on the escalation
+  // row; later sweeps resend until accepted (same Idempotency-Key, so never twice).
+  async function unansweredEmail(callId, route, request, details, now) {
+    const rings = db.prepare("SELECT to_number, ended_reason FROM alert_calls WHERE call_id = ? AND stage = 'primary'").all(callId);
+    const tried = rings.map(r => `${formatPhone(r.to_number)} (${String(r.ended_reason || 'no answer').replace(/[-_]/g, ' ')})`).join(', ') || 'no number';
+    const retryAt = db.prepare('SELECT check_at FROM escalations WHERE call_id = ?').get(callId)?.check_at || now;
+    const next = [isE164(route.backup) ? `Emma is calling the backup number ${formatPhone(route.backup)} now.` : '',
+      `Emma will ring ${(route.call || []).map(formatPhone).join(' and ') || 'you'} once more in about ${Math.max(1, Math.round((retryAt - now) / 60000))} minutes.`].filter(Boolean).join(' ');
+    const subject = alertSubject(details, 'unanswered');
+    const text = `Emma's urgent alert call was not answered: ${tried}.\n${next}\nPlease call the customer back now.\n\n${alertText(route, details, 'new', 'email')}\n\nRequest reference: ${request.id}`;
+    const [client] = await Promise.all([mail(route.email, subject, text, `${request.id}-unanswered`),
+      officeNotice(`${subject.slice(0, 70)} (${route.business || 'no business'})`, text, `${request.id}-unanswered-office`)]);
+    db.prepare('UPDATE escalations SET emailed = ? WHERE call_id = ?').run(client, callId);
+    return client;
+  }
+  // One step of an urgent job's escalation, run by the sweep when check_at passes:
+  //   ringing    first ring judged: answered ends it; unanswered emails the office, rings the backup, schedules the retry
+  //   escalated  retry time: rings the "call" numbers once more, unless the backup answered
+  //   retried    records how the backup and retry rings ended (for the daily digest), then ends
+  // Every move is a status claim (UPDATE ... WHERE status = ...), so overlapping sweeps and restarts never repeat a step.
+  async function escalate(callId, status, emailed, now) {
+    const request = db.prepare('SELECT id, details, assistant_id FROM requests WHERE call_id = ?').get(callId);
+    const route = request && routeOf(request.assistant_id);
+    const details = request && JSON.parse(request.details);
+    const finish = final => { if (setEscalation(callId, final, [status])) console.log(`escalation call=${callId} outcome=${final}`); return final; };
+    if (!route) return finish('no_route');
+    if (details.is_test && !route.alertTests) return finish('suppressed_test');
+    const rows = (...stages) => db.prepare(`SELECT * FROM alert_calls WHERE call_id = ? AND stage IN (${stages.map(() => '?').join(', ')})`).all(callId, ...stages);
+    const outcomes = async list => { const out = []; for (const row of list) out.push(await resolveCall(row, now)); return out; };
+    const later = () => { db.prepare('UPDATE escalations SET check_at = ? WHERE call_id = ? AND status = ?').run(now + RECHECK_MS, callId, status); return 'waiting'; };
+    // An earlier "nobody picked up" email that did not go through is tried again on every step.
+    const resend = async () => (status !== 'ringing' && emailed === 'needs_review' ? ` email=${await unansweredEmail(callId, route, request, details, now)}` : '');
+    if (status === 'ringing') {
+      const primary = await outcomes(rows('primary'));
+      if (primary.includes('answered')) return finish('answered');
+      if (primary.includes(null)) return later();
+      if (!setEscalation(callId, 'escalated', ['ringing'])) return 'busy';
+      const first = Math.min(...rows('primary').map(r => r.placed_at));
+      db.prepare('UPDATE escalations SET check_at = ? WHERE call_id = ?').run(Math.max(now, (Number.isFinite(first) ? first : now) + RETRY_MS), callId);
+      const backup = isE164(route.backup) ? [route.backup] : [];
+      const [email, rang] = await Promise.all([unansweredEmail(callId, route, request, details, now), settle(placeCalls(callId, route, details, 'backup', backup))]);
+      console.log(`escalation call=${callId} outcome=escalated email=${email} backup=${backup.length ? rang : 'none'}`);
+      return 'escalated';
+    }
+    if (status === 'escalated') {
+      if ((await outcomes(rows('backup'))).includes('answered')) return finish('answered') + await resend();
+      if (!setEscalation(callId, 'retried', ['escalated'])) return 'busy';
+      db.prepare('UPDATE escalations SET check_at = ? WHERE call_id = ?').run(now + CHECK_MS, callId);
+      const rang = await settle(placeCalls(callId, route, details, 'retry', (route.call || []).filter(Boolean)));
+      console.log(`escalation call=${callId} outcome=retried retry=${rang}`);
+      return 'retried' + await resend();
+    }
+    const rest = await outcomes(rows('backup', 'retry'));
+    if (rest.includes('answered')) return finish('answered') + await resend();
+    if (rest.includes(null)) return later() + await resend();
+    return finish('unanswered') + await resend();
+  }
+  async function sweepEscalations(now = Date.now()) {
+    if (!db) return [];
+    const due = db.prepare("SELECT call_id, status, emailed FROM escalations WHERE status IN ('ringing', 'escalated', 'retried') AND check_at <= ?").all(now);
+    const done = [];
+    for (const { call_id, status, emailed } of due) {
+      try { done.push(await escalate(call_id, status, emailed, now)); } catch { console.warn(`escalation call=${call_id} failed`); done.push('error'); }
+    }
+    return done;
+  }
+  // ---------- daily digest ----------
+  // How an urgent job's alert went, in the owner's words.
+  function ringSummary(callId) {
+    if (transferRow(callId)?.status === 'connected') return 'put through to you live';
+    const rings = db.prepare('SELECT stage, outcome FROM alert_calls WHERE call_id = ?').all(callId);
+    if (!rings.length) return 'no alert call placed';
+    const answered = rings.find(r => r.outcome === 'answered');
+    if (answered) return `alert call answered${answered.stage === 'backup' ? ' by the backup number' : answered.stage === 'retry' ? ' on the second try' : ''}`;
+    return rings.some(r => !r.outcome) ? 'alert call outcome not known yet' : 'alert calls NOT answered';
+  }
+  // Yesterday's live numbers for one assistant. Calls are every customer call (call_log) plus any saved request, so a
+  // line without end-of-call reports still counts its jobs as calls.
+  function digestStats(assistantId, start, end) {
+    const calls = db.prepare(`SELECT COUNT(*) AS n FROM (
+        SELECT call_id FROM call_log c WHERE assistant_id = ? AND is_test = 0 AND ended_at >= ? AND ended_at < ?
+          AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.call_id = c.call_id AND r.is_test = 1)
+        UNION SELECT call_id FROM requests r WHERE assistant_id = ? AND is_test = 0 AND created_at >= ? AND created_at < ?
+          AND NOT EXISTS (SELECT 1 FROM call_log c WHERE c.call_id = r.call_id AND c.is_test = 1))`).get(assistantId, start, end, assistantId, start, end).n;
+    const rows = db.prepare(`SELECT call_id, details, result FROM requests r WHERE assistant_id = ? AND is_test = 0 AND created_at >= ? AND created_at < ?
+      AND NOT EXISTS (SELECT 1 FROM call_log c WHERE c.call_id = r.call_id AND c.is_test = 1) ORDER BY created_at`).all(assistantId, start, end)
+      .map(r => ({ call_id: r.call_id, details: JSON.parse(r.details), hangup: JSON.parse(r.result).source === 'hangup' }));
+    const jobs = rows.filter(r => !r.hangup);
+    const urgent = jobs.filter(r => /^\s*URGENT\b/i.test(r.details.issue)).map(r => ({ ...r, ring: ringSummary(r.call_id) }));
+    return { calls, jobs: jobs.length, urgent, hangups: rows.filter(r => r.hangup) };
+  }
+  const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  function digestEmail(route, label, stats) {
+    const { calls, jobs, urgent, hangups } = stats;
+    const subject = calls ? `Emma yesterday${SEP}${count(calls, 'call')}, ${count(jobs, 'job')} saved${urgent.length ? `, ${urgent.length} urgent` : ''}` +
+      `${hangups.length ? `, ${count(hangups.length, 'hang-up')}` : ''}` : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working';
+    const lines = [`${route.business || 'Your line'}${SEP}${label}`, '', `Calls Emma answered: ${calls}`, `Jobs saved: ${jobs}`, `Urgent jobs: ${urgent.length}`,
+      ...urgent.map(u => `- ${u.details.name}${SEP}${String(u.details.address || 'no address').split(',')[0]}${SEP}${u.ring}`),
+      `Hang-ups: ${hangups.length}`, ...hangups.map(h => `- ${formatPhone(h.details.caller_id)}${h.details.greeting_hangup ? ' (hung up during greeting)' : ''}${SEP}call them back`), '',
+      calls ? 'Every job was emailed to you as it came in.' : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working. ' +
+        'If you expected calls, check that your shop line still forwards to Emma.', '', 'Anchorline AI'];
+    return { subject, text: lines.join('\n') };
+  }
+  // 7am America/Chicago: yesterday's digest for each route (ALERT_ROUTES and trial clients in service), also on a zero-call
+  // day. Once per route per day: claimed in SQLite (digests), up to 5 tries 15 minutes apart, same Idempotency-Key each try.
+  // A server that is down at 7 sends it when it is back the same day. Off with "digest": false; skipped for test assistants.
+  async function sendDigests(now = Date.now()) {
+    if (!db || !env.RESEND_API_KEY || !env.EMAIL_FROM) return [];
+    const { hour, day, label, start, end } = digestWindow(now);
+    if (hour < 7) return [];
+    const ids = new Set(Object.keys(routes));
+    if (trialsEnabled) for (const { assistant_id } of db.prepare('SELECT assistant_id FROM clients WHERE assistant_id IS NOT NULL').all()) ids.add(assistant_id);
+    const done = [];
+    for (const assistantId of ids) {
+      const route = routeOf(assistantId);
+      if (!route || route.digest === false || (listOf(env.TEST_ASSISTANT_IDS).includes(assistantId) && !route.alertTests)) continue;
+      const to = [...new Set([...(route.email || []), ...(Array.isArray(route.digest) ? route.digest : [])])].filter(v => typeof v === 'string' && v);
+      if (!to.length) continue;
+      db.prepare('INSERT OR IGNORE INTO digests (assistant_id, day) VALUES (?, ?)').run(assistantId, day);
+      if (db.prepare('UPDATE digests SET attempts = attempts + 1, next_at = ? WHERE assistant_id = ? AND day = ? AND sent_at IS NULL AND attempts < 5 AND next_at <= ?')
+        .run(now + 900000, assistantId, day, now).changes !== 1) continue;
+      const { subject, text } = digestEmail(route, label, digestStats(assistantId, start, end));
+      const status = await mail(to, subject, text, `digest-${assistantId}-${day}`);
+      if (status === 'accepted') db.prepare('UPDATE digests SET sent_at = ? WHERE assistant_id = ? AND day = ?').run(new Date(now).toISOString(), assistantId, day);
+      console.log(`digest assistant=${assistantId} day=${day} status=${status}`);
+      done.push(`${assistantId}:${status}`);
+    }
+    return done;
   }
   // transfer-destination-request: only a saved, urgent request with a transfer route is put through.
   function transferRequest(message) {
@@ -425,17 +703,29 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (status === 'connected') return failure('The caller was already connected to the owner.');
     return { saved: true, owner_alert: await releaseAlert(callId, 'no_answer') };
   }
+  // The call recording from an end-of-call report, when Vapi sent one (https only).
+  const recordingOf = message => {
+    const url = message.recordingUrl || message.artifact?.recordingUrl || message.call?.artifact?.recordingUrl;
+    return typeof url === 'string' && /^https:\/\/\S+$/.test(url) && url.length <= 1000 ? url : '';
+  };
   // Safety net: a phone call that ended without a saved request still reaches the office.
+  // A caller who hangs up within the greeting (under 10 s, no details) is a lead too: "call them back". That one is sent
+  // only on a line with an alert route, and once per caller number per 30 minutes (a redial that hangs up again is the same lead).
   async function hangup(callId, message, route) {
     if (db.prepare('SELECT 1 FROM requests WHERE call_id = ?').get(callId)) return 'already_saved';
+    if (message.call?.type === 'outboundPhoneCall') return 'outbound';
     const callerId = callerNumberOf(message);
     if (!callerId) return 'no_caller_id';
-    if (!(Number(message.durationSeconds) >= 10)) return 'too_short';
+    const greeting = !(Number(message.durationSeconds) >= 10);
+    if (greeting && !route) return 'too_short';
+    if (greeting && db.prepare(`SELECT 1 FROM requests WHERE assistant_id IS ? AND created_at >= ? AND json_extract(details, '$.caller_id') = ?`)
+      .get(assistantIdOf(message), new Date(Date.now() - 1800000).toISOString(), callerId)) return 'repeat_caller';
     const summary = String(message.analysis?.summary || message.summary || '').trim().slice(0, 1000);
     // A caller who said "test call" is a test; never alert a client about it.
     const said = `${message.artifact?.transcript || message.transcript || ''} ${summary}`;
-    const details = { name: 'Unknown caller', address: '', issue: summary ? `Hung up before finishing. Summary: ${summary}` : 'Hung up before giving details',
-      is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [] };
+    const issue = greeting ? 'Hung up during the greeting, before giving any details' : summary ? `Hung up before finishing. Summary: ${summary}` : 'Hung up before giving details';
+    const details = { name: 'Unknown caller', address: '', issue, is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [],
+      ...(greeting ? { greeting_hangup: true } : {}), ...(recordingOf(message) ? { recording_url: recordingOf(message) } : {}) };
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
     classify(details, callId, message);
@@ -443,7 +733,25 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (!inserted.changes) return 'already_saved';
     result.office_alert = await alert(route, details, id, 'hangup');
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
-    return `hangup_request_created alert=${result.office_alert}`;
+    return `${greeting ? 'greeting_hangup' : 'hangup'}_request_created alert=${result.office_alert}`;
+  }
+  // After a saved call ends: keep Vapi's recording link on the request (used by the "nobody picked up" email).
+  function noteRecording(callId, message) {
+    const url = recordingOf(message);
+    if (url) db.prepare(`UPDATE requests SET details = json_set(details, '$.recording_url', ?) WHERE call_id = ? AND json_valid(details)
+      AND json_extract(details, '$.recording_url') IS NULL`).run(url, callId);
+  }
+  // Every customer call Emma answered, for the daily digest. Test calls are kept but flagged (same rules as requests,
+  // plus a trial owner calling from their own cell).
+  function logCall(callId, message) {
+    if (message.call?.type === 'outboundPhoneCall') return;
+    const assistantId = assistantIdOf(message) || '';
+    const callerId = callerNumberOf(message);
+    const owner = clientRow(assistantId)?.owner_cell;
+    const test = !!testReason(env, { callId, assistantId, callerId }) || /test call/i.test(`${message.artifact?.transcript || message.transcript || ''}`) ||
+      (!!callerId && !!owner && digitsOf(callerId) === digitsOf(owner)) || !!db.prepare('SELECT 1 FROM requests WHERE call_id = ? AND is_test = 1').get(callId);
+    const seconds = Number(message.durationSeconds ?? message.call?.durationSeconds);
+    db.prepare('INSERT OR IGNORE INTO call_log VALUES (?, ?, ?, ?, ?)').run(callId, assistantId || null, new Date().toISOString(), Number.isFinite(seconds) ? seconds : null, test ? 1 : 0);
   }
   async function submit(callId, args, message = {}) {
     const old = db.prepare('SELECT result FROM requests WHERE call_id = ?').get(callId);
@@ -488,7 +796,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       db.prepare('INSERT OR IGNORE INTO transfers VALUES (?, ?, ?, ?, ?)').run(callId, assistantIdOf(message), 'pending', Date.now() + fallbackMs, new Date().toISOString());
       result.live_transfer = 'available';
     }
-    const officeAlert = alert(routeFor(message), details, id, 'new', transfer);
+    const officeAlert = alert(routeFor(message), details, id, 'new', transfer, callId);
     if (details.is_test) {
       result.caller_email = details.email ? 'suppressed_test' : 'not_requested';
       result.anchorline_email = env.OFFICE_EMAIL ? 'suppressed_test' : 'not_requested';
@@ -518,7 +826,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.7.1', ready, trials_enabled: trialsEnabled,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.8.0', ready, trials_enabled: trialsEnabled,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
         sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length, booking_routes: booking.routeCount,
@@ -561,7 +869,10 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       const message = body?.message;
       if (message?.type === 'end-of-call-report') {
         const callId = conversationKey(message);
+        const ringOutcome = callId ? alertReport(callId, message) : null;
+        if (ringOutcome) { console.log(`end-of-call-report alert-call=${callId} outcome=${ringOutcome}`); return reply(200, {}); }
         const outcome = callId && message.call ? await hangup(callId, message, routeFor(message)) : 'no_call';
+        if (callId && message.call) try { noteRecording(callId, message); logCall(callId, message); } catch { console.warn('call log failed'); }
         // A held urgent alert is settled when the call ends: handed to the owner, or the alert call goes out now.
         let transfer = '';
         if (callId && ['pending', 'dialing'].includes(transferRow(callId)?.status)) {
@@ -645,8 +956,16 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   });
   server.requestTimeout = 30000;
   server.headersTimeout = 15000;
-  // Held urgent alerts are checked every few seconds, and again after a restart (rows live in SQLite).
-  const sweeper = db ? setInterval(() => sweepTransfers().catch(() => {}), 5000) : null;
+  // Held urgent alerts, urgent escalations and the 7am digest are checked every few seconds, and again after a restart
+  // (all state lives in SQLite). One pass at a time, so a slow Vapi or Resend never stacks passes.
+  let sweeping = false;
+  const sweepAll = async () => {
+    if (sweeping) return;
+    sweeping = true;
+    try { await sweepTransfers().catch(() => {}); await sweepEscalations().catch(() => {}); await sendDigests().catch(() => console.warn('digest failed')); }
+    finally { sweeping = false; }
+  };
+  const sweeper = db ? setInterval(sweepAll, 5000) : null;
   sweeper?.unref();
   // Trials: hourly (results emails, trial end, stuck provisioning), and once a minute after startup.
   const trialSweep = () => trials.sweep().catch(() => console.warn('trial sweep failed'));
@@ -654,6 +973,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   const trialStart = trialsEnabled ? setTimeout(trialSweep, 60000) : null;
   trialSweeper?.unref(); trialStart?.unref();
   server.sweepTransfers = sweepTransfers;
+  server.sweepEscalations = sweepEscalations;
+  server.sendDigests = sendDigests;
   server.trials = trials;
   server.on('close', () => { clearInterval(sweeper); clearInterval(trialSweeper); clearTimeout(trialStart); db?.close(); });
   return server;
