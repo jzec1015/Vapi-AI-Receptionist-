@@ -33,7 +33,7 @@ export const TRIGGERS = [
   T('warranty_company', 'Home warranty company job (check rate before accepting)', false,
     'home warranty|american home shield|choice home warranty|first american|frontdoor|select home warranty|warranty company'),
   T('renter', 'Renter: get the landlord or property manager OK', false, 'i rent|we rent|renting|renter|tenant|landlord|property manag\\w*'),
-  T('spanish', 'Spanish speaker: call back in Spanish if you can', false, 'spanish|español|espanol|habla\\w*|no hablo'),
+  T('spanish', 'Spanish speaker: call back in Spanish if you can', false, "spanish|español|espanol|habla\\w*|no hablo|limited english|(?:little|not much|no|poquito) english|(?:doesn'?t|don'?t|does not|do not) speak (?:much |good )?english|english (?:is|isn'?t) (?:limited|not good)|language barrier|un poco"),
   T('existing_customer', 'Existing customer or appointment (Emma cannot see the schedule)', false,
     "existing customer|(?:my|our|the|an|had an) appointment|appointment (?:scheduled|for today|today|this morning|this afternoon)|already (?:scheduled|booked)|running late|(?:hasn'?t|has not|never|didn'?t) (?:shown up|showed up|show up|come|came)|(?:tech|plumber|guy|y'?all|you guys) (?:was|were|came) (?:here|out)|you (?:were|was) (?:just )?(?:here|out)"),
   T('past_job', 'Unhappy about a past job', false, "still (?:leaking|broken|not working)|(?:leaking|broke) again|redo|not happy with|complain\\w*|warranty on (?:the|your) work"),

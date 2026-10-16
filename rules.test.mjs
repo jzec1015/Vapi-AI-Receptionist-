@@ -26,7 +26,7 @@ const SAID = {
   slab_leak: ['there is a warm spot on the floor', 'our water bill went way up'],
   warranty_company: ["I'm calling from American Home Shield", 'this would go through my home warranty'],
   renter: ["I rent this place", 'my landlord said to call you'],
-  spanish: ['¿habla español?', 'Spanish please'],
+  spanish: ['¿habla español?', 'Spanish please', 'caller has limited English', 'I speak little English', "he doesn't speak much English"],
   existing_customer: ['I am calling about my appointment tomorrow', 'your guy was here Tuesday',
     'I had an appointment scheduled for today and the plumber hasn\'t shown up', 'job type: existing customer'],
   past_job: ['it is leaking again after you fixed it', "I'm not happy with the work"],
@@ -192,4 +192,10 @@ test('review fixes: sales pitches stay non-urgent, the caller\'s own number is n
   assert.equal(JSON.parse((await note.json()).results[0].result).urgent, true);
   assert.equal(rings().length, 1);
   assert.match(emails().at(-1).body.subject, /^URGENT update/);
+});
+
+test('a Spanish speaker\'s save needs no email', async t => {
+  const { save } = await fixture(t, { business: 'Riverbend Plumbing', email: ['office@example.com'], hours: always });
+  const result = await save('es', { ...job, issue: 'Kitchen leak', job_details: 'Caller has limited English', email_status: 'skipped_emergency' });
+  assert.equal(result.saved, true, JSON.stringify(result));
 });

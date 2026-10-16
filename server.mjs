@@ -947,7 +947,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     }
     // Skipping the email question is only allowed for emergencies, existing customers, and calls that are not a job
     // (sales, job seekers): none of those get a confirmation email.
-    const noEmailNeeded = notAJob || tags.includes('existing_customer');
+    // Spanish speakers give name and number only (prompt), so their save skips the email too.
+    const noEmailNeeded = notAJob || tags.includes('existing_customer') || tags.includes('spanish');
     if (args.email_status === 'skipped_emergency' && !noEmailNeeded && !/^\s*URGENT\b/i.test(details.issue))
       return failure('Not saved: this is not an urgent job, so ask the caller for their email first, then save again.');
     details.caller_id = callerNumberOf(message);
