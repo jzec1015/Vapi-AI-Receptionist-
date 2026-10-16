@@ -61,7 +61,7 @@ test('signup validation answers 400 with the failing field', async t => {
   const cases = [
     [{ business: '' }, 'business'], [{ business: 'A'.repeat(101) }, 'business'], [{ business: '<script>alert(1)</script>' }, 'business'],
     [{ owner_name: undefined }, 'owner_name'], [{ owner_cell: '555-0144' }, 'owner_cell'], [{ shop_number: '+442079460958' }, 'shop_number'],
-    [{ office_email: 'not-an-email' }, 'office_email'], [{ city: '' }, 'city'], [{ state: 'XX' }, 'state'], [{ services: '' }, 'services'],
+    [{ office_email: 'not-an-email' }, 'office_email'], [{ city: 'x' }, 'city'], [{ state: 'XX' }, 'state'],
     [{ services: 'x'.repeat(501) }, 'services'], [{ not_offered: 'x'.repeat(501) }, 'not_offered'], [{ emergency_rules: 7 }, 'emergency_rules'],
     [{ never_say: 'x'.repeat(501) }, 'never_say'], [{ hours: 'x'.repeat(201) }, 'hours'], [{ sms_consent: 'yes' }, 'sms_consent'],
     [{ terms_accepted: false }, 'terms_accepted'], [{ terms_accepted: 'true' }, 'terms_accepted'], [{ coupon: 'FREE' }, 'coupon']
@@ -371,7 +371,7 @@ test('a failed trial migration turns trials off but Gold Star keeps working', as
   const routes = JSON.stringify({ 'gold-star': { business: 'Gold Star Plumbing', email: ['owner@example.com'] } });
   const { base, signup } = await fixture(t, { ALERT_ROUTES: routes }, dir);
   const health = await (await fetch(`${base}/healthz`)).json();
-  assert.equal(health.status, 'ok'); assert.equal(health.trials_enabled, false); assert.equal(health.version, '1.7.0');
+  assert.equal(health.status, 'ok'); assert.equal(health.trials_enabled, false); assert.equal(health.version, '1.7.1');
   assert.equal((await signup(form())).status, 503);
   const saved = await fetch(`${base}/vapi/webhook`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': key },
     body: JSON.stringify({ message: { type: 'tool-calls', call: { id: 'g-1', assistantId: 'gold-star', customer: { number: '+16155550100' } },
@@ -403,4 +403,29 @@ test('the step-1 clients table is upgraded in place and keeps its rows', async t
   assert.deepEqual(sql('SELECT call_id, is_test FROM client_calls'), [{ call_id: 'call-old', is_test: 0 }]);
   sql("UPDATE clients SET status = 'waitlisted'");
   assert.throws(() => sql("UPDATE clients SET status = 'trial'"), /CHECK/);
+});
+
+test('the short form: city, services and the other details may be left empty', async t => {
+  const { signup, sql } = await fixture(t);
+  const short = form({ city: '', services: '', not_offered: '', emergency_rules: '', never_say: '', hours: '' });
+  assert.equal((await signup(short)).status, 202);
+  const [c] = sql('SELECT city, services, hours FROM clients');
+  assert.deepEqual({ ...c }, { city: '', services: '', hours: '' });
+  const { value } = validateSignup(form({ city: undefined, services: undefined }));
+  assert.equal(value.city, ''); assert.equal(value.services, '');
+});
+
+test('owner emails carry a branded HTML version built from the same text', async t => {
+  const { signup, emails } = await fixture(t);
+  await signup(form());
+  const mail = emails()[0].body;
+  assert.ok(mail.text && mail.html, 'both text and html are sent');
+  const link = /(https:\/\/\S+\/trial\/verify\?token=[0-9a-f]{64})/.exec(mail.text)[1];
+  assert.ok(mail.html.includes(`href="${link}"`) && mail.html.includes('Confirm my email'), 'the verify link is a button');
+  assert.match(mail.html, /1111 Church St, Nashville, TN 37203/);
+  assert.doesNotMatch(mail.html, /<script|<img|<link /);
+  const { emailHtml } = await import('./trial.mjs');
+  const html = emailHtml('s', "Hi <b>,\n\nEmma's number: (720) 555-0100\n\nCall her: tel:+17205550100\n\n- one\n- two");
+  assert.match(html, /Hi &lt;b&gt;,/); assert.match(html, /font-size:28px[^>]*>\(720\) 555-0100/);
+  assert.match(html, /href="tel:\+17205550100"[^>]*>Call Emma now/); assert.match(html, /<li[^>]*>one<\/li>/);
 });
