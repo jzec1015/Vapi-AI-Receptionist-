@@ -48,7 +48,7 @@ export const TRIGGERS = [
 ];
 export const URGENT_TAGS = new Set(TRIGGERS.filter(t => t.urgent).map(t => t.tag));
 const LABELS = Object.fromEntries([...TRIGGERS.map(t => [t.tag, t.label]), ['out_of_area', 'Address not in the service area list'],
-  ['callback_unconfirmed', 'Callback number was not read back: check it']]);
+  ['callback_unconfirmed', 'Callback number was not read back: check it'], ['address_not_found', 'Address not found on the map: confirm it when you call']]);
 export const tagLabel = tag => LABELS[tag] || tag;
 
 // "not flooding", "no gas smell", "nothing is frozen": a negation right before the phrase (at most one filler word, same
@@ -110,4 +110,23 @@ export function shouldRing(tags = [], route = {}, now = new Date()) {
   // A job Emma marked URGENT that matched no trigger still rings: an unknown emergency is not something to sit on.
   const urgentTags = tags.filter(t => URGENT_TAGS.has(t));
   return !urgentTags.length || urgentTags.some(t => wake.includes(t));
+}
+
+// Free US Census address lookup (no key). Never blocks a save: a match goes on the alert as the map's spelling
+// ("1412 DICKERSON PIKE, NASHVILLE, TN, 37207" for a misheard "Dickerzon"), no match adds an "address not found" flag.
+// Without a state or ZIP the Census guesses another state, so the shop's state is added. Returns '' on no match,
+// null when the lookup failed or was skipped (then nothing is shown).
+export async function mapAddress(address, state, send, timeoutMs = 1500) {
+  const text = String(address || '').trim();
+  if (!/^\d+\s+\S/.test(text) || /^not given$/i.test(text)) return null;
+  const hasState = /\b[A-Z]{2}\b\s*(\d{5})?\s*$|\b\d{5}\s*$/.test(text);
+  const query = hasState || !state ? text : `${text}, ${state}`;
+  try {
+    const url = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?benchmark=Public_AR_Current&format=json&address=${encodeURIComponent(query)}`;
+    const response = await send(url, { method: 'GET', signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) return null;
+    const matches = (await response.json())?.result?.addressMatches;
+    if (!Array.isArray(matches)) return null;
+    return String(matches[0]?.matchedAddress || '').slice(0, 200);
+  } catch { return null; }
 }

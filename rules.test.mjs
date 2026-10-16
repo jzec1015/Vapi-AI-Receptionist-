@@ -199,3 +199,16 @@ test('a Spanish speaker\'s save needs no email', async t => {
   const result = await save('es', { ...job, issue: 'Kitchen leak', job_details: 'Caller has limited English', email_status: 'skipped_emergency' });
   assert.equal(result.saved, true, JSON.stringify(result));
 });
+
+test('map check: a match goes on the alert, no match is a flag, a failed lookup shows nothing', async () => {
+  const { mapAddress } = await import('./rules.mjs');
+  const urls = [];
+  const census = matches => async url => { urls.push(url); return Response.json({ result: { addressMatches: matches } }); };
+  assert.equal(await mapAddress('1412 Dickerzon Pike, Nashville', 'TN', census([{ matchedAddress: '1412 DICKERSON PIKE, NASHVILLE, TN, 37207' }])),
+    '1412 DICKERSON PIKE, NASHVILLE, TN, 37207');
+  assert.match(decodeURIComponent(urls[0]), /Dickerzon Pike, Nashville, TN$/);
+  assert.equal(await mapAddress('48 Birch Rd, Nashville TN 37211', 'TN', census([])), '');
+  assert.doesNotMatch(decodeURIComponent(urls[1]), /, TN$/);
+  assert.equal(await mapAddress('Not given', 'TN', census([])), null);
+  assert.equal(await mapAddress('9 Elm St, Smyrna', 'TN', async () => { throw new Error('timeout'); }), null);
+});

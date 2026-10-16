@@ -429,3 +429,18 @@ test('owner emails carry a branded HTML version built from the same text', async
   assert.match(html, /Hi &lt;b&gt;,/); assert.match(html, /font-size:28px[^>]*>\(720\) 555-0100/);
   assert.match(html, /href="tel:\+17205550100"[^>]*>Call Emma now/); assert.match(html, /<li[^>]*>one<\/li>/);
 });
+
+test('plumber-rule settings: fee, towns and warranty choice are optional, length-limited and checked', async () => {
+  const { shopDetails } = await import('./trial.mjs');
+  const { value } = validateSignup(form({ service_fee: '$89', service_area: 'Nashville, Murfreesboro, 37211', warranty_jobs: 'flag' }));
+  assert.equal(value.service_fee, '$89');
+  assert.equal(value.service_area, 'Nashville, Murfreesboro, 37211');
+  assert.equal(value.warranty_jobs, 'flag');
+  assert.equal(validateSignup(form()).value.warranty_jobs, '');
+  assert.equal(validateSignup(form({ warranty_jobs: 'maybe' })).field, 'warranty_jobs');
+  assert.equal(validateSignup(form({ service_fee: 'x'.repeat(121) })).field, 'service_fee');
+  const details = shopDetails({ ...value, city: 'Nashville', state: 'TN' });
+  assert.match(details, /Service call fee: \$89/);
+  assert.match(details, /Towns or ZIP codes served: Nashville, Murfreesboro, 37211/);
+  assert.match(details, /Home warranty company jobs: Take the details and note the warranty company/);
+});

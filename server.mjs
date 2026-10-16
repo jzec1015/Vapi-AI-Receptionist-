@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { createBooking } from './booking.mjs';
 import { createTrials, migrateClients, inService } from './trial.mjs';
-import { ruleTags, callerWords, outOfArea, shouldRing, URGENT_TAGS, tagLabel } from './rules.mjs';
+import { ruleTags, callerWords, outOfArea, shouldRing, URGENT_TAGS, tagLabel, mapAddress } from './rules.mjs';
 
 export function conversationKey(message) {
   const valid = value => typeof value === 'string' && value.length > 0 && value.length <= 200;
@@ -214,6 +214,7 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' - ')}`);
   if (kind === 'new' && details.job_details) lines.push(`Details: ${details.job_details}`);
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
+  if (kind === 'new' && details.address_match) lines.push(`Map: ${details.address_match}`);
   // Flags from the plumber rules (rules.mjs): renter, warranty company, Spanish speaker, out of area...
   const flags = (details.rule_tags || []).filter(t => !URGENT_TAGS.has(t)).map(tagLabel);
   if (details.refusal_flag) flags.unshift(details.refusal_flag);
@@ -405,7 +406,7 @@ export function createApp(env = process.env, send = fetch) {
     // The signup form tells owners urgent jobs ring their cell, so an empty alert_call list falls back to owner_cell.
     const call = jsonList(row.alert_call);
     return { business: row.business, sms: [], email: jsonList(row.office_emails), call: call.length ? call : [row.owner_cell].filter(Boolean),
-      transfer: row.transfer || undefined, service_area: row.service_area || undefined };
+      transfer: row.transfer || undefined, service_area: row.service_area || undefined, state: row.state || undefined };
   }
   // Trial minutes: one usage row per call (Vapi may resend a report), added to the client's total in one transaction.
   // The first report that takes minutes_used to the cap emails Anchorline once. Calls are never refused.
@@ -967,6 +968,12 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (readback) tags.push('callback_unconfirmed');
     const route = routeFor(message);
     if (route?.service_area && /\w/.test(details.address) && !/^not given$/i.test(details.address) && outOfArea(details.address, route.service_area)) tags.push('out_of_area');
+    // ADDRESS_CHECK=census: the map's spelling of the address goes on the alert, or a flag when the map can't find it.
+    if (env.ADDRESS_CHECK === 'census') {
+      const match = await mapAddress(details.address, route?.state || env.ADDRESS_STATE || '', send);
+      if (match) details.address_match = match;
+      else if (match === '') tags.push('address_not_found');
+    }
     details.rule_tags = tags;
     // A sales pitch or job enquiry that mentions "flood" is still not a job.
     const notAJob = /^\s*not a job\b/i.test(details.issue) || tags.includes('sales_call') || tags.includes('job_seeker');
