@@ -112,7 +112,12 @@ test('the assistant is Emma\'s production config with the shop substituted in an
   assert.deepEqual(config.model.toolIds, ['da782f13-0ce0-4c1d-9cb9-1df881c17a97', 'd39115a3-e858-4f79-9bcd-ce28b1aa7814', '178c7380-ea94-410f-afd1-e5544ce3dcad']);
   assert.deepEqual([config.model.provider, config.model.model, config.voice.provider, config.voice.voiceId, config.transcriber.model],
     ['openai', 'gpt-4.1', '11labs', 'EXAVITQu4vr4xnSDxMaL', 'nova-3']);
-  assert.deepEqual(config.startSpeakingPlan.transcriptionEndpointingPlan, { onPunctuationSeconds: 0.4, onNoPunctuationSeconds: 1.5, onNumberSeconds: 1 });
+  assert.deepEqual(config.startSpeakingPlan.transcriptionEndpointingPlan, { onPunctuationSeconds: 0.1, onNoPunctuationSeconds: 1.5, onNumberSeconds: 1 });
+  // The 0503-tested voice: ElevenLabs v4 Turbo, no fake office noise, and the whole-number read-back rule in the prompt.
+  assert.equal(config.voice.model, 'eleven_v4_turbo');
+  assert.equal(config.backgroundSound, 'off');
+  assert.match(config.model.messages[0].content, /THE PHONE NUMBER RULE/);
+  assert.doesNotMatch(config.model.messages[0].content, /\{\{/);
   assert.deepEqual(config.server, { url: 'https://receptionist.example/vapi/webhook', timeoutSeconds: 40, headers: { 'x-anchorline-key': key } });
   assert.deepEqual(config.serverMessages, ['end-of-call-report']);
   assert.equal(config.id, undefined);
