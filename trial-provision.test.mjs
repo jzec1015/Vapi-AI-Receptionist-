@@ -130,6 +130,9 @@ test('the assistant is Emma\'s production config with the shop substituted in an
   assert.doesNotMatch(details, /‮|x{201}/);
   assert.ok(details.endsWith('SHOP DETAILS>>>\n'));
   assert.equal(renderPrompt({ ...shop, services: '', not_offered: '', emergency_rules: '', never_say: '', hours: '', city: '', state: '' }).includes('No extra details given.'), true);
+  // The arrival-time answer must be true after hours too, when the owner's phone isn't rung.
+  assert.ok(prompt.includes(`"I can't promise a time, but I'm getting this to the team right now."`));
+  assert.doesNotMatch(prompt, /being alerted right now/);
 });
 
 test('Vapi names stay within 40 characters, keeping "- Emma" when possible', () => {
