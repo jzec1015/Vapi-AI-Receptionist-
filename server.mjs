@@ -878,7 +878,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     // a flag on the alert, so no caller is lost. Urgent jobs and the caller's own number are never blocked.
     const ownNumber = !!details.callback_phone && digitsOf(details.callback_phone) === digitsOf(callerNumberOf(message));
     const transcript = transcriptOf(message);
-    console.log(`readback-check call=${callId} transcript=${transcript == null ? 'missing' : transcript.length ? `n=${transcript.length}` : 'empty'}`);
+    const source = [['artifact.messages', message.artifact?.messages], ['call.artifact.messages', message.call?.artifact?.messages], ['messages', message.messages],
+      ['artifact.messagesOpenAIFormatted', message.artifact?.messagesOpenAIFormatted], ['call.artifact.messagesOpenAIFormatted', message.call?.artifact?.messagesOpenAIFormatted]]
+      .find(([, list]) => Array.isArray(list) && list.length)?.[0] || 'none';
+    const userTurns = (transcript || []).filter(m => ['user', 'customer'].includes(m?.role)).length;
+    console.log(`readback-check call=${callId} transcript=${transcript == null ? 'missing' : transcript.length ? `n=${transcript.length}` : 'empty'} source=${source} user_turns=${userTurns} caller_words=${callerWords(message).split(/\s+/).filter(Boolean).length}`);
     const urgentIssue = /^\s*URGENT\b/i.test(details.issue);
     // After three read-backs Emma saves anyway with "unconfirmed" in job_details; that is flagged, never sent back.
     const gaveUp = /unconfirmed/i.test(details.job_details);
