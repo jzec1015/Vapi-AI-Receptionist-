@@ -214,18 +214,45 @@ class StepError extends Error {
 class Stopped extends Error {}
 
 // ---------- HTML ----------
-const CSS = `*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#14202e;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-main{max-width:560px;margin:0 auto;padding:32px 16px}.card{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(20,32,46,.12)}
-.brand{font-weight:700;color:#0b5cad;letter-spacing:.02em;margin-bottom:12px}h1{font-size:24px;line-height:1.25;margin:0 0 12px}p{margin:0 0 12px}
-.num{font-size:28px;font-weight:700;margin:4px 0 16px}.btn{display:block;text-align:center;background:#0b5cad;color:#fff;text-decoration:none;font-weight:600;padding:14px;border-radius:10px;margin:10px 0}
-.btn.alt{background:#fff;color:#0b5cad;border:2px solid #0b5cad}dl{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:16px 0 0}dt{color:#5a6b7d}dd{margin:0;font-weight:600}
-.muted{color:#5a6b7d;font-size:14px}table{border-collapse:collapse;width:100%;font-size:14px;background:#fff}th,td{border-bottom:1px solid #e3e8ee;padding:8px;text-align:left;vertical-align:top}
-.wide{max-width:none}form{display:inline}button{font:inherit;font-size:13px;margin:2px;padding:4px 8px;border-radius:6px;border:1px solid #9aa8b6;background:#fff;cursor:pointer}
-@media (prefers-color-scheme:dark){body{background:#0f1720;color:#e6edf3}.card,table{background:#16212d}th,td{border-color:#26364a}.btn.alt{background:transparent}.muted,dt{color:#9fb0c2}button{background:#16212d;color:#e6edf3}}`;
+// Same palette as the website (landing-page/src/plumbing-home.css). Fonts are the system stack: the CSP allows no font files.
+const CSS = `:root{--bg:#f4f2ed;--card:#fff;--ink:#10201a;--ink-2:#33443b;--muted:#56655d;--line:#dcdfd8;--green:#2b5943;--green-ink:#fff;
+--signal:#b9ec4f;--signal-ink:#3d6b17;--soft:#eef2e7;--urgent:#c2410c;--shadow:0 2px 6px #10201a10,0 18px 44px #10201a14}
+@media (prefers-color-scheme:dark){:root{--bg:#0b1510;--card:#13211a;--ink:#eef2e7;--ink-2:#cfd9cf;--muted:#9fb0a5;--line:#26372d;--green:#b9ec4f;--green-ink:#0b1510;
+--signal-ink:#b9ec4f;--soft:#1a2b22;--shadow:none}}
+*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--ink);
+font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit}.top{padding:18px 16px;border-bottom:1px solid var(--line)}.top .in{max-width:600px;margin:0 auto}
+.logo{display:inline-flex;align-items:center;gap:9px;font-weight:800;font-size:17px;letter-spacing:-.01em;text-decoration:none}.logo svg{color:var(--green)}
+main{flex:1;width:100%;max-width:600px;margin:0 auto;padding:clamp(24px,6vw,56px) 16px 32px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:clamp(22px,5vw,36px);box-shadow:var(--shadow)}
+.eyebrow{font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--signal-ink);margin:0 0 10px}
+h1{font-size:clamp(26px,5.5vw,34px);line-height:1.15;letter-spacing:-.02em;margin:0 0 14px}p{margin:0 0 14px;color:var(--ink-2)}
+.pill{display:inline-flex;align-items:center;gap:7px;font-size:14px;font-weight:700;padding:5px 12px;border-radius:99px;background:var(--soft);color:var(--ink);margin:0 0 16px}
+.pill:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--muted)}.pill.live:before{background:#3fa34d;box-shadow:0 0 0 4px #3fa34d33}
+.pill.wait:before{background:#d99a0b}.pill.off:before{background:var(--urgent)}
+.numbox{background:var(--soft);border-radius:14px;padding:18px;margin:6px 0 22px}.label{font-size:14px;color:var(--muted);margin:0 0 2px}
+.num{font-size:clamp(30px,7vw,38px);font-weight:800;letter-spacing:-.01em;margin:0 0 12px;font-variant-numeric:tabular-nums}
+.btn{display:block;text-align:center;background:var(--green);color:var(--green-ink);text-decoration:none;font-weight:700;padding:15px 18px;border-radius:12px;margin:10px 0 0}
+.btn:hover{filter:brightness(1.08)}.btn.alt{background:transparent;color:var(--ink);border:2px solid var(--line)}
+.steps{list-style:none;padding:0;margin:4px 0 22px;display:grid;gap:10px}.steps li{display:flex;align-items:center;gap:12px;color:var(--muted)}
+.steps i{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-style:normal;font-size:13px;font-weight:800;border:2px solid var(--line);color:var(--muted)}
+.steps .done{color:var(--ink)}.steps .done i{background:var(--green);border-color:var(--green);color:var(--green-ink)}
+.steps .now{color:var(--ink);font-weight:700}.steps .now i{border-color:var(--green);color:var(--green)}
+dl{display:grid;grid-template-columns:1fr auto;margin:0;border-top:1px solid var(--line)}dt,dd{padding:11px 0;border-bottom:1px solid var(--line);margin:0}
+dt{color:var(--muted)}dd{font-weight:700;text-align:right}.muted{color:var(--muted);font-size:14px}
+footer{padding:22px 16px 30px;text-align:center;font-size:14px;color:var(--muted)}footer a{color:var(--muted)}
+.wide{max-width:none}table{border-collapse:collapse;width:100%;font-size:14px;background:var(--card)}th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}
+form{display:inline}button{font:inherit;font-size:13px;margin:2px;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer}`;
 const CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const LOGO = `<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+<circle cx="12" cy="5" r="2.5"/><path d="M12 7.5V21M7 11h10M4 14a8 7 0 0 0 16 0"/></svg>`;
 export const page = (title, body, { refresh = 0, wide = false } = {}) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">${refresh ? `<meta http-equiv="refresh" content="${refresh}">` : ''}
-<title>${escapeHtml(title)}</title><style>${CSS}</style></head><body><main${wide ? ' class="wide"' : ''}>${body}</main></body></html>`;
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><meta name="color-scheme" content="light dark">${refresh ? `<meta http-equiv="refresh" content="${refresh}">` : ''}
+<title>${escapeHtml(title)}</title><style>${CSS}</style></head><body><header class="top"><div class="in"><a class="logo" href="${SITE}">${LOGO}Anchorline AI</a></div></header>
+<main${wide ? ' class="wide"' : ''}>${body}</main><footer>Questions? Reply to any of our emails. &middot; <a href="${SITE}">anchorlineappai.com</a></footer></body></html>`;
+// The four setup steps a trial owner goes through; `done` is how many are finished, the next one is highlighted.
+export const steps = done => `<ol class="steps">${['Email confirmed', 'Emma gets a local phone number', 'Forward your shop line to Emma', 'Emma answers your missed calls']
+  .map((label, i) => `<li class="${i < done ? 'done' : i === done ? 'now' : ''}"><i>${i < done ? '&#10003;' : i + 1}</i>${label}</li>`).join('')}</ol>`;
 
 const UNDO_FORWARDING = `- Most carriers (AT&T, Verizon, landlines): dial *73 from the shop phone and wait for the tone.
 - T-Mobile and some cell plans: dial ##21# and press call.
@@ -850,7 +877,7 @@ Anchorline AI`, `${c.id}-${kind}-${c.trial_ends_at}`);
   const json = (res, status, body, headers) => send_(res, status, 'application/json; charset=utf-8', JSON.stringify(body), headers);
   const html = (res, status, body, headers) => send_(res, status, 'text/html; charset=utf-8', body,
     { 'Content-Security-Policy': CSP, 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY', ...headers });
-  const message = (title, text) => page(title, `<div class="card"><div class="brand">Anchorline AI</div><h1>${escapeHtml(title)}</h1><p>${escapeHtml(text)}</p></div>`);
+  const message = (title, text, actions = '') => page(title, `<div class="card"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(text)}</p>${actions}</div>`);
   async function readJson(req) {
     if (Number(req.headers['content-length']) > BODY_LIMIT) return { status: 413 };
     let length = 0;
@@ -897,12 +924,17 @@ Anchorline AI`, `${c.id}-${kind}-${c.trial_ends_at}`);
       : { provisioning: '<p>Emma is being set up with her own phone number. This usually takes a few minutes; this page refreshes by itself.</p>',
         active: '<p>Emma is live and ready to answer your calls.</p>',
         waitlisted: "<p>You're on the waiting list. We'll email you as soon as a trial spot opens up.</p>" }[c.status] || '<p>Your trial is not active yet.</p>';
-    const live = v.emma_number ? `<p class="muted">Emma's number</p><div class="num">${escapeHtml(formatPhone(v.emma_number))}</div>
-<a class="btn" href="${escapeHtml(v.call_link)}">Call Emma now</a><a class="btn alt" href="${escapeHtml(v.forwarding_link)}">Forward your shop line to Emma</a>` : '';
-    return page(`Emma for ${c.business}`, `<div class="card"><div class="brand">Anchorline AI</div><h1>Emma for ${escapeHtml(c.business)}</h1>${intro}${live}
-<dl><dt>Status</dt><dd>${escapeHtml(c.status)}</dd>${v.days_left != null ? `<dt>Days left</dt><dd>${v.days_left}</dd>` : ''}
-<dt>Minutes used</dt><dd>${v.minutes_used} of ${v.minute_cap}</dd><dt>Forwarding confirmed</dt><dd>${v.forwarding_confirmed ? 'Yes' : 'No'}</dd></dl>
-<p class="muted" style="margin-top:16px">Keep this page's link private; it shows your trial details.</p></div>`, { refresh: c.status === 'provisioning' ? 20 : 0 });
+    const live = v.emma_number ? `<div class="numbox"><p class="label">Emma's number</p><div class="num">${escapeHtml(formatPhone(v.emma_number))}</div>
+<a class="btn" href="${escapeHtml(v.call_link)}">Call Emma now</a><a class="btn alt" href="${escapeHtml(v.forwarding_link)}">Forward your shop line to Emma</a></div>` : '';
+    const [label, tone] = { active: ['Live', 'live'], provisioning: ['Setting up', 'wait'], waitlisted: ['On the waiting list', 'wait'],
+      pending_verification: ['Waiting for email confirmation', 'wait'], ended: [inGrace(c, now) ? 'Trial ended, still answering' : 'Trial ended', 'off'] }[c.status] || [c.status, ''];
+    const progress = c.status === 'ended' || c.status === 'waitlisted' ? ''
+      : steps(c.status === 'pending_verification' ? 0 : !c.phone_number ? 1 : !v.forwarding_confirmed ? 2 : 4);
+    return page(`Emma for ${c.business}`, `<div class="card"><p class="eyebrow">Free 14-day trial</p><h1>Emma for ${escapeHtml(c.business)}</h1>
+<span class="pill ${tone}">${escapeHtml(label)}</span>${intro}${live}${progress}
+<dl>${v.days_left != null ? `<dt>Days left</dt><dd>${v.days_left}</dd>` : ''}
+<dt>Minutes used</dt><dd>${v.minutes_used} of ${v.minute_cap}</dd><dt>Forwarding confirmed</dt><dd>${v.forwarding_confirmed ? 'Yes' : 'Not yet'}</dd></dl>
+<p class="muted" style="margin-top:16px">Keep this page's link private. It shows your trial details.</p></div>`, { refresh: c.status === 'provisioning' ? 20 : 0 });
   }
 
   // ---------- admin ----------
@@ -942,7 +974,7 @@ Anchorline AI`, `${c.id}-${kind}-${c.trial_ends_at}`);
 <td>${(Math.round(c.minutes_used * 10) / 10)} / ${c.minute_cap}</td><td>${s.calls}</td><td>${s.jobs}</td><td>${c.forwarding_confirmed_at ? 'yes' : 'no'}</td>
 <td>${escapeHtml(c.phone_number ? formatPhone(c.phone_number) : '-')}</td><td>${escapeHtml(notes)}</td><td>${actions}</td></tr>`;
     }).join('\n');
-    return page('Trials', `<div class="brand">Anchorline AI</div><h1>Trials</h1><p class="muted">${dry ? 'DRY RUN: provisioning makes no API calls. ' : ''}Max active: ${maxActive}</p>
+    return page('Trials', `<h1>Trials</h1><p class="muted">${dry ? 'DRY RUN: provisioning makes no API calls. ' : ''}Max active: ${maxActive}</p>
 <div style="overflow-x:auto"><table><thead><tr><th>Business</th><th>Status</th><th>Created</th><th>Days left</th><th>Minutes</th><th>Calls</th><th>Job requests</th>
 <th>Forwarding</th><th>Emma number</th><th>Errors</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="11">No trials yet.</td></tr>'}</tbody></table></div>`, { wide: true });
   }
@@ -992,13 +1024,14 @@ Anchorline AI`, `${c.id}-${kind}-${c.trial_ends_at}`);
     if (path === '/trial/verify') {
       if (req.method !== 'GET') { json(res, 405, { error: 'GET required' }); return true; }
       const verified = db && key.length >= 32 ? await verify(url.searchParams.get('token'), now) : null;
-      if (!verified) { html(res, 400, message('This link has expired', 'The confirmation link is invalid or more than 24 hours old. Sign up again or reply to the email we sent you.')); return true; }
+      if (!verified) { html(res, 400, message('This link has expired', 'Confirmation links work for 24 hours, and this one is older or incomplete. Start again and we\'ll send you a fresh link; it takes about a minute.',
+        `<a class="btn" href="${SITE}/start">Start my free trial again</a><a class="btn alt" href="${SITE}">Back to anchorlineappai.com</a>`)); return true; }
       const c = verified.client;
       const waiting = c.status === 'waitlisted';
-      html(res, 200, page('Setting up Emma', `<div class="card"><div class="brand">Anchorline AI</div><h1>Thanks, your email is confirmed</h1>
-${waiting ? `<p>All our trial spots for ${escapeHtml(c.business)}'s area are taken right now, so you're on the waiting list. We'll email you as soon as a spot opens up.</p>`
-    : `<p>Emma is being set up for ${escapeHtml(c.business)}. We're giving her a local phone number now; it usually takes a few minutes, and we'll email you when she's ready.</p>`}
-<a class="btn" href="${escapeHtml(statusPath(c.id))}">See Emma's setup status</a><p class="muted">Bookmark that page: it's where you'll find Emma's number and how to forward your calls.</p></div>`));
+      html(res, 200, page('Setting up Emma', `<div class="card"><p class="eyebrow">Free 14-day trial</p><h1>You're confirmed</h1>
+${waiting ? `<p>All our trial spots are taken right now, so ${escapeHtml(c.business)} is on the waiting list. We'll email you as soon as a spot opens up.</p>`
+    : `<p>Emma is being set up for ${escapeHtml(c.business)}. We're giving her a local phone number now. It usually takes a few minutes, and we'll email you the moment she's ready.</p>${steps(1)}`}
+<a class="btn" href="${escapeHtml(statusPath(c.id))}">See Emma's setup status</a><p class="muted" style="margin-top:14px">Bookmark that page. It's where you'll find Emma's number and how to forward your calls.</p></div>`));
       return true;
     }
     if (path === '/trial/status') {
@@ -1008,7 +1041,8 @@ ${waiting ? `<p>All our trial spots for ${escapeHtml(c.business)}'s area are tak
       const c = db && key.length >= 32 && /^[0-9a-f-]{36}$/.test(id) && /^[0-9a-f]{64}$/.test(k) ? row(id) : null;
       const ok = !!c && sameSecret(k, statusKey(c.id));
       const asJson = url.searchParams.get('format') === 'json';
-      if (!ok) { asJson ? json(res, 404, { error: 'Not found' }) : html(res, 404, message('Page not found', 'This status link is not valid. Use the link from your confirmation page or our emails.')); return true; }
+      if (!ok) { asJson ? json(res, 404, { error: 'Not found' }) : html(res, 404, message('Page not found', 'This status link is not valid. Use the link from your confirmation page or from our emails.',
+        `<a class="btn alt" href="${SITE}">Back to anchorlineappai.com</a>`)); return true; }
       asJson ? json(res, 200, statusView(c, now)) : html(res, 200, statusPage(c, now));
       return true;
     }
