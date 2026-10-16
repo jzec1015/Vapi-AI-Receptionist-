@@ -28,7 +28,7 @@
     "maxTokens": 150,
     "temperature": 0.4
   },
-  "firstMessage": "Hi, thanks for calling {{BUSINESS}}. This is Emma. This call may be recorded so we get your details right. How can I help?",
+  "firstMessage": "Hi, thanks for calling {{BUSINESS}}. I'm Emma, {{OWNER_POSSESSIVE}} AI assistant. This call may be recorded so we get your details right. If it's an emergency, just say so and I'll ring {{OWNER_FIRST}} right away. How can I help?",
   "endCallFunctionEnabled": true,
   "endCallMessage": "",
   "transcriber": {

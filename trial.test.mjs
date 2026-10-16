@@ -67,6 +67,18 @@ test('an active trial client gets office emails and alert calls, never SMS', asy
   assert.deepEqual(sent.filter(s => s.url === 'https://api.vapi.ai/call').map(s => s.body.customer.number), ['+16155550401']);
 });
 
+test('a trial with no alert numbers rings the owner cell for urgent jobs, as the signup form promises', async t => {
+  const { post, sent, addClient } = await fixture(t, { VAPI_API_KEY: 'fixture-only', ALERT_CALL_FROM_ID: 'from-line' });
+  addClient(client('o', { alert_call: '[]' }));
+  const saved = await result(await post(toolCall('call-o', 'asst-o', { ...intake, issue: 'URGENT - pipe burst', email_status: 'skipped_emergency' })));
+  assert.equal(saved.saved, true);
+  assert.deepEqual(sent.filter(s => s.url === 'https://api.vapi.ai/call').map(s => s.body.customer.number), ['+16155550400']);
+  // A normal job still only emails.
+  sent.length = 0;
+  await post(toolCall('call-o2', 'asst-o', { ...intake, issue: 'Dripping faucet' }));
+  assert.equal(sent.filter(s => s.url === 'https://api.vapi.ai/call').length, 0);
+});
+
 test('an ALERT_ROUTES entry wins over a client row with the same assistant', async t => {
   const { post, sent, addClient } = await fixture(t);
   addClient(client('dup', { assistant_id: 'gold-star' }));

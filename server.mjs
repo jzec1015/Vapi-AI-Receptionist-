@@ -303,7 +303,10 @@ export function createApp(env = process.env, send = fetch) {
   function clientRoute(assistantId) {
     const row = clientRow(assistantId);
     if (!inService(row)) return null;
-    return { business: row.business, sms: [], email: jsonList(row.office_emails), call: jsonList(row.alert_call), transfer: row.transfer || undefined };
+    // The signup form tells owners urgent jobs ring their cell, so an empty alert_call list falls back to owner_cell.
+    const call = jsonList(row.alert_call);
+    return { business: row.business, sms: [], email: jsonList(row.office_emails), call: call.length ? call : [row.owner_cell].filter(Boolean),
+      transfer: row.transfer || undefined };
   }
   // Trial minutes: one usage row per call (Vapi may resend a report), added to the client's total in one transaction.
   // The first report that takes minutes_used to the cap emails Anchorline once. Calls are never refused.
