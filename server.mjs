@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { createBooking } from './booking.mjs';
 import { createTrials, migrateClients, inService } from './trial.mjs';
+import { ruleTags, callerWords, outOfArea, shouldRing, URGENT_TAGS, tagLabel } from './rules.mjs';
 
 export function conversationKey(message) {
   const valid = value => typeof value === 'string' && value.length > 0 && value.length <= 200;
@@ -81,7 +82,7 @@ export function subjectLine(head, topic, address, phone, max = 90) {
 export function alertSubject(details, kind = 'new') {
   const urgent = /^\s*URGENT\b/i.test(details.issue);
   const phone = formatPhone(details.callback_phone || details.caller_id) || 'no number given';
-  if (kind === 'hangup') return `Caller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${SEP}call them back`;
+  if (kind === 'hangup') return `${urgent ? 'URGENT: c' : 'C'}aller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${SEP}call them back`;
   if (kind === 'unanswered') return subjectLine('UNANSWERED URGENT', details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
   const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : urgent ? 'URGENT' : 'New job';
   return subjectLine(head, kind === 'note' ? details.notes.at(-1) : details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
@@ -123,7 +124,7 @@ const gsm = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036
 // channel 'email': same lines, but no SMS opt-out footer, no 280-character cut and no GSM-7 stripping.
 export function alertText(route, details, kind = 'new', channel = 'sms') {
   const urgent = /^\s*URGENT\b/i.test(details.issue);
-  const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
+  const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? (urgent ? 'URGENT: caller hung up' : 'Caller hung up') : urgent ? 'URGENT call' : 'New call';
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
   const lines = [`Anchorline AI: ${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} - ${phone}`];
@@ -132,6 +133,9 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' - ')}`);
   if (kind === 'new' && details.job_details) lines.push(`Details: ${details.job_details}`);
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
+  // Flags from the plumber rules (rules.mjs): renter, warranty company, Spanish speaker, out of area...
+  const flags = (details.rule_tags || []).filter(t => !URGENT_TAGS.has(t)).map(tagLabel);
+  if (kind !== 'note' && flags.length) lines.push(`Flags: ${flags.join('; ')}`);
   // Email only: the call recording (from Vapi's end-of-call report) near the top, when the server has it.
   if (channel === 'email' && details.recording_url) lines.splice(1, 0, `Recording: ${details.recording_url}`);
   if (channel === 'email') return lines.join('\n');
@@ -239,7 +243,8 @@ export function createApp(env = process.env, send = fetch) {
   // was placed; a ring Vapi still cannot report after 10 minutes counts as not answered. The retry is ~5 minutes after the first ring.
   const CHECK_MS = 150000, RECHECK_MS = 30000, RETRY_MS = 300000, GIVE_UP_MS = 600000;
   const fallbackMs = Math.max(0, Number(env.TRANSFER_FALLBACK_SECONDS ?? 75) || 0) * 1000;
-  const canTransfer = (route, details) => !!route && isE164(route.transfer) && /^\s*URGENT\b/i.test(details.issue) && (!details.is_test || !!route.alertTests);
+  const canTransfer = (route, details) => !!route && isE164(route.transfer) && /^\s*URGENT\b/i.test(details.issue) && (!details.is_test || !!route.alertTests) &&
+    shouldRing(details.rule_tags, route);
   let db;
   let trialsEnabled = false;
   if (dataDir) {
@@ -315,7 +320,7 @@ export function createApp(env = process.env, send = fetch) {
     // The signup form tells owners urgent jobs ring their cell, so an empty alert_call list falls back to owner_cell.
     const call = jsonList(row.alert_call);
     return { business: row.business, sms: [], email: jsonList(row.office_emails), call: call.length ? call : [row.owner_cell].filter(Boolean),
-      transfer: row.transfer || undefined };
+      transfer: row.transfer || undefined, service_area: row.service_area || undefined };
   }
   // Trial minutes: one usage row per call (Vapi may resend a report), added to the client's total in one transaction.
   // The first report that takes minutes_used to the cap emails Anchorline once. Calls are never refused.
@@ -358,6 +363,7 @@ export function createApp(env = process.env, send = fetch) {
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
   // Calls already told once that the house number looked garbled; the second save goes through so no caller is lost.
   const addressWarned = new Set();
+  const readBackWarned = new Set();
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   const inflight = new Map();
@@ -466,7 +472,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: alertSubject(details, kind), text: `${emailText}\n\nRequest reference: ${id}` }) }));
     }
     const urgent = /^\s*URGENT\b/i.test(details.issue);
-    if (kind === 'new' && urgent && !holdCall && callId) jobs.push(...ring(callId, route, details));
+    // After hours only the shop's wake emergencies ring the owner (rules.mjs shouldRing); the urgent email still goes now.
+    if (kind === 'new' && urgent && !holdCall && callId && shouldRing(details.rule_tags, route)) jobs.push(...ring(callId, route, details));
     return settle(jobs);
   }
   async function settle(jobs) {
@@ -693,8 +700,16 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (!note || note.length > 1000) return failure('Missing or invalid note');
     const details = JSON.parse(row.details);
     details.notes = [...(details.notes || []), note].slice(-20);
+    // "Now it's coming through the ceiling": a note with an emergency in it makes a routine job URGENT and rings as a new
+    // urgent job would (rules.mjs), once.
+    const noteTags = ruleTags(note).filter(t => !(details.rule_tags || []).includes(t));
+    details.rule_tags = [...(details.rule_tags || []), ...noteTags];
+    const upgrade = !/^\s*URGENT\b/i.test(details.issue) && !/^\s*not a job\b/i.test(details.issue) && noteTags.some(t => URGENT_TAGS.has(t));
+    if (upgrade) { details.issue = `URGENT - ${details.issue}`; details.urgent_source = 'rules'; }
     db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
-    return { saved: true, request_id: row.id, note_added: true, office_alert: await alert(route, details, row.id, 'note') };
+    const office_alert = await alert(route, details, row.id, 'note');
+    if (upgrade && route && (!details.is_test || route.alertTests) && shouldRing(details.rule_tags, route)) await settle(ring(callId, route, details));
+    return { saved: true, request_id: row.id, note_added: true, office_alert, ...(upgrade ? { urgent: true } : {}) };
   }
   // An email given after the request was saved: only accepted once spelled back and confirmed, then the confirmation goes out.
   async function addEmail(callId, args, route) {
@@ -738,7 +753,10 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     // A caller who said "test call" is a test; never alert a client about it.
     const said = `${message.artifact?.transcript || message.transcript || ''} ${summary}`;
     const issue = greeting ? 'Hung up during the greeting, before giving any details' : summary ? `Hung up before finishing. Summary: ${summary}` : 'Hung up before giving details';
-    const details = { name: 'Unknown caller', address: '', issue, is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [],
+    // A gas caller is told to hang up and leave: the summary's emergency words still put "URGENT" on the hang-up alert.
+    const tags = ruleTags(said);
+    const details = { name: 'Unknown caller', address: '', issue: tags.some(t => URGENT_TAGS.has(t)) ? `URGENT - ${issue}` : issue, rule_tags: tags,
+      is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [],
       ...(greeting ? { greeting_hangup: true } : {}), ...(recordingOf(message) ? { recording_url: recordingOf(message) } : {}) };
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
@@ -792,6 +810,27 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       if (args[field] != null && (typeof args[field] !== 'string' || args[field].length > 500)) return failure(`Invalid ${field}`);
       details[field] = (args[field] || '').trim();
     }
+    // A number given but not read back (callback_read_back false) goes back once with the read-back line; the second try
+    // saves with a flag on the alert, so no caller is lost. Older tool definitions without the field are not checked.
+    const ownNumber = !!details.callback_phone && digitsOf(details.callback_phone) === digitsOf(callerNumberOf(message));
+    if (details.callback_phone && args.callback_read_back === false && !ownNumber && !readBackWarned.has(callId)) {
+      if (readBackWarned.size > 10000) readBackWarned.clear();
+      readBackWarned.add(callId);
+      return failure('Not saved: read the callback number back first ("So that\'s six one five, ...?"), wait for a yes, then save again with callback_read_back true.');
+    }
+    // Plumber rules (rules.mjs): what the caller said plus Emma's summary. An emergency trigger makes the job URGENT even
+    // when Emma left the prefix off; flags (renter, warranty company, Spanish...) go on the owner's alert.
+    const tags = ruleTags(`${details.issue} ${details.job_type} ${details.job_details} ${callerWords(message)}`);
+    if (details.callback_phone && args.callback_read_back === false && !ownNumber) tags.push('callback_unconfirmed');
+    const route = routeFor(message);
+    if (route?.service_area && /\w/.test(details.address) && !/^not given$/i.test(details.address) && outOfArea(details.address, route.service_area)) tags.push('out_of_area');
+    details.rule_tags = tags;
+    // A sales pitch or job enquiry that mentions "flood" is still not a job.
+    const notAJob = /^\s*not a job\b/i.test(details.issue) || tags.includes('sales_call') || tags.includes('job_seeker');
+    if (!notAJob && !/^\s*URGENT\b/i.test(details.issue) && tags.some(t => URGENT_TAGS.has(t))) {
+      details.issue = `URGENT - ${details.issue}`;
+      details.urgent_source = 'rules';
+    }
     // Skipping the email question is only allowed for emergencies.
     if (args.email_status === 'skipped_emergency' && !/^\s*URGENT\b/i.test(details.issue))
       return failure('Not saved: this is not an urgent job, so ask the caller for their email first, then save again.');
@@ -825,6 +864,10 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       ]);
     }
     result.office_alert = await officeAlert;
+    if (details.urgent_source === 'rules') {
+      result.urgent = true;
+      result.say = 'Saved as URGENT from what the caller described. Give the matching safety line if you have not, skip the time question, and tell them the team has it marked urgent.';
+    }
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
     return result;
   }

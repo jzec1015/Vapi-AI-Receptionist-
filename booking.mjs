@@ -312,7 +312,7 @@ export function createBooking(env = process.env, send = fetch, store = new Map()
   async function checkAvailability(ctx, args) {
     const a = adapterFor(ctx.assistantId);
     if (!a) return fallback;
-    if (ctx.request && /^\s*URGENT\b/i.test(ctx.request.issue)) return { ok: false, reason: 'urgent', say: 'Urgent jobs are not booked into windows; the owner is being alerted.' };
+    if (ctx.request && /^\s*URGENT\b/i.test(ctx.request.issue)) return { ok: false, reason: 'urgent', say: 'Urgent jobs are not booked into windows; the team has it marked urgent.' };
     try {
       let list = await windows(a);
       if (typeof args?.preferred_day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(args.preferred_day))
