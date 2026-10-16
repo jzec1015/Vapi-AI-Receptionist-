@@ -28,7 +28,7 @@
     "maxTokens": 150,
     "temperature": 0.4
   },
-  "firstMessage": "Thanks for calling {{BUSINESS}}, this is Emma, {{OWNER_POSSESSIVE}} AI assistant. Calls are recorded. Emergency? Just say so and I'll ring {{OWNER_FIRST}}. What's going on?",
+  "firstMessage": "Thanks for calling {{BUSINESS}}, this is Emma, {{OWNER_POSSESSIVE}} AI assistant. Calls are recorded. Emergency? Just say so and I'll flag it urgent for {{OWNER_FIRST}}. What's going on?",
   "endCallFunctionEnabled": false,
   "endCallMessage": "",
   "transcriber": {

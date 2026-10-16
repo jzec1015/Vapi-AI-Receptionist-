@@ -103,9 +103,9 @@ test('the assistant is Emma\'s production config with the shop substituted in an
   const config = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key });
   assert.equal(config.name, "O'Brien & Sons Plumbing - Emma (trial)");
   assert.deepEqual(config.metadata, { anchorline_client_id: 'client-1', anchorline_trial: true });
-  assert.equal(config.firstMessage, "Thanks for calling O'Brien & Sons Plumbing, this is Emma, the owner's AI assistant. Calls are recorded. Emergency? Just say so and I'll ring the owner. What's going on?");
+  assert.equal(config.firstMessage, "Thanks for calling O'Brien & Sons Plumbing, this is Emma, the owner's AI assistant. Calls are recorded. Emergency? Just say so and I'll flag it urgent for the owner. What's going on?");
   const named = assistantConfig({ ...shop, owner_name: 'pat Obrien' }, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key });
-  assert.match(named.firstMessage, /this is Emma, Pat's AI assistant\. .* I'll ring Pat\./);
+  assert.match(named.firstMessage, /this is Emma, Pat's AI assistant\. .* I'll flag it urgent for Pat\./);
   assert.match(named.model.messages[0].content, /I'm letting Pat know right away/);
   assert.doesNotMatch(named.model.messages[0].content + named.firstMessage, /\{\{OWNER_/);
   assert.match(assistantConfig({ ...shop, owner_name: '<b>' }, { serverUrl: 'x', secret: key }).firstMessage, /the owner's AI assistant/);
