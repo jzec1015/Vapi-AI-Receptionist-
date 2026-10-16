@@ -907,19 +907,27 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const seconds = Number(message.durationSeconds ?? message.call?.durationSeconds);
     db.prepare('INSERT OR IGNORE INTO call_log VALUES (?, ?, ?, ?, ?)').run(callId, assistantId || null, new Date().toISOString(), Number.isFinite(seconds) ? seconds : null, test ? 1 : 0);
   }
+  const EMPTY_ARGUMENTS = 'empty_arguments: resend submit_service_request with every field filled. Do not ask the caller anything.';
+  // A save with no job behind it: "Not a job" plus a test call, line check or wrong number.
+  const lineCheck = details => /^\s*not a job\b/i.test(details.issue) &&
+    (details.is_test || /\b(test(ing)?|checking the line|line check|wrong number|misdial)/i.test(details.issue));
   // forced: the caller hung up after a refused save (end-of-call net). The one-time checks no longer send it back, and
   // the alert carries `forced` as a flag saying what was not confirmed.
   async function submit(callId, args, message = {}, forced = '') {
     const old = db.prepare('SELECT result FROM requests WHERE call_id = ?').get(callId);
     if (old) return { ...JSON.parse(old.result), duplicate: true };
-    if (!args || typeof args !== 'object' || Array.isArray(args)) return failure('Invalid parameters');
+    // Round 5: some models sent submit with empty arguments; "Missing or invalid name" then made Emma re-ask the caller's
+    // name for 5-6 turns. An empty save is answered with an instruction to resend, never to ask the caller again.
+    if (!args || typeof args !== 'object' || Array.isArray(args) || !['name', 'address', 'issue'].some(f => typeof args[f] === 'string' && args[f].trim()))
+      return failure(EMPTY_ARGUMENTS);
     if (forced) {
       for (const set of [addressWarned, readBackWarned, emailWarned]) set.add(callId);
       if (args.email_status === 'skipped_emergency') args = { ...args, email_status: 'declined' };
     }
     const details = {};
     for (const field of ['name', 'address', 'issue']) {
-      if (typeof args[field] !== 'string' || !args[field].trim() || args[field].length > 4000) return failure(`Missing or invalid ${field}`);
+      if (typeof args[field] !== 'string' || !args[field].trim() || args[field].length > 4000)
+        return failure(`Missing or invalid ${field}: resend submit_service_request with every field filled; use "Not given" for anything the caller didn't say. Do not ask the caller again.`);
       details[field] = args[field].trim();
     }
     if (typeof args.is_test !== 'boolean') return failure('is_test must be boolean');
@@ -981,12 +989,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       details.issue = `URGENT - ${details.issue}`;
       details.urgent_source = 'rules';
     }
-    // Skipping the email question is only allowed for emergencies, existing customers, and calls that are not a job
-    // (sales, job seekers): none of those get a confirmation email.
-    // Spanish speakers give name and number only (prompt), so their save skips the email too.
+    // Emergencies, existing customers, calls that are not a job (sales, job seekers) and Spanish speakers get no
+    // confirmation email. Every other job saves BEFORE the email (v5: on the live line a hang-up at the email question
+    // lost two complete jobs), so the email is never a reason to refuse a save: a non-urgent "skipped_emergency" is
+    // saved as "ask_after_save" and Emma is told to offer the email next.
     const noEmailNeeded = notAJob || tags.includes('existing_customer') || tags.includes('spanish');
-    if (args.email_status === 'skipped_emergency' && !noEmailNeeded && !/^\s*URGENT\b/i.test(details.issue))
-      return failure('Not saved: this is not an urgent job, so ask the caller for their email first, then save again.');
+    if (['skipped_emergency', 'not_needed'].includes(args.email_status) && !noEmailNeeded && !/^\s*URGENT\b/i.test(details.issue))
+      args = { ...args, email_status: 'ask_after_save' };
     details.caller_id = callerNumberOf(message);
     if (forced) details.refusal_flag = forced;
     details.notes = [];
@@ -1027,9 +1036,19 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       ]);
     }
     result.office_alert = await officeAlert;
+    // No alert route (e.g. a test line): the request is saved but nobody was told, so Emma must not say she let anyone know.
+    if (result.office_alert === 'not_configured' && !details.is_test && !result.say)
+      result.say = 'Saved, but no one was alerted. Say: "It\'s saved, and the team will see it." Never say you let anyone know.';
     if (details.urgent_source === 'rules') {
       result.urgent = true;
       result.say = 'Saved as URGENT from what the caller described. Give the matching safety line if you have not, skip the time question, and tell them the team has it marked urgent.';
+    } else if (lineCheck(details)) {
+      // A line check, wrong number or test with no job: there is nothing to pass on, so Emma must not say she sent anything.
+      if (details.is_test) result.sent_to_owner = false;
+      result.say = 'This was not a job, so never say you sent or passed anything on. Close briefly: "Line\'s working, thanks for checking. Take care." (wrong number: "No problem, take care.")';
+    } else if (!details.email && !noEmailNeeded && !/^\s*URGENT\b/i.test(details.issue) && args.email_status === 'ask_after_save') {
+      // Saved before the email (a hang-up at the email question no longer loses the job): the email is an optional extra now.
+      result.next = 'Saved. Now ask for their email for a confirmation, spelled letter by letter; after you spell it back and they say yes, call add_customer_email. If they decline or it fails twice, move on.';
     }
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
     return result;

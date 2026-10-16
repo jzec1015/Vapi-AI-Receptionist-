@@ -1,7 +1,7 @@
 {
   "name": "{{BUSINESS}} - Emma (trial)",
   "voice": {
-    "model": "eleven_turbo_v2_5",
+    "model": "eleven_flash_v2_5",
     "speed": 0.95,
     "style": 0,
     "voiceId": "EXAVITQu4vr4xnSDxMaL",
@@ -28,13 +28,14 @@
     "maxTokens": 150,
     "temperature": 0.4
   },
-  "firstMessage": "Thanks for calling {{BUSINESS}}, this is Emma, {{OWNER_POSSESSIVE}} AI assistant. Calls are recorded. Emergency? Just say so and I'll flag it urgent for {{OWNER_FIRST}}. What's going on?",
+  "firstMessage": "Thanks for calling {{BUSINESS}}, this is Emma, {{OWNER_POSSESSIVE}} AI assistant. Calls are recorded. If it's an emergency, just say so. What's going on?",
   "endCallFunctionEnabled": false,
   "endCallMessage": "",
   "transcriber": {
-    "model": "nova-3",
-    "language": "en",
-    "provider": "deepgram"
+    "provider": "deepgram",
+    "model": "flux-general-en",
+    "eotThreshold": 0.7,
+    "eotTimeoutMs": 3000
   },
   "silenceTimeoutSeconds": 20,
   "serverMessages": [
@@ -53,17 +54,12 @@
   },
   "backgroundDenoisingEnabled": true,
   "startSpeakingPlan": {
-    "waitSeconds": 0.05,
-    "transcriptionEndpointingPlan": {
-      "onPunctuationSeconds": 0.15,
-      "onNoPunctuationSeconds": 1.5,
-      "onNumberSeconds": 1.0
-    }
+    "waitSeconds": 0.05
   },
   "stopSpeakingPlan": {
-    "numWords": 1,
+    "numWords": 3,
     "voiceSeconds": 0.2,
-    "backoffSeconds": 1
+    "backoffSeconds": 1.2
   },
   "server": {
     "url": "{{SERVER_URL}}",

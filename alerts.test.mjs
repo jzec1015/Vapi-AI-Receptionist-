@@ -147,10 +147,12 @@ test('job type, size and details reach the office alert', async t => {
   assert.match(text, /Reply STOP to opt out$/);
 });
 
-test('skipping the email question is refused for a non-urgent job', async t => {
+test('a non-urgent job is saved before the email, and Emma is told to offer it next', async t => {
   const { post } = await fixture(t);
   const r = await result(await post(toolCall('skip-1', 'submit_service_request', { ...intake, issue: 'Faucet drip', email_status: 'skipped_emergency' })));
-  assert.equal(r.saved, false); assert.match(r.error, /ask the caller for their email/);
+  assert.equal(r.saved, true); assert.match(r.next, /ask for their email/); assert.match(r.next, /add_customer_email/);
+  const after = await result(await post(toolCall('skip-3', 'submit_service_request', { ...intake, issue: 'Faucet drip', email_status: 'ask_after_save' })));
+  assert.equal(after.saved, true); assert.match(after.next, /add_customer_email/);
   const ok = await result(await post(toolCall('skip-2', 'submit_service_request', { ...intake, email_status: 'skipped_emergency' })));
   assert.equal(ok.saved, true);
 });
@@ -163,4 +165,37 @@ test('a late email is only added after spell-back and then sends the confirmatio
   const added = await result(await post(toolCall('late-1', 'add_customer_email', { email: 'linda@example.com', confirmed_after_spelling_back: true })));
   assert.equal(added.email_added, true); assert.equal(added.caller_email, 'accepted');
   assert.ok(sent.some(s => s.url.includes('resend') && s.body.to[0] === 'linda@example.com' && /we received your request/.test(s.body.subject)));
+});
+
+test('a line check or wrong number never gets wording that implies something was sent to the owner', async t => {
+  const { post } = await fixture(t);
+  const check = await result(await post(toolCall('line-1', 'submit_service_request',
+    { name: 'Not given', address: 'Not given', issue: 'Not a job - test call, just checking the line', is_test: true, callback_phone: '', email_status: 'declined' })));
+  assert.equal(check.saved, true); assert.equal(check.sent_to_owner, false);
+  assert.match(check.say, /never say you sent/); assert.match(check.say, /Line's working, thanks for checking/);
+  const wrong = await result(await post(toolCall('line-2', 'submit_service_request',
+    { name: 'Not given', address: 'Not given', issue: 'Not a job - wrong number', is_test: false, callback_phone: '', email_status: 'declined' })));
+  assert.equal(wrong.saved, true); assert.match(wrong.say, /never say you sent/); assert.equal(wrong.next, undefined);
+  const sales = await result(await post(toolCall('line-3', 'submit_service_request',
+    { ...intake, issue: 'Not a job - SEO company pitching services', email_status: 'declined' })));
+  assert.equal(sales.say, undefined, 'a sales message is passed on, so the line-check wording does not apply');
+});
+
+test('an empty save is sent back with "resend every field", never an instruction to re-ask the caller', async t => {
+  const { post } = await fixture(t);
+  for (const args of [{}, { is_test: false, email_status: 'confirmed' }]) {
+    const r = await result(await post(toolCall(`empty-${Object.keys(args).length}`, 'submit_service_request', args)));
+    assert.equal(r.saved, false); assert.match(r.error, /^empty_arguments: resend submit_service_request with every field filled\. Do not ask the caller anything\./);
+  }
+  const one = await result(await post(toolCall('empty-name', 'submit_service_request', { ...intake, name: '' })));
+  assert.match(one.error, /Missing or invalid name: resend .*"Not given".*Do not ask the caller again/);
+});
+
+test('"not_needed" on an ordinary job is saved first with the email offered next; a line with no route never claims anyone was told', async t => {
+  const { post } = await fixture(t);
+  const r = await result(await post(toolCall('nn-1', 'submit_service_request', { ...intake, issue: 'Slow drain', email_status: 'not_needed' })));
+  assert.equal(r.saved, true); assert.match(r.next, /ask for their email/);
+  const unrouted = await result(await post(toolCall('nr-1', 'submit_service_request', { ...intake, issue: 'Slow drain', email_status: 'ask_after_save' }, { assistantId: 'no-such-route' })));
+  assert.equal(unrouted.saved, true); assert.equal(unrouted.office_alert, 'not_configured');
+  assert.match(unrouted.say, /It's saved, and the team will see it\./);
 });
