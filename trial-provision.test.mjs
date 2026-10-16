@@ -633,3 +633,15 @@ test('a repeated call from the same caller within 2 minutes is logged as a suspe
   assert.ok(logs.some(l => /call=loop-2 .*loop=suspected/.test(l)));
   assert.ok(!logs.some(l => /call=loop-1 .*loop=suspected/.test(l)));
 });
+
+test('the phone number read-back rule is the last rule Emma reads, before the shop details', () => {
+  const shop = { id: 'client-3', business: 'Acme Plumbing', owner_name: 'Dana Smith', shop_number: '+17205550155', city: 'Denver', state: 'CO', services: 'Drains' };
+  const prompt = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key }).model.messages[0].content;
+  const rule = prompt.indexOf('THE PHONE NUMBER RULE');
+  assert.ok(rule > prompt.indexOf('WRAPPING UP') && rule > prompt.indexOf('STAYING NATURAL'), 'the rule comes after every other section');
+  assert.ok(rule < prompt.indexOf('<<<SHOP DETAILS'), 'and before the shop owner\'s details');
+  const text = prompt.slice(rule, prompt.indexOf('SHOP DETAILS', rule));
+  assert.match(text, /Never call submit_service_request until you have read the whole callback number back and the caller has clearly said yes/);
+  assert.match(text, /If the caller corrects any digit, read the whole corrected number back and wait for a yes before saving/);
+  assert.match(text, /In an emergency this read-back is still the one question you ask before saving/);
+});
