@@ -29,14 +29,14 @@
     "temperature": 0.4
   },
   "firstMessage": "Hi, thanks for calling {{BUSINESS}}. I'm Emma, {{OWNER_POSSESSIVE}} AI assistant. This call may be recorded so we get your details right. If it's an emergency, just say so and I'll ring {{OWNER_FIRST}} right away. How can I help?",
-  "endCallFunctionEnabled": true,
+  "endCallFunctionEnabled": false,
   "endCallMessage": "",
   "transcriber": {
     "model": "nova-3",
     "language": "en",
     "provider": "deepgram"
   },
-  "silenceTimeoutSeconds": 30,
+  "silenceTimeoutSeconds": 20,
   "serverMessages": [
     "end-of-call-report"
   ],
@@ -71,5 +71,24 @@
     "headers": {
       "x-anchorline-key": "{{WEBHOOK_SECRET}}"
     }
-  }
+  },
+  "hooks": [
+    {
+      "on": "customer.speech.timeout",
+      "options": {
+        "timeoutSeconds": 8,
+        "triggerMaxCount": 2,
+        "triggerResetMode": "onUserSpeech"
+      },
+      "do": [
+        {
+          "type": "say",
+          "exact": [
+            "Still with me?",
+            "Are you still there?"
+          ]
+        }
+      ]
+    }
+  ]
 }

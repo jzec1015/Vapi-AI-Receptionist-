@@ -51,6 +51,15 @@ export function formatPhone(value) {
 }
 
 // Lock-screen email subjects: what, where, who to call, e.g. "URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142".
+// A house number that speech recognition clearly garbled: over 6 digits, or 3+ separate digit groups before the
+// street ("2 42 4 0 Elm Street"). Deliberately narrow; "24240 Elm" and "100 200 Main" pass.
+export const garbledHouseNumber = address => {
+  const lead = String(address || '').trim().match(/^(\d+(?:[\s-]+\d+)*)(?=\s|,|$)/);
+  if (!lead) return false;
+  const groups = lead[1].split(/[\s-]+/);
+  return groups.some(g => g.length > 6) || (groups.length >= 3 && groups.every(g => g.length <= 2));
+};
+
 // At most 90 characters; the phone number is never cut, the address keeps its first part (street), the issue gets the rest.
 const SEP = ' \u2013 ';
 const clip = (text, n) => {
@@ -347,6 +356,8 @@ export function createApp(env = process.env, send = fetch) {
     return expected.length >= 32 && supplied.length === expected.length && timingSafeEqual(supplied, expected);
   };
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
+  // Calls already told once that the house number looked garbled; the second save goes through so no caller is lost.
+  const addressWarned = new Set();
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   const inflight = new Map();
@@ -767,6 +778,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     }
     if (typeof args.is_test !== 'boolean') return failure('is_test must be boolean');
     details.is_test = args.is_test;
+    if (garbledHouseNumber(details.address) && !addressWarned.has(callId)) {
+      if (addressWarned.size > 10000) addressWarned.clear();
+      addressWarned.add(callId);
+      return failure('Not saved: the house number sounds garbled. Say "Sorry, I want to make sure I have the house number right. Could you say just the number again?", read it back digit by digit, then save again.');
+    }
     if (args.callback_phone != null && (typeof args.callback_phone !== 'string' || args.callback_phone.length > 100)) return failure('Invalid callback phone');
     details.callback_phone = args.callback_phone || '';
     if (args.preferred_time != null && (typeof args.preferred_time !== 'string' || args.preferred_time.length > 200)) return failure('Invalid preferred time');
