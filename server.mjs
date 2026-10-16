@@ -51,13 +51,41 @@ export function formatPhone(value) {
 }
 
 // Lock-screen email subjects: what, where, who to call, e.g. "URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142".
-// A house number that speech recognition clearly garbled: over 6 digits, or 3+ separate digit groups before the
-// street ("2 42 4 0 Elm Street"). Deliberately narrow; "24240 Elm" and "100 200 Main" pass.
+// A house number that speech recognition clearly garbled: over 6 digits, or 3+ digit groups of mixed sizes before the
+// street ("2 42 4 0 Elm Street"). Deliberately narrow: the model often spaces out single digits, so "5 0 1 Woodland"
+// (= 501) passes, as do "24240 Elm" and "100 200 Main".
 export const garbledHouseNumber = address => {
   const lead = String(address || '').trim().match(/^(\d+(?:[\s-]+\d+)*)(?=\s|,|$)/);
   if (!lead) return false;
   const groups = lead[1].split(/[\s-]+/);
+  if (groups.every(g => g.length === 1)) return groups.length > 6;
   return groups.some(g => g.length > 6) || (groups.length >= 3 && groups.every(g => g.length <= 2));
+};
+
+// Digits in what Emma said, written or spoken ("six one five, oh one", "double five" -> "615015" / "55").
+const DIGIT_WORDS = { zero: '0', oh: '0', o: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
+export const spokenDigits = text => {
+  let out = '', double = false;
+  for (const word of String(text || '').toLowerCase().match(/\d|[a-z]+/g) || []) {
+    const d = /\d/.test(word) ? word : DIGIT_WORDS[word];
+    if (word === 'double') { double = true; continue; }
+    if (d) out += double ? d + d : d;
+    double = false;
+  }
+  return out;
+};
+
+// The callback number must be read back and answered before saving. Uses Vapi's live transcript on the tool call
+// (message.artifact.messages); without one it can't tell, so it never blocks. Returns null when the save may go ahead.
+export const readbackProblem = (messages, phone, urgent) => {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  const last4 = digitsOf(phone).slice(-4);
+  if (last4.length < 4) return null;
+  const turns = messages.filter(m => ['bot', 'assistant', 'user'].includes(m?.role) && typeof (m.message ?? m.content) === 'string');
+  let readback = -1;
+  turns.forEach((m, i) => { if (m.role !== 'user' && spokenDigits(m.message ?? m.content).includes(last4)) readback = i; });
+  if (readback < 0) return urgent ? null : 'no_readback';
+  return turns.slice(readback + 1).some(m => m.role === 'user') ? null : 'no_answer';
 };
 
 // At most 90 characters; the phone number is never cut, the address keeps its first part (street), the issue gets the rest.
@@ -358,6 +386,8 @@ export function createApp(env = process.env, send = fetch) {
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
   // Calls already told once that the house number looked garbled; the second save goes through so no caller is lost.
   const addressWarned = new Set();
+  // Refusals for a missing phone read-back, per call; after two the save goes through so no caller is lost.
+  const readbackWarned = new Map();
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   const inflight = new Map();
@@ -795,6 +825,17 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     // Skipping the email question is only allowed for emergencies.
     if (args.email_status === 'skipped_emergency' && !/^\s*URGENT\b/i.test(details.issue))
       return failure('Not saved: this is not an urgent job, so ask the caller for their email first, then save again.');
+    // Vapi documents artifact on tool-calls as the live call.artifact; log when it's missing so a test call shows it.
+    if (!Array.isArray(message.artifact?.messages)) console.log(`readback-check call=${callId} transcript=missing`);
+    const readback = readbackProblem(message.artifact?.messages, details.callback_phone, /^\s*URGENT\b/i.test(details.issue));
+    if (readback && (readbackWarned.get(callId) || 0) < 2) {
+      if (readbackWarned.size > 10000) readbackWarned.clear();
+      readbackWarned.set(callId, (readbackWarned.get(callId) || 0) + 1);
+      console.log(`readback-refused call=${callId} reason=${readback}`);
+      return failure(readback === 'no_answer'
+        ? 'Not saved yet: you just read the number back. Stop and wait for the caller to say yes, then save again.'
+        : 'Not saved: read the full callback number back digit by digit, wait for the caller to say yes, then save again.');
+    }
     details.caller_id = callerNumberOf(message);
     details.notes = [];
     details.email = '';
