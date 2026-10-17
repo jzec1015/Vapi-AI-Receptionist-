@@ -659,7 +659,7 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   assert.match(natural, /For house numbers, see item 3\./);
   assert.doesNotMatch(natural, /ten digits|five or more digits/);
   const address = section('3. The service address.', '4. The best callback number');
-  assert.match(address, /Read back the street number and street name;.* If the house number has five or more digits, don't read it back; ask instead, "Sorry, could you say the house number once more, slowly\?"/);
+  assert.match(address, /Read back the street number and street name;.* If the house number has five or more digits, don't read it back; ask instead, "Sorry, could you say the house number once more, slowly\?" If they give the same number again, accept it and read it back normally; never ask a third time\./);
   // Item 4 says only how to say a number aloud; the read-back rule itself lives in THE PHONE NUMBER RULE.
   const item4 = section('4. The best callback number', '5. Whether');
   assert.match(item4, /say it in three groups, ALWAYS spelled out as words, never as digits, with commas between groups/);
@@ -676,22 +676,28 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   const rule = section('THE ONE RULE YOU NEVER BREAK', 'WRAPPING UP');
   assert.match(rule, /If submit_service_request, add_request_note or add_customer_email returns an error, times out, or doesn't return saved true, nothing was saved/);
   assert.match(rule, /never say it was sent or added, and never say you're ringing Dana\./);
-  assert.match(rule, /If the error says what to fix, fix it and save again, at most twice in all\./);
-  assert.match(rule, /Otherwise say "I'm having trouble saving that, one moment\." and call the same tool again once\./);
-  assert.match(rule, /say "I'm sorry, I couldn't save that, but the team still gets a recording of this call and will call you back at" and read back the number they gave \(if they gave no number, end at "will call you back"\), then repeat the problem, their name and the address/);
+  assert.match(rule, /If the error says what to fix, fix it; either way, say "I'm having trouble saving that, one moment\." and call the same tool again, at most twice more in all\./);
+  assert.match(rule, /If submit_service_request still isn't saved after that, say "I'm sorry, I couldn't save that, but the team will call you back at" and read back the number they gave;/);
+  assert.match(rule, /if they gave no number \(they refused, so don't ask again\), say "I'm sorry, I couldn't save that\. The team will try the number you're calling from\." Then repeat the problem, their name and the address\./);
+  assert.doesNotMatch(prompt, /recording of this call/);
   assert.match(rule, /This is the one time you may go past 25 words\./);
   assert.match(rule, /If add_customer_email or add_request_note still isn't saved, say "Mention that when the team calls you, so they have it\."/);
-  assert.match(prompt, /If a save is refused, fix what the error says and save again right away \(at most twice in all; see THE ONE RULE\)\./);
+  // The fix-and-save rule lives only in THE ONE RULE; a confirmation email is promised only when the server accepted it.
+  assert.match(prompt, /If a save fails, follow THE ONE RULE\./);
+  assert.doesNotMatch(prompt, /If a save is refused/);
+  assert.match(prompt, /Only if it returns saved true and caller_email "accepted", tell them their confirmation is on its way; otherwise say "The team will confirm your email when they call\."/);
   // THE PHONE NUMBER RULE holds the whole read-back rule and is still the last rule, right before the shop details.
   const phone = prompt.slice(prompt.indexOf('THE PHONE NUMBER RULE ('), prompt.indexOf('SHOP DETAILS') + 'SHOP DETAILS'.length);
   assert.match(phone, /^THE PHONE NUMBER RULE \(this outranks every other rule about saving; gas and shut-off safety advice still come first\)\n/);
-  assert.match(phone, /even when they rattle it off early in the same breath as everything else, your very next reply must be ONLY the read-back question \("So that's seven two oh, five five five, oh one four four\?"\), with no tool call and nothing else; then stop talking and wait for their answer\./);
+  assert.match(phone, /even when they rattle it off early in the same breath as everything else, your very next reply must be ONLY the read-back question \("So that's seven two oh, five five five, oh one four two\?"\), with no tool call and nothing else; then stop talking and wait for their answer\./);
   assert.match(phone, /Set callback_read_back true only if you actually read it back in this call and they said yes\./);
   assert.match(phone, /then save with callback_phone empty\.\n\nSHOP DETAILS/);
   assert.doesNotMatch(prompt, /drains are affected/);
   assert.ok(prompt.lastIndexOf('THE PHONE NUMBER RULE (') > prompt.lastIndexOf('STAYING NATURAL'), 'the phone number rule is still the last rule');
   for (const text of ['THE PHONE NUMBER RULE (', 'you cut out there', 'If a detail sounds impossible', 'Never end the call in a reply that asks a question',
-    "I'm having trouble saving that, one moment.", "I couldn't save that", 'five or more digits', 'rattle it off early', 'very next reply must be ONLY the read-back',
-    'read the whole corrected number back', 'Mention that when the team calls you', 'one step you never skip', "never say you're ringing", "I'm ringing"]) once(text);
+    "I'm having trouble saving that, one moment.", "I couldn't save that, but the team will call you back at", 'The team will try the number you', 'five or more digits', 'rattle it off early', 'very next reply must be ONLY the read-back',
+    'read the whole corrected number back', 'Mention that when the team calls you', 'one step you never skip', "never say you're ringing", "I'm ringing", 'fix it; either way', 'never ask a third time', 'caller_email "accepted"']) once(text);
+  assert.equal(prompt.split('five five five, oh one four two?').length - 1, 2, 'item 4 and THE PHONE NUMBER RULE use the same example number');
+  assert.doesNotMatch(prompt, /oh one four four/);
   assert.doesNotMatch(prompt, /\{\{/);
 });
