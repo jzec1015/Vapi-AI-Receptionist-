@@ -166,6 +166,19 @@ test('a retry that throws is counted, so it still reaches the cap', async t => {
   assert.deepEqual(await app.sweepOfficeRetries(Date.now() + MIN + 2000), [], 'waits a minute, not 5 s');
 });
 
+test('a retry that keeps throwing ends in an Anchorline notice by call ID', async t => {
+  quiet(t);
+  const { app, post, sent, down, dir, rows } = await fixture(t);
+  down.add('telnyx'); down.add('resend');
+  await post(toolCall('always-broken'));
+  const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+  db.prepare("UPDATE requests SET details = '{' WHERE call_id = 'always-broken'").run(); db.close();
+  const now = Date.now();
+  for (let i = 1; i <= 6; i++) assert.deepEqual(await app.sweepOfficeRetries(now + i * 61000), ['error']);
+  assert.equal(rows()[0].done, 'gave_up_error_notice_accepted');
+  assert.match(sent.find(s => s.provider === 'office' && /could not be read/.test(s.body.subject)).body.text, /Vapi call ID: always-broken/);
+});
+
 test('test calls and lines without a route are never queued, even when the route alerts on tests', async t => {
   quiet(t);
   const { app, post, down, rows } = await fixture(t, { env: { ALERT_ROUTES: JSON.stringify({ 'client-a': { ...route, alertTests: true } }) } });
@@ -173,7 +186,7 @@ test('test calls and lines without a route are never queued, even when the route
   assert.equal((await result(await post(toolCall('test-call', { ...intake, is_test: true })))).office_alert, 'needs_review');
   const other = toolCall('no-route'); other.message.call.assistantId = 'demo-line';
   assert.equal((await result(await post(other))).office_alert, 'not_configured');
-  assert.deepEqual(rows().map(r => [r.call_id, r.done]), [['no-route', 'not_configured']], 'the test call is never armed');
+  assert.deepEqual(rows(), [], 'neither the test call nor a line without a route is armed');
   assert.deepEqual(await app.sweepOfficeRetries(Date.now() + 10 * MIN), []);
 });
 

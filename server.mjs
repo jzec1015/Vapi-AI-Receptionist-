@@ -267,7 +267,8 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS office_retries (
         call_id TEXT PRIMARY KEY, kind TEXT NOT NULL, email_key TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
         next_at INTEGER NOT NULL, done TEXT
-      );`);
+      );
+      CREATE INDEX IF NOT EXISTS office_retries_due ON office_retries (done, next_at);`);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
     // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
     // A failed trial migration switches trials off (healthz trials_enabled: false) but never stops the server.
@@ -479,11 +480,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   const settle = async jobs => (await settleOutcome(jobs)).status;
   // Saves a request and, for a live one, arms its office-alert retry in the same transaction, before any network call:
   // a crash or redeploy while the alert is going out still leaves the retry for sweepOfficeRetries. Returns insert's info.
-  function saveWithRetry(orIgnore, callId, id, details, result, assistantId, kind) {
+  function saveWithRetry(orIgnore, callId, id, details, result, assistantId, kind, routed) {
     db.exec('BEGIN IMMEDIATE');
     try {
       const info = insert(orIgnore, callId, id, details, result, assistantId);
-      if (info.changes && !details.is_test) db.prepare('INSERT OR IGNORE INTO office_retries (call_id, kind, email_key, next_at) VALUES (?, ?, ?, ?)')
+      if (info.changes && routed && !details.is_test) db.prepare('INSERT OR IGNORE INTO office_retries (call_id, kind, email_key, next_at) VALUES (?, ?, ?, ?)')
         .run(callId, kind, `${id}-alert-${kind}-0`, Date.now() + OFFICE_RETRY_MS);
       db.exec('COMMIT');
       return info;
@@ -665,7 +666,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       (first ? console.error : console.warn)(`office-alert GAVE UP call=${row.call_id} request=${request.id} anchorline_notice=${notice}`);
       return `gave_up_${notice}`;
     } catch {
-      // Counted like a failed try, so a retry that keeps throwing still reaches the notice and the cap.
+      // Counted like a failed try. Once the retries are used up Anchorline is told (by call ID: the request may be unreadable).
+      if (attempts > OFFICE_RETRIES) {
+        const notice = await officeNotice('Office alert failed: request could not be read',
+          `An office alert reached nobody and its retry keeps failing. Nobody at the office has been told.\nVapi call ID: ${row.call_id}`,
+          `${row.call_id}-office-alert-error`).catch(() => 'needs_review');
+        if (notice === 'accepted' || notice === 'not_requested') { set({ attempts, done: `gave_up_error_notice_${notice}` }); console.error(`office-alert GAVE UP call=${row.call_id} retry kept failing, anchorline_notice=${notice}`); return 'error'; }
+      }
       set(attempts >= OFFICE_RETRIES + 60 ? { attempts, done: 'gave_up_error' } : { attempts, next_at: now + OFFICE_RETRY_MS });
       console.warn(`office-alert retry call=${row.call_id} attempt=${attempts} failed`);
       return 'error';
@@ -820,7 +827,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
     classify(details, callId, message);
-    const inserted = saveWithRetry(true, callId, id, details, result, assistantIdOf(message), 'hangup');
+    const inserted = saveWithRetry(true, callId, id, details, result, assistantIdOf(message), 'hangup', !!route);
     if (!inserted.changes) return 'already_saved';
     const outcome = await alertOutcome(route, details, id, 'hangup');
     result.office_alert = outcome.status;
@@ -882,14 +889,17 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       caller_email: details.email ? 'pending' : 'not_requested',
       anchorline_email: env.OFFICE_EMAIL ? 'pending' : 'not_requested' };
     // Commit before any network operation. One request per Vapi call survives retries/restarts.
-    saveWithRetry(false, callId, id, details, result, assistantIdOf(message), 'new');
+    saveWithRetry(false, callId, id, details, result, assistantIdOf(message), 'new', !!routeFor(message));
     // Urgent job with an owner's cell on the route: offer a live transfer and hold the spoken alert call for its outcome.
     const transfer = canTransfer(routeFor(message), details);
     if (transfer) {
       db.prepare('INSERT OR IGNORE INTO transfers VALUES (?, ?, ?, ?, ?)').run(callId, assistantIdOf(message), 'pending', Date.now() + fallbackMs, new Date().toISOString());
       result.live_transfer = 'available';
     }
-    const officeAlert = alertOutcome(routeFor(message), details, id, 'new', transfer, callId);
+    // The retry is settled the moment the alert resolves (not after the receipts), so a crash in between can't re-text.
+    let retry = '';
+    const officeAlert = alertOutcome(routeFor(message), details, id, 'new', transfer, callId)
+      .then(outcome => { retry = settleOfficeRetry(callId, id, 'new', outcome) ? ' retry=queued' : ''; return outcome; });
     if (details.is_test) {
       result.caller_email = details.email ? 'suppressed_test' : 'not_requested';
       result.anchorline_email = env.OFFICE_EMAIL ? 'suppressed_test' : 'not_requested';
@@ -901,7 +911,6 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const outcome = await officeAlert;
     result.office_alert = outcome.status;
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
-    const retry = settleOfficeRetry(callId, id, 'new', outcome) ? ' retry=queued' : '';
     // Operational log only: statuses and IDs, never caller details.
     console.log(`submit call=${callId} request=${id} urgent=${/^\s*URGENT\b/i.test(details.issue) ? 'yes' : 'no'} office_alert=${result.office_alert} caller_email=${result.caller_email} anchorline_email=${result.anchorline_email}${retry}`);
     return result;
