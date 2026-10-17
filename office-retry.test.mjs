@@ -4,14 +4,15 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp } from './server.mjs';
 
 // v1.8.1: a request whose office alert reached nobody (every channel failed) is retried, then Anchorline is told.
 const key = 'synthetic-test-key-not-used-in-production';
 const MIN = 60000;
-const routes = JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'] } });
-const alertEnv = { ALERT_ROUTES: routes, TELNYX_API_KEY: 'fixture-only', TELNYX_FROM: '+15550000000', RESEND_API_KEY: 'fixture-only',
-  EMAIL_FROM: 'alerts@example.com', OFFICE_EMAIL: 'ops@example.com' };
+const route = { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'] };
+const alertEnv = { ALERT_ROUTES: JSON.stringify({ 'client-a': route }), TELNYX_API_KEY: 'fixture-only', TELNYX_FROM: '+15550000000',
+  RESEND_API_KEY: 'fixture-only', EMAIL_FROM: 'alerts@example.com', OFFICE_EMAIL: 'ops@example.com' };
 const intake = { name: 'Linda Harper', address: '48 Birch Road', issue: 'Slow kitchen drain', is_test: false, callback_phone: '6155550142',
   email_status: 'declined' };
 const toolCall = (id, args = intake) => ({ message: { type: 'tool-calls', call: { id, assistantId: 'client-a', customer: { number: '+16155550100' } },
@@ -20,31 +21,35 @@ const hangup = id => ({ message: { type: 'end-of-call-report', durationSeconds: 
   call: { id, assistantId: 'client-a', type: 'inboundPhoneCall', customer: { number: '+16155550100' } } } });
 const result = async response => JSON.parse((await response.json()).results[0].result);
 
-// down: providers that fail ('telnyx', 'resend', 'office' = the Anchorline notice). Every send is recorded.
-async function fixture(t, { dir = mkdtempSync(join(tmpdir(), 'office-retry-')), keep = false } = {}) {
-  const sent = [], down = new Set();
+// down: providers that answer 500 ('telnyx', 'resend' = client alert email, 'office' = mail to OFFICE_EMAIL, 'vapi').
+// gate: when set, every send waits for it (an alert still in flight). keep: the test closes the app itself.
+async function fixture(t, { dir = mkdtempSync(join(tmpdir(), 'office-retry-')), keep = false, env = {} } = {}) {
+  const sent = [], down = new Set(), state = { gate: null };
   const send = async (url, init) => {
     const body = JSON.parse(init.body);
-    const provider = url.includes('telnyx') ? 'telnyx' : body.to?.includes?.('ops@example.com') ? 'office' : 'resend';
+    const provider = url.includes('telnyx') ? 'telnyx' : url.includes('vapi') ? 'vapi' : body.to?.includes?.('ops@example.com') ? 'office' : 'resend';
+    if (state.gate) await state.gate;
     sent.push({ provider, body, key: init.headers['Idempotency-Key'] });
-    return new Response('{}', { status: down.has(provider) ? 500 : 200 });
+    return new Response(JSON.stringify({ id: `vapi-${sent.length}` }), { status: down.has(provider) ? 500 : 200 });
   };
-  const app = createApp({ DATA_DIR: dir, VAPI_WEBHOOK_SECRET: key, ...alertEnv }, send);
+  const app = createApp({ DATA_DIR: dir, VAPI_WEBHOOK_SECRET: key, ...alertEnv, ...env }, send);
   app.listen(0, '127.0.0.1'); await once(app, 'listening');
-  // keep: the test closes this app itself (to restart on the same folder) and the next fixture removes the folder.
   if (!keep) t.after(async () => { await new Promise(resolve => app.close(resolve)); rmSync(dir, { recursive: true, force: true }); });
   const url = `http://127.0.0.1:${app.address().port}/vapi/webhook`;
   const post = async body => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': key }, body: JSON.stringify(body) });
-  const alerts = () => sent.filter(s => s.provider !== 'office' && !(s.body.to || []).includes?.('ops@example.com'));
-  return { app, post, sent, down, dir, alerts };
+  const rows = () => { const db = new DatabaseSync(join(dir, 'requests.sqlite')); try { return db.prepare('SELECT * FROM office_retries ORDER BY call_id').all(); } finally { db.close(); } };
+  const close = () => new Promise(resolve => app.close(resolve));
+  return { app, post, sent, down, dir, rows, state, close };
 }
+const quiet = t => { const { log, warn, error } = console; console.log = console.warn = console.error = () => {}; t.after(() => Object.assign(console, { log, warn, error })); };
 
 test('an alert that reached nobody is retried every minute until a channel gets through, with the same email key', async t => {
-  const { app, post, sent, down } = await fixture(t);
+  quiet(t);
+  const { app, post, sent, down, rows } = await fixture(t);
   down.add('telnyx'); down.add('resend');
   const saved = await result(await post(toolCall('all-down')));
   assert.equal(saved.saved, true); assert.equal(saved.office_alert, 'needs_review');
-  const firstKey = sent.find(s => s.provider === 'resend' && s.body.to?.[0] === 'office@example.com').key;
+  const firstKey = sent.find(s => s.provider === 'resend').key;
   const now = Date.now();
   assert.deepEqual(await app.sweepOfficeRetries(now + 30000), [], 'not before a minute');
   assert.deepEqual(await app.sweepOfficeRetries(now + MIN + 1000), ['retrying']);
@@ -55,21 +60,49 @@ test('an alert that reached nobody is retried every minute until a channel gets 
   assert.equal(retry.filter(s => s.provider === 'telnyx').length, 1);
   assert.deepEqual(retry.filter(s => s.provider === 'resend').map(s => s.key), [firstKey], 'Resend can dedupe a send that did land');
   assert.deepEqual(await app.sweepOfficeRetries(now + 10 * MIN), [], 'done once delivered');
-  const again = await result(await post(toolCall('all-down')));
-  assert.equal(again.office_alert, 'sent_after_retry', 'a repeat of the call sees the real outcome');
+  assert.equal(rows()[0].done, 'sent');
+  assert.equal((await result(await post(toolCall('all-down')))).office_alert, 'sent_after_retry', 'a repeat of the call sees the real outcome');
 });
 
-test('a partly delivered alert is not retried (no second text or email)', async t => {
-  const { app, post, sent, down } = await fixture(t);
+test('the retry is armed before the alert goes out, so a crash mid-alert still retries after a restart', async t => {
+  quiet(t);
+  const first = await fixture(t, { keep: true });
+  let release; first.state.gate = new Promise(resolve => { release = resolve; });
+  const pending = first.post(toolCall('crash-mid-alert'));
+  for (let i = 0; i < 100 && !first.rows().length; i++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(first.rows().map(r => [r.call_id, r.done, r.attempts]), [['crash-mid-alert', null, 0]], 'armed while the alert is still in flight');
+  // The "crash": a second server on the same data folder takes over while the first alert never finished.
+  const second = await fixture(t, { dir: first.dir });
+  assert.deepEqual(await second.app.sweepOfficeRetries(Date.now() + MIN + 1000), ['sent']);
+  assert.equal(second.sent.filter(s => s.provider === 'telnyx').length, 1);
+  release(); await pending; await first.close();
+});
+
+test('a delivered or partly delivered alert closes its retry and is never sent again', async t => {
+  quiet(t);
+  const { app, post, sent, down, rows } = await fixture(t);
+  await post(toolCall('all-up'));
   down.add('telnyx');
   assert.equal((await result(await post(toolCall('half-down')))).office_alert, 'needs_review');
+  assert.deepEqual(rows().map(r => [r.call_id, r.done]), [['all-up', 'sent'], ['half-down', 'needs_review']]);
   const before = sent.length;
   assert.deepEqual(await app.sweepOfficeRetries(Date.now() + 10 * MIN), []);
   assert.equal(sent.length, before);
 });
 
+test('an urgent ring that was placed counts as reaching the office', async t => {
+  quiet(t);
+  const urgentEnv = { VAPI_API_KEY: 'fixture-only', ALERT_CALL_FROM_ID: 'phone-1', ALERT_ROUTES: JSON.stringify({ 'client-a': { ...route, call: ['+15550000009'] } }) };
+  const { post, down, rows } = await fixture(t, { env: urgentEnv });
+  down.add('telnyx'); down.add('resend');
+  const saved = await result(await post(toolCall('urgent-ring', { ...intake, issue: 'URGENT - burst pipe' })));
+  assert.equal(saved.office_alert, 'needs_review');
+  assert.equal(rows()[0].done, 'needs_review', 'closed: the owner is being rung (escalation handles an unanswered ring)');
+});
+
 test('after 5 failed retries Anchorline is told once, and that notice is retried until accepted', async t => {
-  const { app, post, sent, down } = await fixture(t);
+  quiet(t);
+  const { app, post, sent, down, rows } = await fixture(t);
   down.add('telnyx'); down.add('resend'); down.add('office');
   await post(toolCall('never'));
   const now = Date.now();
@@ -82,21 +115,70 @@ test('after 5 failed retries Anchorline is told once, and that notice is retried
   const notices = sent.filter(s => s.provider === 'office' && /^Office alert failed/.test(s.body.subject));
   assert.equal(notices.length, 2);
   assert.equal(new Set(notices.map(s => s.key)).size, 1, 'one Idempotency-Key: Resend sends it at most once');
-  assert.match(notices[1].body.text, /Nobody at the office has been told[\s\S]*Request reference: /);
+  assert.match(notices[1].body.text, /^Every alert channel failed 6 times[\s\S]*Nobody at the office has been told[\s\S]*Request reference: /);
   assert.equal(sent.filter(s => s.provider === 'telnyx').length, smsTries, 'no more client texts once given up');
+  assert.equal(rows()[0].done, 'gave_up_notice_accepted');
   assert.deepEqual(await app.sweepOfficeRetries(now + 60 * MIN), []);
 });
 
-test('test calls and lines without a route are never queued', async t => {
-  const { app, post, down } = await fixture(t);
+test('the Anchorline notice gives up after an hour of failures', async t => {
+  quiet(t);
+  const { app, post, down, rows } = await fixture(t);
+  down.add('telnyx'); down.add('resend'); down.add('office');
+  await post(toolCall('silent'));
+  const now = Date.now();
+  for (let i = 1; i <= 70 && !rows()[0].done; i++) await app.sweepOfficeRetries(now + i * 61000);
+  assert.equal(rows()[0].done, 'gave_up_silent'); assert.equal(rows()[0].attempts, 65);
+});
+
+test('without OFFICE_EMAIL the retry still ends after 5 tries', async t => {
+  quiet(t);
+  const { app, post, down, rows } = await fixture(t, { env: { OFFICE_EMAIL: '' } });
   down.add('telnyx'); down.add('resend');
-  assert.equal((await result(await post(toolCall('test-call', { ...intake, is_test: true })))).office_alert, 'suppressed_test');
+  await post(toolCall('no-office'));
+  const now = Date.now();
+  for (let i = 1; i <= 6; i++) await app.sweepOfficeRetries(now + i * 61000);
+  assert.equal(rows()[0].done, 'gave_up_notice_not_requested');
+});
+
+test('a route that disappears mid-retry still ends in the Anchorline notice', async t => {
+  quiet(t);
+  const first = await fixture(t, { keep: true });
+  first.down.add('telnyx'); first.down.add('resend');
+  await first.post(toolCall('route-gone'));
+  await first.close();
+  const second = await fixture(t, { dir: first.dir, env: { ALERT_ROUTES: '{}' } });
+  assert.deepEqual(await second.app.sweepOfficeRetries(Date.now() + MIN + 1000), ['gave_up_accepted']);
+  const notice = second.sent.find(s => s.provider === 'office');
+  assert.match(notice.body.text, /alert route is gone[\s\S]*Issue: Slow kitchen drain/);
+  assert.equal(second.sent.filter(s => s.provider === 'telnyx').length, 0);
+});
+
+test('a retry that throws is counted, so it still reaches the cap', async t => {
+  quiet(t);
+  const { app, post, down, dir, rows } = await fixture(t);
+  down.add('telnyx'); down.add('resend');
+  await post(toolCall('broken-row'));
+  const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+  db.prepare("UPDATE requests SET details = '{' WHERE call_id = 'broken-row'").run(); db.close();
+  assert.deepEqual(await app.sweepOfficeRetries(Date.now() + MIN + 1000), ['error']);
+  assert.equal(rows()[0].attempts, 1);
+  assert.deepEqual(await app.sweepOfficeRetries(Date.now() + MIN + 2000), [], 'waits a minute, not 5 s');
+});
+
+test('test calls and lines without a route are never queued, even when the route alerts on tests', async t => {
+  quiet(t);
+  const { app, post, down, rows } = await fixture(t, { env: { ALERT_ROUTES: JSON.stringify({ 'client-a': { ...route, alertTests: true } }) } });
+  down.add('telnyx'); down.add('resend');
+  assert.equal((await result(await post(toolCall('test-call', { ...intake, is_test: true })))).office_alert, 'needs_review');
   const other = toolCall('no-route'); other.message.call.assistantId = 'demo-line';
   assert.equal((await result(await post(other))).office_alert, 'not_configured');
+  assert.deepEqual(rows().map(r => [r.call_id, r.done]), [['no-route', 'not_configured']], 'the test call is never armed');
   assert.deepEqual(await app.sweepOfficeRetries(Date.now() + 10 * MIN), []);
 });
 
 test('a hang-up alert that reached nobody is retried too', async t => {
+  quiet(t);
   const { app, post, sent, down } = await fixture(t);
   down.add('telnyx'); down.add('resend');
   assert.equal((await post(hangup('hang-down'))).status, 200);
@@ -104,16 +186,6 @@ test('a hang-up alert that reached nobody is retried too', async t => {
   const before = sent.length;
   assert.deepEqual(await app.sweepOfficeRetries(Date.now() + MIN + 1000), ['sent']);
   assert.match(sent.slice(before).find(s => s.provider === 'telnyx').body.text, /^Anchorline AI: Caller hung up - Gold Star Plumbing/);
-});
-
-test('a queued retry survives a restart', async t => {
-  const first = await fixture(t, { keep: true });
-  first.down.add('telnyx'); first.down.add('resend');
-  await first.post(toolCall('restart-down'));
-  await new Promise(resolve => first.app.close(resolve));
-  const second = await fixture(t, { dir: first.dir });
-  assert.deepEqual(await second.app.sweepOfficeRetries(Date.now() + MIN + 1000), ['sent']);
-  assert.equal(second.sent.filter(s => s.provider === 'telnyx').length, 1);
 });
 
 test('failed alert emails and every submit outcome are logged without caller details', async t => {
