@@ -860,7 +860,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (rest.includes(null)) return later() + await resend();
     return finish('unanswered') + await resend();
   }
-  // Office alerts that reached nobody: send the SMS and email again every minute (no new ring: urgent escalation owns
+  // Office alerts that reached nobody (office_retries is the only sweeper that retries them): send the SMS and email again every minute (no new ring: urgent escalation owns
   // that), 5 times, keeping the first email's Resend key. Then Anchorline gets one notice, retried every minute for up
   // to an hour until accepted. A route that is gone, or a retry that throws, still ends in that notice.
   async function retryOffice(row, now) {
@@ -876,6 +876,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       let why = `Every alert channel failed ${Math.min(row.attempts + 1, OFFICE_RETRIES + 1)} times`;
       // After a crash, alertOutcome skips channels the ledger has as sent and sends the cut ones once.
       // Known gap: sent_after_retry may label a row whose channels were finished after a crash.
+      // Known gap: a Telnyx SMS that timed out after 8 s but was delivered is recorded failed and re-sent by a retry (same as main).
       if (route && row.attempts < OFFICE_RETRIES) {
         // A job saved over an hour ago still goes to the shop (nothing is lost), once, marked as delayed.
         const age = Math.floor((now - Date.parse(request.created_at)) / 60000);
@@ -1019,7 +1020,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     (ref, kind, call_id, tool_call_id, args_key, created_at, due_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(ref, kind, callId, toolCallId, argsKey, Date.now(), Date.now() + 30000);
   // A note alert reached the office when it needed nothing (sent, test, no route) or at least one of its channels went out.
   // Until then its outbox row stays, and the sweep tries the failed channels again. (The new-job alert is not kept here:
-  // office_retries owns "reached nobody" for new-job and hang-up alerts.)
+  // office_retries is the only sweeper that retries a new-job or hang-up alert that reached nobody; a Vapi retry of a
+  // needs_review submit also re-sends its failed channels, through the same ledger.)
   const officeReached = (result, alertKey) => result.office_alert !== 'needs_review' && result.office_alert !== 'pending'
     || !!db.prepare("SELECT 1 FROM deliveries WHERE ref = ? AND status = 'sent'").get(alertKey);
   const doneOutbox = ref => db.prepare('DELETE FROM outbox WHERE ref = ?').run(ref);
@@ -1061,7 +1063,9 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   const toolRef = (name, callId, toolCallId, argsKey) => `${name}\n${callId}\n${toolCallId}\n${argsKey}`;
   const toolRow = (name, callId, toolCallId, argsKey) => db.prepare(`SELECT arg, assistant_id, result FROM tool_calls
     WHERE call_id = ? AND name = ? AND tool_call_id = ? AND args_key = ?`).get(callId, name, toolCallId, argsKey);
-  // A toolCall id already stored with other arguments: a conflict (a Vapi retry repeats the same body), never a new change.
+  // add_request_note and add_customer_email: a toolCall id already stored with other arguments is refused as a conflict (a
+  // Vapi retry repeats the same body), never a new change. submit keeps main's one-request-per-call rule: a repeat with
+  // other arguments gets the stored result, marked duplicate.
   const reused = (name, callId, toolCallId) => !!db.prepare('SELECT 1 FROM tool_calls WHERE call_id = ? AND name = ? AND tool_call_id = ?').get(callId, name, toolCallId);
   function deliverTool(name, callId, toolCallId, argsKey) {
     const ref = toolRef(name, callId, toolCallId, argsKey);
@@ -1461,7 +1465,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   const sweepAll = async () => {
     if (sweeping) return;
     sweeping = true;
-    try { await sweepTransfers().catch(() => {}); await sweepEscalations().catch(() => {}); await sweepOutbox().catch(() => {}); await sendDigests().catch(() => console.warn('digest failed')); }
+    try { await sweepTransfers().catch(() => {}); await sweepEscalations().catch(() => {}); await sendDigests().catch(() => console.warn('digest failed')); }
     finally { sweeping = false; }
   };
   const sweeper = db ? setInterval(sweepAll, 5000) : null;
@@ -1473,6 +1477,15 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     try { await sweepOfficeRetries().catch(() => console.warn('office-alert sweep failed')); } finally { retrying = false; }
   }, 5000) : null;
   officeSweeper?.unref();
+  // The outbox (finishing sends cut off by a restart) has its own timer too: a hanging Telnyx or Resend never holds up the
+  // held urgent rings above. It may run alongside the office sweep: both go through the shared delivery ledger and its joins.
+  let finishing = false;
+  const outboxSweeper = db ? setInterval(async () => {
+    if (finishing) return;
+    finishing = true;
+    try { await sweepOutbox().catch(() => console.warn('outbox sweep failed')); } finally { finishing = false; }
+  }, 5000) : null;
+  outboxSweeper?.unref();
   // Trials: hourly (results emails, trial end, stuck provisioning), and once a minute after startup.
   const trialSweep = () => trials.sweep().catch(() => console.warn('trial sweep failed'));
   const trialSweeper = trialsEnabled ? setInterval(trialSweep, 3600000) : null;
@@ -1484,7 +1497,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   server.sweepOfficeRetries = sweepOfficeRetries;
   server.sendDigests = sendDigests;
   server.trials = trials;
-  server.on('close', () => { clearInterval(sweeper); clearInterval(officeSweeper); clearInterval(trialSweeper); clearTimeout(trialStart); db?.close(); });
+  server.on('close', () => { clearInterval(sweeper); clearInterval(officeSweeper); clearInterval(outboxSweeper); clearInterval(trialSweeper); clearTimeout(trialStart); db?.close(); });
   return server;
 }
 

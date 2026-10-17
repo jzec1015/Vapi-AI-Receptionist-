@@ -630,3 +630,50 @@ test('every tool call logs one line with ids, outcome and time, never the argume
   assert.match(tools[3], /^tool-call name=no_such_tool call=l-1 tool_call=tc_bad_id outcome=refused ms=\d+$/);
   for (const l of lines) { assert.doesNotMatch(l, /4471|Linda|Birch|6155550142/); }
 });
+
+test('outbox rows retrying while Telnyx and Resend hang never delay a held urgent ring: it goes on the same sweep tick as with no hang', async t => {
+  t.mock.method(console, 'warn', () => {}); t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const env = { ALERT_ROUTES: JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'], call: ['+15550000009'], digest: false } }),
+    VAPI_API_KEY: 'fixture-only', ALERT_CALL_FROM_ID: 'from-line' };
+  // Returns when (ms after the restart, on the mocked clock) the held ring was placed, or null if not within 40 s.
+  async function ringTime(hang) {
+    const dir = tempDir(t);
+    const first = await fixture(t, { dir, extra: env });
+    await first.post(toolCall('b-1', 'submit_service_request', intake, 'tc-s'));
+    for (let i = 0; i < 4; i++) await first.post(note('b-1', `Gate code ${i}`, `tc-n${i}`));
+    await first.stop();
+    // Four note alerts left unsent (outbox rows due now), and a missed transfer whose held ring is due at +7 s.
+    const base = Date.now();
+    const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+    try {
+      db.exec(`DELETE FROM deliveries WHERE ref LIKE '%-alert-note-%'; UPDATE tool_calls SET result = json_set(result, '$.office_alert', 'pending') WHERE name = 'add_request_note'`);
+      for (const r of db.prepare("SELECT call_id, name, tool_call_id, args_key FROM tool_calls WHERE name = 'add_request_note'").all())
+        db.prepare('INSERT OR REPLACE INTO outbox (ref, kind, call_id, tool_call_id, args_key, created_at, due_at) VALUES (?, ?, ?, ?, ?, ?, 0)')
+          .run(`${r.name}\n${r.call_id}\n${r.tool_call_id}\n${r.args_key}`, r.name, r.call_id, r.tool_call_id, r.args_key, base);
+      assert.equal(db.prepare('SELECT count(*) n FROM outbox').get().n, 4);
+      db.prepare("INSERT INTO transfers VALUES ('b-1', 'client-a', 'pending', ?, ?)").run(base + 7000, new Date(base).toISOString());
+    } finally { db.close(); }
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: base });
+    try {
+      const rings = [];
+      const hung = [];
+      const send = (url, init) => {
+        if (url === 'https://api.vapi.ai/call') { rings.push(Date.now() - base); return Promise.resolve(Response.json({ id: 'v1' })); }
+        if (url.startsWith('https://api.vapi.ai/')) return Promise.resolve(new Response('{}', { status: 404 }));
+        if (!hang) return Promise.resolve(new Response('{}', { status: 200 }));
+        hung.push(url); // Telnyx or Resend hangs (until its 8 s abort, which never comes on this clock)
+        return new Promise((_, reject) => init.signal?.addEventListener('abort', () => reject(new Error('timeout'))));
+      };
+      const app = createApp({ DATA_DIR: dir, VAPI_WEBHOOK_SECRET: key, ...alertEnv, ...env }, send);
+      try {
+        for (let tick = 1; tick <= 8 && !rings.length; tick++) { t.mock.timers.tick(5000); await settleLater(60); }
+        if (hang) assert.ok(hung.length > 0, 'the outbox sweep is hanging on a provider');
+        return rings[0] ?? null;
+      } finally { app.close(); }
+    } finally { t.mock.timers.reset(); }
+  }
+  const control = await ringTime(false);
+  const hung = await ringTime(true);
+  assert.equal(control, 10000, 'with no hang the ring goes on the first 5 s tick after it is due');
+  assert.equal(hung, control, `with providers hanging the ring went at ${hung} ms instead of ${control} ms`);
+});
