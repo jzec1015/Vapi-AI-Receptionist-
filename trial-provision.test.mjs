@@ -682,7 +682,7 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   assert.match(rule, /If submit_service_request, add_request_note or add_customer_email returns an error, times out, or doesn't return saved true, nothing was saved/);
   assert.match(rule, /never say it was sent or added, and never say you're ringing Dana\./);
   assert.match(rule, /Say "I'm having trouble saving that, one moment\.", fix what the error says if it tells you, and call the same tool again once\. If submit_service_request still isn't saved, say "I'm sorry, I couldn't save that, but the team will call you back at" and read back the number they gave;/);
-  assert.match(rule, /if they gave no number \(they refused, so don't ask again\), say "I'm sorry, I couldn't save that\. The team will try the number you're calling from\." Then repeat the problem, their name and the address\./);
+  assert.match(rule, /if they gave no number \(they refused, or you couldn't get one, so don't ask again\), say "I'm sorry, I couldn't save that\. The team will try the number you're calling from, if it shows on our end\." Then repeat the problem, their name and the address\./);
   assert.doesNotMatch(prompt, /recording of this call/);
   assert.match(rule, /This is the one time you may go past 25 words\./);
   assert.match(rule, /If add_customer_email or add_request_note still isn't saved, say "Mention that when the team calls you, so they have it\."/);
@@ -795,8 +795,8 @@ test('social pass: Emma yields to interruptions, re-reads only a correction, cap
   assert.doesNotMatch(prompt, /Pricing depends on what|DO NOT ALWAYS USE/);
   for (const [, line] of prompt.slice(0, prompt.indexOf('<<<SHOP DETAILS')).matchAll(/"([^"]*)"/g))
     assert.ok(line.split(/\s+/).length <= 25, `quoted line over 25 words: ${line}`);
-  // d: shorter than the voice-upgrade text (3,098 template words), with each rule still stated once.
-  assert.ok(prompt.split(/\s+/).length < 2900, `prompt has ${prompt.split(/\s+/).length} words`);
+  // d: shorter than the voice-upgrade text (3,220 rendered words), with each rule still stated once.
+  assert.ok(prompt.split(/\s+/).length < 3000, `prompt has ${prompt.split(/\s+/).length} words`);
 });
 
 test('social round 2: an interrupted read-back is read again in full, and phone corrections are not failed tries', () => {
@@ -810,7 +810,7 @@ test('social round 2: an interrupted read-back is read again in full, and phone 
   once('except a read-back');
   // M2: only a number she couldn't make out is a failed try; corrections are capped separately, so there is no endless loop.
   const phone = section('THE PHONE NUMBER RULE (', 'SHOP DETAILS');
-  assert.match(phone, /Only a number you couldn't make out counts as a failed try; a caller correcting a digit after your read-back does not, but if you still have no yes after two corrections, use the same fallback\./);
+  assert.match(phone, /Only a number you couldn't make out counts as a failed try; a caller correcting a digit after your read-back does not, but if you still have no yes after two corrections, use the same fallback, but note "couldn't confirm a callback number" instead\./);
   assert.ok(phone.indexOf('If the caller corrects any digit, read the whole corrected number back') < phone.indexOf('Only a number you couldn'), 'the correction read-back rule comes first and is unchanged');
   // A capped caller who must be saved right away is saved, and the office is told why there is no number.
   assert.match(prompt, /If you couldn't get a number \(THE PHONE NUMBER RULE\), save those callers right away too\./);
@@ -822,4 +822,15 @@ test('social round 2: an interrupted read-back is read again in full, and phone 
   // Restored from the voice-upgrade text.
   assert.match(prompt, /every letter and digit with none skipped \(count them against what they spelled\)/);
   assert.match(prompt, /Don't invent hours or policies; offer to pass the question along\./);
+});
+
+test('social round 3: honest no-number failure line, notes allowed in job_details, corrections cut into a read-back', () => {
+  const shop = { id: 'client-8', business: 'Riverbend Plumbing', owner_name: 'Dana Whitfield', shop_number: '+16155550100', city: 'Nashville', state: 'TN', services: 'Drains' };
+  const prompt = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key }).model.messages[0].content;
+  const sound = prompt.slice(prompt.indexOf('HOW YOU SOUND'), prompt.indexOf('BE CURIOUS'));
+  assert.match(sound, /wait for a clear yes\. If they cut in with a correction instead, say back only the changed part, except the phone number, which is always read back whole\./);
+  assert.match(prompt, /The issue and job_details hold only what the caller really said \(plus any callback-number note from THE PHONE NUMBER RULE\);/);
+  // Every calling-number line holds even with blocked caller ID.
+  assert.doesNotMatch(prompt, /calling from\."/);
+  assert.equal(prompt.split('if it shows on our end').length - 1, 3);
 });
