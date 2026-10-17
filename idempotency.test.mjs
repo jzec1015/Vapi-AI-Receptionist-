@@ -365,12 +365,118 @@ test('an outbox and tool_calls table from an earlier build (no created_at) never
   await app.sweepOutbox(Date.now() + 31000); // the old row (no request behind it) never throws the sweep
 });
 
-test('an outbox row older than an hour (left by a rollback) is dropped, never sent late', async t => {
+test('a stale submit row: the outbox sends nothing late, unsent receipts end as dropped_stale, office_retries sends the alert once marked delayed', async t => {
+  const lines = [];
+  t.mock.method(console, 'log', l => lines.push(String(l))); t.mock.method(console, 'warn', l => lines.push(String(l)));
   const dir = tempDir(t);
-  await crashMidSend(t, dir, { cut: toolCall('k-5', 'submit_service_request', intake) });
+  const extra = { OFFICE_EMAIL: 'ops@anchorline.example' };
+  await crashMidSend(t, dir, { extra, cut: toolCall('k-5', 'submit_service_request', { ...intake, email: 'linda@example.org', email_confirmed: true }) });
+  const second = await fixture(t, { dir, extra });
+  const later = Date.now() + 2 * 3600000;
+  assert.deepEqual(await second.app.sweepOutbox(later), []);
+  assert.equal(second.sent.length, 0, 'the outbox sends nothing late'); assert.equal(outboxRows(dir), 0);
+  const stored = () => { const db = new DatabaseSync(join(dir, 'requests.sqlite')); try { return JSON.parse(db.prepare('SELECT result FROM requests').get().result); } finally { db.close(); } };
+  assert.equal(stored().caller_email, 'dropped_stale'); assert.equal(stored().anchorline_email, 'dropped_stale');
+  assert.ok(lines.some(l => /^outbox stale-dropped kind=submit call=k-5 .*receipts=dropped_stale/.test(l)));
+  // The job still reaches the shop, once, marked as delayed (main's behaviour, made visible).
+  assert.deepEqual(await second.app.sweepOfficeRetries(later), ['sent']);
+  for (let i = 1; i < 8; i++) await Promise.all([second.app.sweepOutbox(later + i * MIN), second.app.sweepOfficeRetries(later + i * MIN)]);
+  assert.equal(second.sms().length, 1); assert.match(second.sms()[0].body.text, /^Anchorline AI: \(delayed \d+ min\) New call/);
+  const id = requestId(dir, 'k-5');
+  assert.deepEqual(second.emails().filter(e => e.body.to[0] === 'office@example.com').map(e => e.key), [`${id}-alert-new-0`]);
+  assert.equal(second.emails().filter(e => e.body.to[0] !== 'office@example.com').length, 0, 'no late receipts');
+  assert.ok(lines.some(l => /^office-alert delayed call=k-5 request=\S+ age_min=\d+$/.test(l)));
+  assert.equal(stored().office_alert, 'sent_after_retry');
+});
+
+test('email X fails, the caller corrects it to Y, then submit is retried: Y gets exactly one confirmation', async t => {
+  let failX = true;
+  const { post, emails } = await fixture(t, { behave: (url, body) => body.to?.[0] === 'x@example.org' && failX ? 500 : 200 });
+  const first = await post(toolCall('c-1', 'submit_service_request', { ...intake, email: 'x@example.org', email_confirmed: true }, 's1'));
+  assert.equal(first.caller_email, 'needs_review');
+  assert.equal((await post(email('c-1', 'y@example.org', 'e1'))).caller_email, 'accepted');
+  failX = false;
+  const retry = await post(toolCall('c-1', 'submit_service_request', { ...intake, email: 'x@example.org', email_confirmed: true }, 's1'));
+  assert.equal(retry.caller_email, 'accepted');
+  const to = address => emails().filter(e => e.body.to[0] === address);
+  assert.equal(to('y@example.org').length, 1, 'the corrected address gets one confirmation');
+  assert.deepEqual(to('x@example.org').map(e => e.key), [`${first.request_id}-caller`], 'the first address keeps the v1.5 key and is not re-sent');
+});
+
+test('a retried urgent submit after Vapi refused the ring does not report the alert as sent', async t => {
+  let vapiDown = true;
+  const urgent = { ALERT_ROUTES: JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'], call: ['+15550000009'] } }),
+    VAPI_API_KEY: 'fixture-only', ALERT_CALL_FROM_ID: 'phone-1' };
+  const { post, sent, sms } = await fixture(t, { extra: urgent, behave: url => url.includes('vapi') && vapiDown ? 500 : 200 });
+  const args = { ...intake, issue: 'URGENT - burst pipe' };
+  assert.equal((await post(toolCall('v-1', 'submit_service_request', args))).office_alert, 'needs_review');
+  vapiDown = false;
+  const retry = await post(toolCall('v-1', 'submit_service_request', args));
+  assert.equal(retry.office_alert, 'needs_review', 'nobody was rung: the stored ring outcome (not_placed) counts');
+  assert.equal(sent.filter(s => s.url.includes('vapi')).length, 1, 'the ring is never placed twice');
+  assert.equal(sms().length, 1);
+});
+
+test('a submit retry running alongside the office retry never overwrites sent_after_retry', async t => {
+  let down = true;
+  // The retry reads the stored result first; the office retry joins its slow alert sends and stores sent_after_retry;
+  // the retry's slower caller receipt finishes last and must not write its stale copy of office_alert back.
+  const { app, post, dir } = await fixture(t, { behave: async (url, body) => {
+    if (!down) await settleLater(body.to?.[0] === 'linda@example.org' ? 600 : 300);
+    return down ? 500 : 200;
+  } });
+  const args = { ...intake, email: 'linda@example.org', email_confirmed: true };
+  await post(toolCall('j-1', 'submit_service_request', args));
+  down = false;
+  const retrying = post(toolCall('j-1', 'submit_service_request', args));
+  await settleLater(100);
+  assert.deepEqual(await app.sweepOfficeRetries(Date.now() + MIN + 1000), ['sent']);
+  const retry = await retrying;
+  const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+  const stored = JSON.parse(db.prepare('SELECT result FROM requests').get().result); db.close();
+  assert.equal(stored.office_alert, 'sent_after_retry'); assert.equal(stored.caller_email, 'accepted');
+  assert.equal(retry.office_alert, 'sent_after_retry', 'the retry reports what is stored');
+});
+
+test('office retries under way, then a Vapi retry delivers: the office retry is closed at once and sends nothing more', async t => {
+  let down = true;
+  const { app, post, dir, sent } = await fixture(t, { behave: (url, body) => down && (url.includes('telnyx') || body.to?.[0] === 'office@example.com') ? 500 : 200 });
+  await post(toolCall('p-11', 'submit_service_request', intake));
+  const now = Date.now();
+  await app.sweepOfficeRetries(now + MIN + 1000); await app.sweepOfficeRetries(now + 2 * MIN + 1000);
+  assert.equal(retryRow(dir, 'p-11').attempts, 2);
+  down = false;
+  assert.equal((await post(toolCall('p-11', 'submit_service_request', intake))).office_alert, 'sent');
+  assert.equal(retryRow(dir, 'p-11').done, 'sent', 'closed by the Vapi retry, not left armed');
+  const before = sent.length;
+  for (let i = 3; i < 12; i++) await app.sweepOfficeRetries(now + i * MIN + 1000);
+  assert.equal(sent.length, before);
+});
+
+test('a confirmation to A cut off by a restart is never sent once the caller corrected it to B', async t => {
+  const dir = tempDir(t);
+  await crashMidSend(t, dir, { before: f => f.post(toolCall('p-12', 'submit_service_request', intake)), cut: email('p-12', 'a@example.org', 'e1') });
   const second = await fixture(t, { dir });
-  assert.deepEqual(await second.app.sweepOutbox(Date.now() + 2 * 3600000), []);
-  assert.equal(second.sent.length, 0); assert.equal(outboxRows(dir), 0);
+  await second.post(email('p-12', 'b@example.org', 'e2'));
+  const swept = await second.app.sweepOutbox(Date.now() + 31000);
+  assert.equal(swept.length, 1);
+  const late = await second.post(email('p-12', 'a@example.org', 'e1'));
+  assert.equal(late.caller_email, 'superseded');
+  const to = address => second.emails().filter(e => e.body.to[0] === address).length;
+  assert.equal(to('a@example.org'), 0); assert.equal(to('b@example.org'), 1);
+});
+
+test('the same toolCall id with different arguments is refused, nothing appended or sent', async t => {
+  const { post, saved, sms } = await fixture(t);
+  await post(toolCall('p-6', 'submit_service_request', intake));
+  assert.equal((await post(note('p-6', 'Gate 1', 'same'))).note_added, true);
+  const before = sms().length;
+  const clash = await post(note('p-6', 'Gate 2', 'same'));
+  assert.equal(clash.saved, false); assert.equal(clash.retryable, false);
+  assert.deepEqual(saved('p-6').notes, ['Gate 1']); assert.equal(sms().length, before);
+  assert.equal((await post(email('p-6', 'a@example.org', 'same-e'))).caller_email, 'accepted');
+  assert.equal((await post(email('p-6', 'b@example.org', 'same-e'))).saved, false);
+  assert.equal(saved('p-6').email, 'a@example.org');
 });
 
 test('a retried add_customer_email sends one confirmation; a corrected address is saved and sent', async t => {
