@@ -81,17 +81,43 @@ export function callTurns(message) {
   }
   return turns;
 }
-// The last number Emma read back that the caller confirmed in their next turn ("yes", "yeah", "that's right", ...), as
-// 10 digits; '' when none was confirmed. A caller who says "no, it's ..." does not confirm it.
-const CONFIRMED = /^\W*(?:(?:uh|um|mm)\W+)?(?:yes|yeah|yep|yup|correct|that'?s right|that is right|right)\b/i;
+// The callback number to trust from a call that ended before a save, as 10 digits; '' when there is no clean confirmation.
+// A number counts only when Emma ASKED it back (the number is in her question, or her question right after it is just
+// "is that right?") and the caller's very next turn is a plain yes ("yes", "yeah", "that's right", "mhm") with no "no",
+// "but", "wait", "?" or digits in it. A later read-back that is not confirmed, or a caller who later gives a different
+// number or says it "ends in" something else, clears it: a wrong number marked confirmed is worse than none.
+const CONFIRMED = /^\W*(?:(?:uh|um|mm|oh|okay|ok)\W+)?(?:yes|yeah|yep|yup|ya|correct|that'?s (?:right|correct|it)|that is (?:right|correct)|right|exactly|you got it|uh[- ]?huh|mhm+|mm[- ]?hmm)\b/i;
+const DOUBT = /\?|\d|\b(?:no|nope|nah|not|but|actually|wait|hold on|except|wrong|old|ends?|change|different|sorry)\b/i;
+const CORRECTION = /\b(?:ends? (?:in|with)|wrong number|not (?:my|the right) (?:number|cell|phone)|old number|different number)\b/i;
+const CHECK_QUESTION = /^\W*(?:(?:is|was|did i get|have i got)\s+)?(?:that|it|this|those|i)?\s*(?:right|correct|all right)?\W*(?:right|correct)?\?\s*$/i;
+function readBackIn(text) {
+  const number = phoneNumbersIn(text).at(-1);
+  if (!number) return '';
+  const sentences = String(text).split(/(?<=[.?!])\s+/);
+  let k = -1;
+  sentences.forEach((sentence, i) => { if (phoneNumbersIn(sentence).includes(number)) k = i; });
+  if (k < 0) return '';
+  const after = sentences.slice(k + 1).join(' ').trim();
+  if (!after) return /\?\s*$/.test(sentences[k]) ? number : '';
+  return /\?/.test(after) && CHECK_QUESTION.test(after) && !/[a-z]{3,}.*\?.*[a-z]{3,}.*\?/i.test(after) ? number : '';
+}
+const plainYes = text => { const t = String(text).replace(/\u2019/g, "'").trim(); return CONFIRMED.test(t) && !DOUBT.test(t) && t.split(/\s+/).length <= 8; };
 export function confirmedCallback(message) {
-  const turns = callTurns(message);
+  const turns = [];
+  for (const turn of callTurns(message)) {
+    if (turns.at(-1)?.role === turn.role) turns.at(-1).text += ` ${turn.text}`;
+    else turns.push({ ...turn });
+  }
   let number = '';
   turns.forEach((turn, i) => {
-    if (turn.role !== 'assistant') return;
-    const read = phoneNumbersIn(turn.text).at(-1);
-    const reply = turns.slice(i + 1).find(t => t.role === 'user');
-    if (read && reply && CONFIRMED.test(reply.text.replace(/\u2019/g, "'"))) number = read;
+    if (turn.role === 'user') {
+      if (CORRECTION.test(turn.text) || phoneNumbersIn(turn.text).some(n => n !== number)) number = '';
+      return;
+    }
+    const read = readBackIn(turn.text);
+    if (!read) return;
+    const reply = turns[i + 1];
+    number = reply?.role === 'user' && plainYes(reply.text) ? read : '';
   });
   return number;
 }
@@ -100,9 +126,14 @@ export function transcriptExcerpt(message, max = 1500) {
   const text = (String(message.artifact?.transcript || message.transcript || '').trim() ||
     callTurns(message).map(t => `${t.role === 'user' ? 'User' : 'AI'}: ${t.text}`).join('\n')).trim();
   if (text.length <= max) return text;
-  const tail = text.slice(-(max - 1));
+  const tail = text.slice(-(max - 41)).replace(/^[\uDC00-\uDFFF]/, '');
   const start = tail.indexOf('\n') >= 0 && tail.indexOf('\n') < max / 3 ? tail.indexOf('\n') + 1 : tail.search(/\s/) + 1;
-  return `\u2026${tail.slice(start).trim()}`;
+  const body = tail.slice(start).trim();
+  // Cut inside a turn: keep that turn's speaker tag so the office knows who said it (40 characters are kept for it).
+  const cut = text.length - tail.length + start;
+  const speaker = /^\s*(AI|Assistant|Bot|User|Customer):/i.test(body) ? '' :
+    (text.slice(0, cut).split('\n').reverse().map(line => line.match(/^\s*(AI|Assistant|Bot|User|Customer):/i)?.[1]).find(Boolean) || '');
+  return `\u2026${speaker ? `${speaker}: \u2026` : ''}${body}`;
 }
 // The one urgent test: Emma saves an urgent job with an issue starting "URGENT - ".
 export const isUrgent = issue => /^\s*URGENT\b/i.test(issue);
@@ -949,7 +980,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     // A caller who said "test call" is a test; never alert a client about it.
     const said = `${message.artifact?.transcript || message.transcript || ''} ${summary}`;
     // What the caller said and the number Emma read back and they confirmed (e.g. a save that failed mid-deploy), from the
-    // report's own transcript: no extra Vapi call. Never a number the caller did not confirm.
+    // report's own transcript: no extra Vapi call. Only a number Emma asked back and the caller answered with a plain yes
+    // (confirmedCallback); otherwise callback_phone stays empty and the office uses the caller ID.
     const excerpt = greeting ? '' : transcriptExcerpt(message);
     const callback = greeting ? '' : confirmedCallback(message);
     const issue = greeting ? 'Hung up during the greeting, before giving any details' :

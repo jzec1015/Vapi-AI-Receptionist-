@@ -143,6 +143,20 @@ test('read-back parsing: spoken and written numbers, confirmations, excerpt leng
   assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?']])), '');
   assert.equal(confirmedCallback({}), '');
   assert.equal(confirmedCallback({ artifact: { messages: [{ role: 'assistant', content: 'So 615 555 0142?' }, { role: 'user', content: 'Yes.' }] } }), '6155550142');
+  // Never mark a number confirmed unless the caller's next turn is a plain yes to Emma's read-back question.
+  const N = '6155550142', ask = ['bot', 'Is it six one five, five five five, oh one four two?'];
+  for (const reply of ['Yes, but it ends in 43.', 'Yeah no, that is my old number.', 'Yes... wait.', 'Yes?', 'Right, but the last digit is 3.',
+    "Correct me if I'm wrong but I said 0143."]) assert.equal(confirmedCallback(msg([ask, ['user', reply]])), '', reply);
+  assert.equal(confirmedCallback(msg([ask, ['user', 'Mhm.']])), N);
+  assert.equal(confirmedCallback(msg([['bot', 'Okay, 615 555 0142. Is that right?'], ['user', "Yep, that's it."]])), N);
+  assert.equal(confirmedCallback(msg([['bot', 'I have 615 555 0142. Is this urgent?'], ['user', 'Yeah, water everywhere']])), '');
+  assert.equal(confirmedCallback(msg([['bot', 'Got it, 615 555 0142.'], ['bot', 'Is this an emergency?'], ['user', 'Yes!']])), '');
+  assert.equal(confirmedCallback(msg([['bot', 'You can also reach the office at 615 555 0100.'], ['user', 'Right, okay.']])), '');
+  assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'So 615 555 0143?']])), '', 'a later unconfirmed read-back clears it');
+  assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'And the address?'], ['user', 'Oh, actually that number ends in 43.']])), '');
+  assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'So 615 555 0199?'], ['user', 'Yes.']])), '6155550199');
+  const turn = { artifact: { transcript: `AI: Hi.\nUser: ${'blah '.repeat(400)}the end` } };
+  assert.match(transcriptExcerpt(turn), /^\u2026User: \u2026blah/); assert.ok(transcriptExcerpt(turn).length <= 1500);
   const long = { artifact: { transcript: Array.from({ length: 80 }, (_, i) => `${i % 2 ? 'User' : 'AI'}: line ${i} of the call`).join('\n') } };
   const excerpt = transcriptExcerpt(long);
   assert.ok(excerpt.length <= 1500); assert.match(excerpt, /^\u2026(AI|User): line \d+/); assert.match(excerpt, /User: line 79 of the call$/);
