@@ -685,7 +685,10 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   assert.match(prompt, /If a save fails, follow THE ONE RULE\./);
   assert.doesNotMatch(prompt, /If a save is refused/);
   assert.match(prompt, /Only if it returns saved true and caller_email "accepted", tell them their confirmation is on its way; if it returned saved true without "accepted", say "The team will confirm your email when they call\."/);
-  assert.match(prompt, /Never save before you have asked for the email \(unless it's an emergency or the caller refuses details, see NEVER LOSE A CALLER\);/);
+  // Who may be saved without an email: one statement in item 6, a pointer in WRAPPING UP.
+  assert.match(prompt, /Never save before you have asked for the email, unless the caller refuses details \(see NEVER LOSE A CALLER\), the call is an emergency, or the caller sounds rushed or upset\. For an emergency or a rushed or upset caller, skip the email and time questions and save right after the number is confirmed, with email_status "skipped_emergency" for an emergency and "declined" for a rushed or upset caller\./);
+  assert.match(wrapping, /If the call is an emergency or the caller sounds rushed or upset, follow item 6\./);
+  once('skip the email and time questions');
   assert.doesNotMatch(prompt, /twice more|at most twice/);
   // THE PHONE NUMBER RULE holds the whole read-back rule and is still the last rule, right before the shop details.
   const phone = prompt.slice(prompt.indexOf('THE PHONE NUMBER RULE ('), prompt.indexOf('SHOP DETAILS') + 'SHOP DETAILS'.length);
