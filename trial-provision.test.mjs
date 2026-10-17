@@ -112,7 +112,12 @@ test('the assistant is Emma\'s production config with the shop substituted in an
   assert.deepEqual(config.model.toolIds, ['da782f13-0ce0-4c1d-9cb9-1df881c17a97', 'd39115a3-e858-4f79-9bcd-ce28b1aa7814', '178c7380-ea94-410f-afd1-e5544ce3dcad']);
   assert.deepEqual([config.model.provider, config.model.model, config.voice.provider, config.voice.voiceId, config.transcriber.model],
     ['openai', 'gpt-4.1', '11labs', 'EXAVITQu4vr4xnSDxMaL', 'nova-3']);
-  assert.deepEqual(config.startSpeakingPlan.transcriptionEndpointingPlan, { onPunctuationSeconds: 0.4, onNoPunctuationSeconds: 1.5, onNumberSeconds: 1 });
+  assert.deepEqual(config.startSpeakingPlan.transcriptionEndpointingPlan, { onPunctuationSeconds: 0.1, onNoPunctuationSeconds: 1.5, onNumberSeconds: 1 });
+  // The 0503-tested voice: ElevenLabs v4 Turbo, no fake office noise, and the whole-number read-back rule in the prompt.
+  assert.equal(config.voice.model, 'eleven_v4_turbo');
+  assert.equal(config.backgroundSound, 'off');
+  assert.match(config.model.messages[0].content, /THE PHONE NUMBER RULE/);
+  assert.doesNotMatch(config.model.messages[0].content, /\{\{/);
   assert.deepEqual(config.server, { url: 'https://receptionist.example/vapi/webhook', timeoutSeconds: 40, headers: { 'x-anchorline-key': key } });
   assert.deepEqual(config.serverMessages, ['end-of-call-report']);
   assert.equal(config.id, undefined);
@@ -706,4 +711,51 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   assert.equal(prompt.split('five five five, oh one four two?').length - 1, 2, 'item 4 and THE PHONE NUMBER RULE use the same example number');
   assert.doesNotMatch(prompt, /oh one four four/);
   assert.doesNotMatch(prompt, /\{\{/);
+});
+
+test('the voice upgrade adds its spoken style and address read-back once, without a second phone read-back rule', () => {
+  const shop = { id: 'client-5', business: 'Riverbend Plumbing', owner_name: 'Dana Whitfield', shop_number: '+16155550100', city: 'Nashville', state: 'TN', services: 'Drains' };
+  const config = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key });
+  const prompt = config.model.messages[0].content;
+  const once = text => assert.equal(prompt.split(text).length - 1, 1, `"${text}" appears exactly once`);
+  // Voice and turn-taking settings.
+  assert.equal(config.voice.stability, 0.4);
+  assert.deepEqual(config.startSpeakingPlan.smartEndpointingPlan, { provider: 'livekit' });
+  assert.deepEqual(config.startSpeakingPlan.customEndpointingRules, [{ type: 'assistant', regex: '(number to reach|phone number|callback number|best number|good number)', timeoutSeconds: 1.5 }]);
+  assert.ok(config.stopSpeakingPlan.acknowledgementPhrases.includes('mm-hmm'));
+  // Spoken-style section sits right before THE PHONE NUMBER RULE, which is still last.
+  const talk = prompt.indexOf('HOW YOU ACTUALLY TALK');
+  assert.ok(talk > prompt.indexOf('STAYING NATURAL') && talk < prompt.indexOf('THE PHONE NUMBER RULE ('));
+  // C2: the sample lines carry no read-back of their own; the read-back is worded only in item 4 and THE PHONE NUMBER RULE.
+  const style = prompt.slice(talk, prompt.indexOf('THE PHONE NUMBER RULE ('));
+  assert.doesNotMatch(style, /Reading a number back|Let me make sure I've got it|six one five|five five five/);
+  assert.equal(prompt.split('five five five, oh one four two').length - 1, 2, 'only item 4 and THE PHONE NUMBER RULE read a number back');
+  // C4: the no-punctuation style rule covers only her free-form talk and doesn't override scripted lines, spelling or question marks.
+  assert.match(style, /In your own free-form talk, never use colons, dashes, lists, bullet points, parentheses or line breaks; use plain spoken sentences with commas and periods, and ask at most one question per reply\. This does not change the exact lines quoted elsewhere in this prompt, spelling an email back letter by letter, or ending a question with a question mark\./);
+  assert.doesNotMatch(prompt, /Exactly one question per reply|commas and periods only/);
+  // The email ask is one question; the 0503 letter-by-letter read-back is unchanged.
+  assert.match(prompt, /after the phone number is confirmed, ask "And what's a good email for a confirmation\? Spell it out for me, letter by letter\." Speech recognition/);
+  assert.doesNotMatch(prompt, /Could you spell it out for me/);
+  assert.match(prompt, /in small groups with pauses \("J-A-K-E\.\.\. Z-E-C\.\.\. two-zero-one-six"\)/);
+  assert.doesNotMatch(prompt, /seven two oh|Of course, we can help with that"\), then|say "Quick question,"|repeat the whole number once more|Always read back the house number/);
+  // Address read-back is its own reply, stated once, in item 3 next to the five-or-more-digit check.
+  const address = prompt.slice(prompt.indexOf('3. The service address.'), prompt.indexOf('4. The best callback number'));
+  assert.match(address, /make the read-back its own reply, only the question \("That's four twelve Gallatin Pike\?"\) with nothing after it, then stop and wait for their answer\. If they give the callback number and the address together, the phone number read-back comes first, as THE PHONE NUMBER RULE says, and the address read-back is your next reply once they have confirmed the number, unless item 6 says to save right away; then save first, read the address back after, and add any correction with add_request_note\. If the house number has five or more digits/);
+  // C3: the example is spoken as words, like item 4 says for street numbers; C1: the phone rule itself is unchanged and last.
+  assert.doesNotMatch(prompt, /412 Gallatin/);
+  assert.match(prompt, /your very next reply must be ONLY the read-back question \("So that's six one five, five five five, oh one four two\?"\), with no tool call and nothing else; then stop talking and wait for their answer\./);
+  assert.ok(prompt.indexOf('THE PHONE NUMBER RULE (') > prompt.indexOf('HOW YOU ACTUALLY TALK'));
+  for (const text of ['its own reply', 'skip any question the caller already answered', 'never fill it in from your own question', 'keep it and use it; never drop it', 'HOW YOU ACTUALLY TALK']) once(text);
+  assert.doesNotMatch(prompt, /drains are affected|address read-back question/);
+  // C5: callers item 6 saves right away (urgent, rushed, leaving, refusing) are saved before the address read-back; item 6 itself is unchanged.
+  assert.match(prompt, /For those callers, skip the email and time questions and save as soon as the number is confirmed \(right away if they refused a number\)/);
+  assert.match(address, /unless item 6 says to save right away; then save first, read the address back after, and add any correction with add_request_note\./);
+  assert.match(prompt, /keep it and use it; never drop it\. A phone number given early still gets its read-back first \(THE PHONE NUMBER RULE\)\./);
+  // N1: "never the same sentence twice" covers free-form talk only, so scripted lines (cut-out, save trouble, read-backs) may recur.
+  assert.match(style, /Never say the same free-form sentence twice in a call; the exact lines quoted elsewhere in this prompt may come up again whenever they apply\./);
+  assert.doesNotMatch(prompt, /Never say the same sentence twice/);
+  // N2: the only closing line is WRAPPING UP's, followed by "Anything else you'd like me to pass along?".
+  assert.doesNotMatch(prompt, /you're all set|Wrapping up, once/);
+  once('Alright, I\'ve got all that over to the team.');
+  assert.match(prompt, /"Alright, I've got all that over to the team\. Someone will be in touch with you soon\." Then ask, "Anything else you'd like me to pass along\?"/);
 });
