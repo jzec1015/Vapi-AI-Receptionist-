@@ -44,7 +44,8 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
 //       server cannot tell whether a submit already failed for good (a refusal such as "ask for the email first" is not
 //       one, and a Vapi timeout never reaches it), so the note leaves that to what she said: if she already told the caller
 //       "I'm sorry, I couldn't save that" (THE ONE RULE after a second failed submit), she skips the say line, never calls
-//       submit_service_request again, and says only NOT_SAVED_SAY (the team is already calling back).
+//       submit_service_request or the tool again, and says only NOT_SAVED_SAY (the team is already calling back). That
+//       exception opens the note, and the normal steps follow under "Otherwise:".
 //   an unconfirmed email                  UNCONFIRMED_SAY, then item 6's spell-back steps and a wait for the caller's yes
 //       (never a retry before they speak). Never counted.
 //   any other failure                     counted: the server counts this call's CONSECUTIVE counted failures of this tool
@@ -53,7 +54,7 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
 //       tool, or the first save of the request, starts the count again. A body with no call id (nothing to count by, and a
 //       retry cannot fix it) gets NOT_SAVED_SAY and "Do not call it again" at once.
 // The prompt's THE ONE RULE gives every note failure the trouble line, a retry and NOT_SAVED_SAY; she obeyed that over the
-// note (Oct 17), so the two uncounted notes say they replace those steps for this result (REPLACES).
+// note (Oct 17), so the two uncounted notes say to follow them instead and speak only the lines they give (REPLACES).
 export const NOT_SAVED_SAY = 'Mention that when the team calls you, so they have it.';
 export const NO_REQUEST_SAY = 'Okay, let\'s get the rest of your details first.';
 export const UNCONFIRMED_SAY = 'Let me spell that back to make sure I have it.';
@@ -64,16 +65,17 @@ const NO_REQUEST = 'No saved request yet; save the request first';
 const SAY_ONLY = 'Say exactly the say line and nothing else about this.';
 const NO_PROMISE = 'Never say "I\'ll note that", "I\'ll let the team know", "I\'ll pass that on", "I\'ve added that" or anything similar.';
 const NO_CLAIM = 'Other than the exact lines given here, never say the team will see, have, know or get this detail.';
-const REPLACES = 'This note replaces THE ONE RULE\'s steps for a failed save (trouble line, retry, closing line) for this result.';
+const REPLACES = 'For this result, follow this note instead of THE ONE RULE\'s failed-save steps (trouble line, retry, closing line), and speak only the lines it gives.';
 export const notSavedSay = (result = {}, failures = 1) => result.error === NO_REQUEST ? NO_REQUEST_SAY
   : result.error === UNCONFIRMED_EMAIL ? UNCONFIRMED_SAY : failures === 1 ? TROUBLE_SAY : NOT_SAVED_SAY;
 export const notSavedNote = (name, result = {}, failures = 1) => `${SAY_ONLY} ` + (result.error === NO_REQUEST
-  ? `${REPLACES} NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: never say the ` +
-    `team will call or call back about this. Do not call ${name} again before the job is saved. ` +
-    'Carry on with the call and save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP ' +
-    `say to. Only after that returns saved true, call ${name} again with the same detail, unless it is already in what you ` +
-    'saved. If earlier in this call you already told the caller "I\'m sorry, I couldn\'t save that", do not say the say line ' +
-    `and do not call submit_service_request again; say only "${NOT_SAVED_SAY}"`
+  // The exception comes first and the rest is "Otherwise:", so no sentence of the normal steps contradicts it.
+  ? 'If earlier in this call you already told the caller "I\'m sorry, I couldn\'t save that", do not say the say line and do not ' +
+    `call submit_service_request or ${name} again; say only "${NOT_SAVED_SAY}" Otherwise: ${REPLACES} NOT saved: nothing was ` +
+    'noted, added or passed on. There is no saved job yet, so no team call is set up: never say the team will call or call ' +
+    `back about this. Do not call ${name} again before the job is saved. Carry on with the call and save with ` +
+    'submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP say to. Only after that returns saved ' +
+    `true, call ${name} again with the same detail, unless it is already in what you saved.`
   : result.error === UNCONFIRMED_EMAIL
   ? `${REPLACES} NOT saved: the email is not confirmed yet. Then spell the email back letter by letter, and stop and wait for the caller's clear yes. ` +
     `Only after they say yes, call ${name} again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ` +

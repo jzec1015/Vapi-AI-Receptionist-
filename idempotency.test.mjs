@@ -728,19 +728,22 @@ test('a 7am digest send that hangs never delays a held urgent ring: it goes on t
 const UNCONFIRMED = 'Not added: spell the email back letter by letter and get a clear yes first.';
 const SAY_ONLY = 'Say exactly the say line and nothing else about this.';
 // The uncounted notes give other steps than the prompt's THE ONE RULE, and say so (it was obeyed over the note on Oct 17).
-const REPLACES = "This note replaces THE ONE RULE's steps for a failed save (trouble line, retry, closing line) for this result.";
+const REPLACES = "For this result, follow this note instead of THE ONE RULE's failed-save steps (trouble line, retry, closing line), and speak only the lines it gives.";
 const NEVER = `Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar. ` +
   'Other than the exact lines given here, never say the team will see, have, know or get this detail.';
 const retryNote = name => `${SAY_ONLY} NOT saved: nothing was noted, added or passed on. Then fix what the error says if it tells you, and call ` +
   `${name} once more in that same reply, before the caller speaks; never stop after the say line. If that call is not saved either, its ` +
   `result gives the next line to say. ${NEVER}`;
 const NO_REQUEST = 'No saved request yet; save the request first';
-const nojobNote = name => `${SAY_ONLY} ${REPLACES} NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: ` +
+// The exception (she already said the submit could not be saved) opens the note; the normal steps follow "Otherwise:".
+const nojobNote = name => `${SAY_ONLY} If earlier in this call you already told the caller "I'm sorry, I couldn't save that", do not say ` +
+  `the say line and do not call submit_service_request or ${name} again; say only "Mention that when the team calls you, so they have it." ` +
+  `Otherwise: ${REPLACES} NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: ` +
   `never say the team will call or call back about this. Do not call ${name} again before the job is saved. ` +
   'Carry on with the call and save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP ' +
   `say to. Only after that returns saved true, call ${name} again with the same detail, unless it is already in what you ` +
-  'saved. If earlier in this call you already told the caller "I\'m sorry, I couldn\'t save that", do not say the say line and do ' +
-  `not call submit_service_request again; say only "Mention that when the team calls you, so they have it." ${NEVER}`;
+  `saved. ${NEVER}`;
+const nojobNormal = text => text.split(' Otherwise: ')[1];
 const stopNote = `${SAY_ONLY} NOT saved again. Do not call it again. ${NEVER}`;
 const noIdNote = `${SAY_ONLY} NOT saved. Do not call it again. ${NEVER}`;
 const confirmNote = `${SAY_ONLY} ${REPLACES} NOT saved: the email is not confirmed yet. Then spell the email back letter by letter, and stop and wait for the caller's clear yes. ` +
@@ -903,7 +906,7 @@ test('"No saved request yet" is never counted: three in a row all get the save-t
     const result = await post(note('zj-1', 'Gate 1', id));
     notSaved(result, N, NO_REQUEST, 'nojob');
     // Only the exception (she already said the submit could not be saved) names the not-saved line.
-    assert.doesNotMatch(result.say + result.note.split('If earlier in this call')[0], /when the team calls|Do not call it again|trouble saving/);
+    assert.doesNotMatch(result.say + nojobNormal(result.note), /when the team calls|Do not call it again|trouble saving/);
   }
   for (const id of ['e1', 'e2', 'e3']) notSaved(await post(email('zj-1', 'a@example.org', id)), E, NO_REQUEST, 'nojob');
   const db = new DatabaseSync(join(dir, 'requests.sqlite'));
@@ -985,7 +988,7 @@ test('the not-saved note text: retryable is never consulted; the count picks ret
   assert.equal(notSavedNote('add_customer_email', { saved: false, retryable: false, error: UNCONFIRMED }, 5), confirmNote);
   for (const name of ['add_request_note', 'add_customer_email'])
     for (const failures of [1, 2, Infinity]) assert.equal(notSavedNote(name, { saved: false, retryable: false, error: NO_REQUEST }, failures), nojobNote(name));
-  assert.doesNotMatch(nojobNote('x').split('If earlier in this call')[0], /when the team calls|so they have it|Do not call it again|that they will have it/);
+  assert.doesNotMatch(nojobNormal(nojobNote('x')), /when the team calls|so they have it|Do not call it again|that they will have it/);
   // It points to the prompt's rules for when to save and never restates them (main and emma-social-1017 differ: the
   // social fallback for a number that can't be confirmed, the address read-back), and never says to save right away.
   assert.match(nojobNote('x'), /save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP say to\./);
@@ -1007,15 +1010,20 @@ test('each not-saved failure type speaks its one exact line, and every note says
     assert.equal(notSavedSay({ error: 'Invalid email' }, Infinity), NOT_SAVED_SAY);
     for (const [error, failures] of [[NO_REQUEST, 1], [UNCONFIRMED, 1], ['x', 1], ['x', 2], ['x', Infinity]]) {
       const text = notSavedNote(name, { error }, failures), uncounted = error !== 'x';
-      assert.ok(text.startsWith(uncounted ? `${SAY_ONLY} ${REPLACES} NOT saved` : `${SAY_ONLY} NOT saved`), text); assert.ok(text.endsWith(NEVER), text);
+      const opens = error === NO_REQUEST ? `${SAY_ONLY} If earlier in this call` : uncounted ? `${SAY_ONLY} ${REPLACES} NOT saved` : `${SAY_ONLY} NOT saved`;
+      assert.ok(text.startsWith(opens), text); assert.ok(text.endsWith(NEVER), text);
+      if (error === NO_REQUEST) assert.ok(nojobNormal(text).startsWith(`${REPLACES} NOT saved`), text);
     }
 
   }
-  // The no-job note never contradicts its line: no team call and no "they will have it". The not-saved line appears only
-  // in the one exception, once she has already said the submit could not be saved (the team is calling back then).
-  const [normal, exception] = nojobNote('x').split('If earlier in this call you already told the caller');
-  assert.doesNotMatch(normal, /team calls you|so they have it|that they will have it/);
-  assert.match(exception, /^ "I'm sorry, I couldn't save that", do not say the say line and do not call submit_service_request again; say only "Mention that when the team calls you, so they have it\." /);
+  // The no-job note opens with its one exception (she already said the submit could not be saved, so the team is calling
+  // back: the not-saved line, no save tool), then "Otherwise:" and the normal steps, which never name the not-saved line,
+  // a team call or "they will have it", so nothing after the exception contradicts it. Nothing follows the steps but NEVER.
+  const [exception, normal] = nojobNote('x').split(' Otherwise: ');
+  assert.equal(exception, `${SAY_ONLY} If earlier in this call you already told the caller "I'm sorry, I couldn't save that", do not say the ` +
+    'say line and do not call submit_service_request or x again; say only "Mention that when the team calls you, so they have it."');
+  assert.doesNotMatch(normal, /team calls you|so they have it|that they will have it|couldn't save/);
+  assert.ok(normal.endsWith(`unless it is already in what you saved. ${NEVER}`));
   // Only a counted failure after the first, and no call id, say "do not call it again"; the retry note never does.
   assert.doesNotMatch(retryNote('x'), /Do not call/); assert.match(stopNote, /Do not call it again/); assert.match(noIdNote, /Do not call it again/);
 });
