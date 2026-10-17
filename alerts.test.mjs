@@ -203,7 +203,7 @@ test('priority tiers: urgent, high-value (big job or big-ticket work), routine',
     [{ issue: 'Something odd', job_type: 'Tankless water heater install' }, 'high-value', 'tankless label'],
     [{ issue: 'Something odd', job_type: 'Sewer line replacement' }, 'high-value', 'sewer line label'],
     [{ issue: 'Something odd', job_type: 'Bathroom remodel' }, 'high-value', 'remodel label'],
-    // The grader's four misses: negated or finished work never makes a job high-value.
+    // Negated or finished work never makes a job high-value.
     [{ issue: 'They do not need a new water heater, just the sink' }, 'routine', 'negated new water heater'],
     [{ issue: 'Drip from the water heater, not looking to replace it yet' }, 'routine', 'not looking to replace'],
     [{ issue: 'Just had a new water heater put in, now the faucet leaks' }, 'routine', 'had a new water heater put in'],
