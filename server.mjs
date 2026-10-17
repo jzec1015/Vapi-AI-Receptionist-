@@ -229,6 +229,7 @@ export function createApp(env = process.env, send = fetch) {
   // Urgent escalation timing. Alert calls last at most 90 s (maxDurationSeconds), so the first ring is judged 150 s after it
   // was placed; a ring Vapi still cannot report after 10 minutes counts as not answered. The retry is ~5 minutes after the first ring.
   const CHECK_MS = 150000, RECHECK_MS = 30000, RETRY_MS = 300000, GIVE_UP_MS = 600000;
+  const OFFICE_RETRY_MS = 60000, OFFICE_RETRIES = 5;
   const fallbackMs = Math.max(0, Number(env.TRANSFER_FALLBACK_SECONDS ?? 75) || 0) * 1000;
   const canTransfer = (route, details) => !!route && isE164(route.transfer) && /^\s*URGENT\b/i.test(details.issue) && (!details.is_test || !!route.alertTests);
   let db;
@@ -260,7 +261,14 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS digests (
         assistant_id TEXT NOT NULL, day TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, sent_at TEXT,
         PRIMARY KEY (assistant_id, day)
-      );`);
+      );
+      -- v1.8.1: a request whose office alert reached nobody (every SMS, email and ring failed) is retried here every
+      -- minute, 5 times, then Anchorline (OFFICE_EMAIL) is told. New table only: v1.8.0 ignores it.
+      CREATE TABLE IF NOT EXISTS office_retries (
+        call_id TEXT PRIMARY KEY, kind TEXT NOT NULL, email_key TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        next_at INTEGER NOT NULL, done TEXT
+      );
+      CREATE INDEX IF NOT EXISTS office_retries_due ON office_retries (done, next_at);`);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
     // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
     // A failed trial migration switches trials off (healthz trials_enabled: false) but never stops the server.
@@ -433,7 +441,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   // Office alerts for one client route. Returns a status string; never throws.
   // holdCall: a live transfer will be tried first, so the spoken alert call waits for its outcome.
   async function alert(route, details, id, kind, holdCall = false, callId = '') {
-    if (!route || (details.is_test && !route.alertTests)) return details.is_test ? 'suppressed_test' : 'not_configured';
+    return (await alertOutcome(route, details, id, kind, holdCall, callId)).status;
+  }
+  // The same, plus whether any channel got through (delivered), so a request whose alert reached nobody can be retried.
+  async function alertOutcome(route, details, id, kind, holdCall = false, callId = '', emailKey = `${id}-alert-${kind}-${details.notes.length}`) {
+    if (!route || (details.is_test && !route.alertTests)) return { status: details.is_test ? 'suppressed_test' : 'not_configured', delivered: false };
     const text = alertText(route, details, kind);
     const jobs = [];
     if (env.TELNYX_API_KEY && env.TELNYX_FROM) {
@@ -445,23 +457,48 @@ This records a request only. It does not confirm an appointment, dispatch, trans
           if (!r.ok) { let codes = ''; try { codes = (await r.clone().json()).errors?.map(e => e.code).join(',') || ''; } catch {}
             console.warn(`sms alert failed: HTTP ${r.status} ${codes}`); }
           return r;
-        }));
+        }, error => { console.warn('sms alert failed: no response'); throw error; }));
     }
     if (env.RESEND_API_KEY && env.EMAIL_FROM && (route.email || []).length) {
       const emailText = alertText(route, details, kind, 'email');
       jobs.push(send('https://api.resend.com/emails', {
         method: 'POST', signal: AbortSignal.timeout(8000),
-        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': `${id}-alert-${kind}-${details.notes.length}` },
-        body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: alertSubject(details, kind), text: `${emailText}\n\nRequest reference: ${id}` }) }));
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': emailKey },
+        body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: alertSubject(details, kind), text: `${emailText}\n\nRequest reference: ${id}` }) })
+        .then(r => { if (!r.ok) console.warn(`alert email failed: HTTP ${r.status} request=${id}`); return r; },
+          error => { console.warn(`alert email failed: no response request=${id}`); throw error; }));
     }
     const urgent = /^\s*URGENT\b/i.test(details.issue);
     if (kind === 'new' && urgent && !holdCall && callId) jobs.push(...ring(callId, route, details));
-    return settle(jobs);
+    return settleOutcome(jobs);
   }
-  async function settle(jobs) {
-    if (!jobs.length) return 'not_configured';
-    const settled = await Promise.allSettled(jobs);
-    return settled.every(s => s.status === 'fulfilled' && s.value.ok) ? 'sent' : 'needs_review';
+  async function settleOutcome(jobs) {
+    if (!jobs.length) return { status: 'not_configured', delivered: false };
+    const ok = (await Promise.allSettled(jobs)).map(s => s.status === 'fulfilled' && !!s.value?.ok);
+    return { status: ok.every(Boolean) ? 'sent' : 'needs_review', delivered: ok.some(Boolean) };
+  }
+  const settle = async jobs => (await settleOutcome(jobs)).status;
+  // Saves a request and, for a live one, arms its office-alert retry in the same transaction, before any network call:
+  // a crash or redeploy while the alert is going out still leaves the retry for sweepOfficeRetries. Returns insert's info.
+  function saveWithRetry(orIgnore, callId, id, details, result, assistantId, kind, routed) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const info = insert(orIgnore, callId, id, details, result, assistantId);
+      if (info.changes && routed && !details.is_test) db.prepare('INSERT OR IGNORE INTO office_retries (call_id, kind, email_key, next_at) VALUES (?, ?, ?, ?)')
+        .run(callId, kind, `${id}-alert-${kind}-0`, Date.now() + OFFICE_RETRY_MS);
+      db.exec('COMMIT');
+      return info;
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  // The first alert finished: a channel got through (or there was nothing to send), so the retry is closed. Otherwise it
+  // stays armed. Returns true when it stays.
+  function settleOfficeRetry(callId, id, kind, outcome) {
+    if (outcome.status === 'needs_review' && !outcome.delivered) {
+      console.warn(`office-alert reached nobody call=${callId} request=${id} kind=${kind}: retrying every ${OFFICE_RETRY_MS / 1000} s, ${OFFICE_RETRIES} times`);
+      return true;
+    }
+    db.prepare('UPDATE office_retries SET done = ? WHERE call_id = ? AND done IS NULL AND attempts = 0').run(outcome.status, callId);
+    return false;
   }
   // Live transfer bookkeeping. One row per call; the held alert call is placed at most once.
   const transferRow = callId => db.prepare('SELECT status, due_at FROM transfers WHERE call_id = ?').get(callId);
@@ -588,6 +625,64 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (rest.includes('answered')) return finish('answered') + await resend();
     if (rest.includes(null)) return later() + await resend();
     return finish('unanswered') + await resend();
+  }
+  // Office alerts that reached nobody: send the SMS and email again every minute (no new ring: urgent escalation owns
+  // that), 5 times, keeping the first email's Resend key. Then Anchorline gets one notice, retried every minute for up
+  // to an hour until accepted. A route that is gone, or a retry that throws, still ends in that notice.
+  async function retryOffice(row, now) {
+    const set = fields => db.prepare(`UPDATE office_retries SET ${Object.keys(fields).map(k => `${k} = ?`).join(', ')} WHERE call_id = ?`)
+      .run(...Object.values(fields), row.call_id);
+    const attempts = row.attempts + 1;
+    try {
+      const request = db.prepare('SELECT id, details, result, assistant_id FROM requests WHERE call_id = ?').get(row.call_id);
+      if (!request) { set({ done: 'no_request' }); console.warn(`office-alert retry call=${row.call_id}: request row is gone`); return 'no_request'; }
+      const details = JSON.parse(request.details);
+      if (details.is_test) { set({ done: 'suppressed_test' }); return 'suppressed_test'; }
+      const route = routeOf(request.assistant_id);
+      let why = `Every alert channel failed ${Math.min(row.attempts + 1, OFFICE_RETRIES + 1)} times`;
+      if (route && row.attempts < OFFICE_RETRIES) {
+        const outcome = await alertOutcome(route, details, request.id, row.kind, true, '', row.email_key);
+        if (outcome.delivered) {
+          set({ attempts, done: 'sent' });
+          db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify({ ...JSON.parse(request.result), office_alert: 'sent_after_retry' }), row.call_id);
+          console.log(`office-alert retry call=${row.call_id} request=${request.id} attempt=${attempts} outcome=sent`);
+          return 'sent';
+        }
+        if (outcome.status === 'needs_review') {
+          set({ attempts, next_at: now + OFFICE_RETRY_MS });
+          console.warn(`office-alert retry call=${row.call_id} request=${request.id} attempt=${attempts} outcome=reached_nobody`);
+          return 'retrying';
+        }
+        why = `The alert could not be retried (${outcome.status}) after the first try failed`;
+      } else if (!route) why = 'The shop\'s alert route is gone, so the alert could not be retried';
+      // Tell Anchorline instead (same Idempotency-Key, so at most one email lands).
+      const first = row.attempts <= OFFICE_RETRIES;
+      const notice = await officeNotice(`Office alert failed: ${alertSubject(details, row.kind)}`.slice(0, 120),
+        `${why} for this request (${route?.business || 'no route'}). Nobody at the office has been told.\nCall the shop and pass it on.\n\n` +
+        `${route ? alertText(route, details, row.kind, 'email') : `Issue: ${details.issue}`}\n\nRequest reference: ${request.id}`, `${request.id}-office-alert-failed`);
+      const base = Math.max(attempts, OFFICE_RETRIES + 1);
+      if (notice === 'accepted' || notice === 'not_requested') set({ attempts: base, done: `gave_up_notice_${notice}` });
+      else set(base >= OFFICE_RETRIES + 60 ? { attempts: base, done: 'gave_up_silent' } : { attempts: base, next_at: now + OFFICE_RETRY_MS });
+      (first ? console.error : console.warn)(`office-alert GAVE UP call=${row.call_id} request=${request.id} anchorline_notice=${notice}`);
+      return `gave_up_${notice}`;
+    } catch {
+      // Counted like a failed try. Once the retries are used up Anchorline is told (by call ID: the request may be unreadable).
+      if (attempts > OFFICE_RETRIES) {
+        const notice = await officeNotice('Office alert failed: request could not be read',
+          `An office alert reached nobody and its retry keeps failing. Nobody at the office has been told.\nVapi call ID: ${row.call_id}`,
+          `${row.call_id}-office-alert-error`).catch(() => 'needs_review');
+        if (notice === 'accepted' || notice === 'not_requested') { set({ attempts, done: `gave_up_error_notice_${notice}` }); console.error(`office-alert GAVE UP call=${row.call_id} retry kept failing, anchorline_notice=${notice}`); return 'error'; }
+      }
+      set(attempts >= OFFICE_RETRIES + 60 ? { attempts, done: 'gave_up_error' } : { attempts, next_at: now + OFFICE_RETRY_MS });
+      console.warn(`office-alert retry call=${row.call_id} attempt=${attempts} failed`);
+      return 'error';
+    }
+  }
+  // Due retries run side by side on their own timer, so a slow provider never holds up urgent transfers or escalations.
+  async function sweepOfficeRetries(now = Date.now()) {
+    if (!db) return [];
+    const due = db.prepare('SELECT * FROM office_retries WHERE done IS NULL AND next_at <= ? ORDER BY next_at LIMIT 20').all(now);
+    return Promise.all(due.map(row => retryOffice(row, now)));
   }
   async function sweepEscalations(now = Date.now()) {
     if (!db) return [];
@@ -732,11 +827,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
     classify(details, callId, message);
-    const inserted = insert(true, callId, id, details, result, assistantIdOf(message));
+    const inserted = saveWithRetry(true, callId, id, details, result, assistantIdOf(message), 'hangup', !!route);
     if (!inserted.changes) return 'already_saved';
-    result.office_alert = await alert(route, details, id, 'hangup');
+    const outcome = await alertOutcome(route, details, id, 'hangup');
+    result.office_alert = outcome.status;
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
-    return `${greeting ? 'greeting_hangup' : 'hangup'}_request_created alert=${result.office_alert}`;
+    const retry = settleOfficeRetry(callId, id, 'hangup', outcome) ? ' retry=queued' : '';
+    return `${greeting ? 'greeting_hangup' : 'hangup'}_request_created alert=${result.office_alert}${retry}`;
   }
   // After a saved call ends: keep Vapi's recording link on the request (used by the "nobody picked up" email).
   function noteRecording(callId, message) {
@@ -792,14 +889,17 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       caller_email: details.email ? 'pending' : 'not_requested',
       anchorline_email: env.OFFICE_EMAIL ? 'pending' : 'not_requested' };
     // Commit before any network operation. One request per Vapi call survives retries/restarts.
-    insert(false, callId, id, details, result, assistantIdOf(message));
+    saveWithRetry(false, callId, id, details, result, assistantIdOf(message), 'new', !!routeFor(message));
     // Urgent job with an owner's cell on the route: offer a live transfer and hold the spoken alert call for its outcome.
     const transfer = canTransfer(routeFor(message), details);
     if (transfer) {
       db.prepare('INSERT OR IGNORE INTO transfers VALUES (?, ?, ?, ?, ?)').run(callId, assistantIdOf(message), 'pending', Date.now() + fallbackMs, new Date().toISOString());
       result.live_transfer = 'available';
     }
-    const officeAlert = alert(routeFor(message), details, id, 'new', transfer, callId);
+    // The retry is settled the moment the alert resolves (not after the receipts), so a crash in between can't re-text.
+    let retry = '';
+    const officeAlert = alertOutcome(routeFor(message), details, id, 'new', transfer, callId)
+      .then(outcome => { retry = settleOfficeRetry(callId, id, 'new', outcome) ? ' retry=queued' : ''; return outcome; });
     if (details.is_test) {
       result.caller_email = details.email ? 'suppressed_test' : 'not_requested';
       result.anchorline_email = env.OFFICE_EMAIL ? 'suppressed_test' : 'not_requested';
@@ -808,8 +908,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         receipt(details.email, details, id, 'caller', routeFor(message)), receipt(env.OFFICE_EMAIL, details, id, 'office')
       ]);
     }
-    result.office_alert = await officeAlert;
+    const outcome = await officeAlert;
+    result.office_alert = outcome.status;
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
+    // Operational log only: statuses and IDs, never caller details.
+    console.log(`submit call=${callId} request=${id} urgent=${/^\s*URGENT\b/i.test(details.issue) ? 'yes' : 'no'} office_alert=${result.office_alert} caller_email=${result.caller_email} anchorline_email=${result.anchorline_email}${retry}`);
     return result;
   }
   function once(callId, args, message) {
@@ -829,7 +932,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       try { if (db) db.prepare('SELECT 1').get(); }
       catch { return reply(503, { status: 'unhealthy', ready: false }); }
       return reply(path === '/readyz' && !ready ? 503 : 200, {
-        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.8.0', ready, trials_enabled: trialsEnabled,
+        status: 'ok', service: 'Anchorline Vapi Receptionist', version: '1.8.1', ready, trials_enabled: trialsEnabled,
         storage_configured: !!db, webhook_auth_configured: key.length >= 32,
         email_configured: !!(env.RESEND_API_KEY && env.EMAIL_FROM && env.OFFICE_EMAIL),
         sms_configured: !!(env.TELNYX_API_KEY && env.TELNYX_FROM), call_alerts_configured: !!(env.VAPI_API_KEY && env.ALERT_CALL_FROM_ID), alert_routes: Object.keys(routes).length, booking_routes: booking.routeCount,
@@ -970,6 +1073,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   };
   const sweeper = db ? setInterval(sweepAll, 5000) : null;
   sweeper?.unref();
+  let retrying = false;
+  const officeSweeper = db ? setInterval(async () => {
+    if (retrying) return;
+    retrying = true;
+    try { await sweepOfficeRetries().catch(() => console.warn('office-alert sweep failed')); } finally { retrying = false; }
+  }, 5000) : null;
+  officeSweeper?.unref();
   // Trials: hourly (results emails, trial end, stuck provisioning), and once a minute after startup.
   const trialSweep = () => trials.sweep().catch(() => console.warn('trial sweep failed'));
   const trialSweeper = trialsEnabled ? setInterval(trialSweep, 3600000) : null;
@@ -977,9 +1087,10 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   trialSweeper?.unref(); trialStart?.unref();
   server.sweepTransfers = sweepTransfers;
   server.sweepEscalations = sweepEscalations;
+  server.sweepOfficeRetries = sweepOfficeRetries;
   server.sendDigests = sendDigests;
   server.trials = trials;
-  server.on('close', () => { clearInterval(sweeper); clearInterval(trialSweeper); clearTimeout(trialStart); db?.close(); });
+  server.on('close', () => { clearInterval(sweeper); clearInterval(officeSweeper); clearInterval(trialSweeper); clearTimeout(trialStart); db?.close(); });
   return server;
 }
 
