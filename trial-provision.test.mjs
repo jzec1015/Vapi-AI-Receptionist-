@@ -656,7 +656,7 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   assert.match(natural, /cut off, garbled, or doesn't fit what you asked, never guess/);
   assert.match(natural, /"Sorry, you cut out there, could you say that again\?"/);
   assert.match(natural, /If a detail sounds impossible, like an email with no @ or no domain, check it once before you use it/);
-  assert.match(natural, /For house numbers, see item 3\./);
+  assert.match(natural, /If it still has no @ or no domain, don't use it: save with no email and email_confirmed false\. For house numbers, see item 3\./);
   assert.doesNotMatch(natural, /ten digits|five or more digits/);
   const address = section('3. The service address.', '4. The best callback number');
   assert.match(address, /Read back the street number and street name;.* If the house number has five or more digits, don't read it back; ask instead, "Sorry, could you say the house number once more, slowly\?" If they give the same number again, accept it and read it back normally; never ask a third time\./);
@@ -676,8 +676,7 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   const rule = section('THE ONE RULE YOU NEVER BREAK', 'WRAPPING UP');
   assert.match(rule, /If submit_service_request, add_request_note or add_customer_email returns an error, times out, or doesn't return saved true, nothing was saved/);
   assert.match(rule, /never say it was sent or added, and never say you're ringing Dana\./);
-  assert.match(rule, /If the error says what to fix, fix it; either way, say "I'm having trouble saving that, one moment\." and call the same tool again, at most twice more in all\./);
-  assert.match(rule, /If submit_service_request still isn't saved after that, say "I'm sorry, I couldn't save that, but the team will call you back at" and read back the number they gave;/);
+  assert.match(rule, /Say "I'm having trouble saving that, one moment\.", fix what the error says if it tells you, and call the same tool again once\. If submit_service_request still isn't saved, say "I'm sorry, I couldn't save that, but the team will call you back at" and read back the number they gave;/);
   assert.match(rule, /if they gave no number \(they refused, so don't ask again\), say "I'm sorry, I couldn't save that\. The team will try the number you're calling from\." Then repeat the problem, their name and the address\./);
   assert.doesNotMatch(prompt, /recording of this call/);
   assert.match(rule, /This is the one time you may go past 25 words\./);
@@ -685,7 +684,9 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   // The fix-and-save rule lives only in THE ONE RULE; a confirmation email is promised only when the server accepted it.
   assert.match(prompt, /If a save fails, follow THE ONE RULE\./);
   assert.doesNotMatch(prompt, /If a save is refused/);
-  assert.match(prompt, /Only if it returns saved true and caller_email "accepted", tell them their confirmation is on its way; otherwise say "The team will confirm your email when they call\."/);
+  assert.match(prompt, /Only if it returns saved true and caller_email "accepted", tell them their confirmation is on its way; if it returned saved true without "accepted", say "The team will confirm your email when they call\."/);
+  assert.match(prompt, /Never save before you have asked for the email \(unless it's an emergency or the caller refuses details, see NEVER LOSE A CALLER\);/);
+  assert.doesNotMatch(prompt, /twice more|at most twice/);
   // THE PHONE NUMBER RULE holds the whole read-back rule and is still the last rule, right before the shop details.
   const phone = prompt.slice(prompt.indexOf('THE PHONE NUMBER RULE ('), prompt.indexOf('SHOP DETAILS') + 'SHOP DETAILS'.length);
   assert.match(phone, /^THE PHONE NUMBER RULE \(this outranks every other rule about saving; gas and shut-off safety advice still come first\)\n/);
@@ -696,7 +697,7 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   assert.ok(prompt.lastIndexOf('THE PHONE NUMBER RULE (') > prompt.lastIndexOf('STAYING NATURAL'), 'the phone number rule is still the last rule');
   for (const text of ['THE PHONE NUMBER RULE (', 'you cut out there', 'If a detail sounds impossible', 'Never end the call in a reply that asks a question',
     "I'm having trouble saving that, one moment.", "I couldn't save that, but the team will call you back at", 'The team will try the number you', 'five or more digits', 'rattle it off early', 'very next reply must be ONLY the read-back',
-    'read the whole corrected number back', 'Mention that when the team calls you', 'one step you never skip', "never say you're ringing", "I'm ringing", 'fix it; either way', 'never ask a third time', 'caller_email "accepted"']) once(text);
+    'read the whole corrected number back', 'Mention that when the team calls you', 'one step you never skip', "never say you're ringing", "I'm ringing", 'fix what the error says if it tells you, and call the same tool again once', 'never ask a third time', 'caller_email "accepted"']) once(text);
   assert.equal(prompt.split('five five five, oh one four two?').length - 1, 2, 'item 4 and THE PHONE NUMBER RULE use the same example number');
   assert.doesNotMatch(prompt, /oh one four four/);
   assert.doesNotMatch(prompt, /\{\{/);
