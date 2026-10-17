@@ -276,7 +276,8 @@ export function createApp(env = process.env, send = fetch) {
       );
       CREATE TABLE IF NOT EXISTS deliveries (ref TEXT NOT NULL, channel TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (ref, channel));
       CREATE TABLE IF NOT EXISTS outbox (
-        ref TEXT PRIMARY KEY, kind TEXT NOT NULL, call_id TEXT NOT NULL, tool_call_id TEXT, args_key TEXT, due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
+        ref TEXT PRIMARY KEY, kind TEXT NOT NULL, call_id TEXT NOT NULL, tool_call_id TEXT, args_key TEXT, created_at INTEGER NOT NULL,
+        due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
       );`);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
     // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
@@ -466,7 +467,9 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   }
   // Office alerts for one client route. Returns a status string; never throws.
   // holdCall: a live transfer will be tried first, so the spoken alert call waits for its outcome.
-  async function alert(route, details, id, kind, holdCall = false, callId = '', emailKey = `${id}-alert-${kind}-${details.notes.length}`) {
+  // emailKey is the Resend Idempotency-Key and the delivery-ledger ref. The new-job and hang-up alerts use the v1.5 key
+  // (<id>-alert-<kind>-0, notes were always empty then); it must not change when notes are added later.
+  async function alert(route, details, id, kind, holdCall = false, callId = '', emailKey = `${id}-alert-${kind}-0`) {
     if (!route || (details.is_test && !route.alertTests)) return details.is_test ? 'suppressed_test' : 'not_configured';
     const text = alertText(route, details, kind);
     const jobs = [];
@@ -727,7 +730,11 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     return { ...result, duplicate: true };
   }
   const addOutbox = (ref, kind, callId, toolCallId = null, argsKey = null) => db.prepare(`INSERT OR REPLACE INTO outbox
-    (ref, kind, call_id, tool_call_id, args_key, due_at) VALUES (?, ?, ?, ?, ?, ?)`).run(ref, kind, callId, toolCallId, argsKey, Date.now() + 30000);
+    (ref, kind, call_id, tool_call_id, args_key, created_at, due_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(ref, kind, callId, toolCallId, argsKey, Date.now(), Date.now() + 30000);
+  // The office was reached when the alert needed nothing (sent, test, no route) or at least one of its channels went out.
+  // Until then the outbox row stays, and the sweep tries the failed channels again.
+  const officeReached = (result, alertKey) => result.office_alert !== 'needs_review' && result.office_alert !== 'pending'
+    || !!db.prepare("SELECT 1 FROM deliveries WHERE ref = ? AND status = 'sent'").get(alertKey);
   const doneOutbox = ref => db.prepare('DELETE FROM outbox WHERE ref = ?').run(ref);
   const transaction = work => {
     db.exec('BEGIN IMMEDIATE');
@@ -738,13 +745,13 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     return run(ref, async () => {
       const row = db.prepare('SELECT id, details, result FROM requests WHERE call_id = ?').get(callId);
       const details = JSON.parse(row.details), result = JSON.parse(row.result), route = routeOf(details.assistant_id);
-      const officeAlert = unfinished(result.office_alert) ? alert(route, details, row.id, 'new', result.live_transfer === 'available', callId) : result.office_alert;
+      const officeAlert = unfinished(result.office_alert) ? alert(route, details, row.id, 'new', result.live_transfer === 'available', callId, `${row.id}-alert-new-0`) : result.office_alert;
       const [callerEmail, anchorlineEmail] = await Promise.all([
         unfinished(result.caller_email) ? receipt(details.email, details, row.id, 'caller', route) : result.caller_email,
         unfinished(result.anchorline_email) ? receipt(env.OFFICE_EMAIL, details, row.id, 'office') : result.anchorline_email]);
       Object.assign(result, { caller_email: callerEmail, anchorline_email: anchorlineEmail, office_alert: await officeAlert });
       db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
-      doneOutbox(ref);
+      if (officeReached(result, `${row.id}-alert-new-0`)) doneOutbox(ref);
       return result;
     });
   }
@@ -757,15 +764,16 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       const tool = toolRow(name, callId, toolCallId, argsKey);
       const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
       const result = JSON.parse(tool.result), details = JSON.parse(row.details), route = routeOf(tool.assistant_id);
+      const noteKey = `${row.id}-alert-note-${sha(`${toolCallId}\n${argsKey}`).slice(0, 32)}`;
       if (name === 'add_request_note' && unfinished(result.office_alert)) {
         const noted = { ...details, notes: [...(details.notes || []).filter(n => n !== tool.arg), tool.arg] };
-        result.office_alert = await alert(route, noted, row.id, 'note', false, '', `${row.id}-alert-note-${sha(`${toolCallId}\n${argsKey}`).slice(0, 32)}`);
+        result.office_alert = await alert(route, noted, row.id, 'note', false, '', noteKey);
       }
       // A pending confirmation for an address the caller has since corrected is not sent.
       if (name === 'add_customer_email' && unfinished(result.caller_email)) result.caller_email = String(details.email).toLowerCase() !== tool.arg.toLowerCase()
         ? 'superseded' : await receipt(tool.arg, details, row.id, 'caller', route, callerKey(row.id, tool.arg));
       db.prepare('UPDATE tool_calls SET result = ? WHERE call_id = ? AND name = ? AND tool_call_id = ? AND args_key = ?').run(JSON.stringify(result), callId, name, toolCallId, argsKey);
-      doneOutbox(ref);
+      if (name === 'add_request_note' ? officeReached(result, noteKey) : result.caller_email !== 'needs_review') doneOutbox(ref);
       return result;
     });
   }
@@ -806,14 +814,29 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     return saveTool(name, callId, toolCallId, argsKey, email, assistantId, details,
       { saved: true, request_id: row.id, email_added: true, caller_email: details.is_test ? 'suppressed_test' : 'pending' });
   }
-  // Restart safety net: saved work whose sends never finished (no final result 30 s after it was saved, and not running
-  // in this process) is finished here, even when Vapi does not retry. Up to 5 passes a minute apart.
+  async function giveUp(row) {
+    const request = db.prepare('SELECT id, assistant_id FROM requests WHERE call_id = ?').get(row.call_id);
+    console.error(`OUTBOX GAVE UP: ${row.kind === 'add_customer_email' ? 'caller confirmation' : 'office alert'} not delivered kind=${row.kind} call=${logSafe(row.call_id)} request=${request?.id || 'none'}`);
+    if (!request || row.kind === 'add_customer_email') return;
+    const business = routeOf(request.assistant_id)?.business || request.assistant_id || 'unknown line';
+    await officeNotice(`ALERT NOT DELIVERED – ${business}`, `The office alert for a saved request could not be delivered on any channel after 6 tries.
+Business: ${business}
+Request reference: ${request.id}
+Kind: ${row.kind === 'submit' ? 'new request' : 'note'}
+
+Call the office with the request details (see /admin or the database).`, `${request.id}-undelivered-${sha(row.ref).slice(0, 16)}`);
+  }
+  // Restart safety net: saved work whose sends never finished, or whose office alert reached no channel, is retried here
+  // even when Vapi does not retry: first 30 s after it was saved (if not running in this process), then up to 5 passes a
+  // minute apart. A row older than an hour (e.g. left by a rollback) is dropped, never sent late. When the passes run out
+  // and the office got nothing, Anchorline (OFFICE_EMAIL) gets a notice with the request reference.
   async function sweepOutbox(now = Date.now()) {
     if (!db) return [];
     const done = [];
     for (const row of db.prepare('SELECT * FROM outbox WHERE due_at <= ? ORDER BY due_at LIMIT 20').all(now)) {
       if (flights.has(row.ref)) continue;
-      if (row.attempts >= 5) { doneOutbox(row.ref); console.warn(`outbox gave-up kind=${row.kind} call=${logSafe(row.call_id)}`); continue; }
+      if (row.created_at < now - 3600000) { doneOutbox(row.ref); console.warn(`outbox stale-dropped kind=${row.kind} call=${logSafe(row.call_id)}`); continue; }
+      if (row.attempts >= 5) { doneOutbox(row.ref); await giveUp(row); continue; }
       db.prepare('UPDATE outbox SET attempts = attempts + 1, due_at = ? WHERE ref = ?').run(now + 60000, row.ref);
       try {
         const result = row.kind === 'submit' ? await deliverSubmit(row.call_id) : await deliverTool(row.kind, row.call_id, row.tool_call_id, row.args_key);
@@ -1078,7 +1101,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   const sweepAll = async () => {
     if (sweeping) return;
     sweeping = true;
-    try { await sweepOutbox().catch(() => {}); await sweepTransfers().catch(() => {}); await sweepEscalations().catch(() => {}); await sendDigests().catch(() => console.warn('digest failed')); }
+    try { await sweepTransfers().catch(() => {}); await sweepEscalations().catch(() => {}); await sweepOutbox().catch(() => {}); await sendDigests().catch(() => console.warn('digest failed')); }
     finally { sweeping = false; }
   };
   const sweeper = db ? setInterval(sweepAll, 5000) : null;

@@ -19,14 +19,14 @@ const note = (callId, text, toolId) => toolCall(callId, 'add_request_note', { no
 const email = (callId, address, toolId) => toolCall(callId, 'add_customer_email', { email: address, confirmed_after_spelling_back: true }, toolId);
 const tempDir = t => { const dir = mkdtempSync(join(tmpdir(), 'idem-test-')); t.after(() => rmSync(dir, { recursive: true, force: true })); return dir; };
 // behave(url, body) -> status code, or a Promise for one (a Promise that never settles is a send cut off by a restart).
-async function fixture(t, { behave = () => 200, dir = tempDir(t) } = {}) {
+async function fixture(t, { behave = () => 200, dir = tempDir(t), extra = {} } = {}) {
   const sent = [];
   const send = async (url, init) => {
     const body = JSON.parse(init.body);
     sent.push({ url, key: init.headers?.['Idempotency-Key'], body });
     return new Response('{}', { status: await behave(url, body) });
   };
-  const app = createApp({ DATA_DIR: dir, VAPI_WEBHOOK_SECRET: key, ...alertEnv }, send);
+  const app = createApp({ DATA_DIR: dir, VAPI_WEBHOOK_SECRET: key, ...alertEnv, ...extra }, send);
   app.listen(0, '127.0.0.1'); await once(app, 'listening');
   const stop = () => { if (!app.listening) return; app.closeAllConnections(); return new Promise(resolve => app.close(resolve)); };
   t.after(stop);
@@ -205,6 +205,71 @@ test('restart before sends finished, and Vapi never retries: the outbox sweep fi
   // A late Vapi retry now gets the finished result and sends nothing more.
   const late = await second.post(note('r-3', 'Dog in the yard', 'tc-n'));
   assert.equal(late.office_alert, 'sent'); assert.equal(second.sent.length, 5);
+});
+
+const twoNumbers = { ALERT_ROUTES: JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001', '+15550000002'], email: ['office@example.com'] } }) };
+const emailOnly = { ALERT_ROUTES: JSON.stringify({ 'client-a': { business: 'Trial Co', sms: [], email: ['office@example.com'] } }) };
+const outboxRows = dir => { const db = new DatabaseSync(join(dir, 'requests.sqlite')); try { return db.prepare('SELECT count(*) AS n FROM outbox').get().n; } finally { db.close(); } };
+
+test('a duplicate submit after a note re-sends only the SMS that failed, never the delivered ones', async t => {
+  const { post, sms, emails } = await fixture(t, { extra: twoNumbers, behave: (url, body) => url.includes('telnyx') && body.to === '+15550000002' ? 400 : 200 });
+  const first = await post(toolCall('k-1', 'submit_service_request', intake, 's1'));
+  assert.equal(first.office_alert, 'needs_review');
+  await post(note('k-1', 'Gate 1', 'n1'));
+  const [smsBefore, emailsBefore] = [sms().length, emails().length];
+  await post(toolCall('k-1', 'submit_service_request', intake, 's2'));
+  assert.deepEqual(sms().slice(smsBefore).map(s => s.body.to), ['+15550000002']);
+  assert.equal(emails().length, emailsBefore, 'the delivered alert email is not sent again');
+});
+
+test('restart mid-submit, a note added, then the sweep: the new-job alert keeps its v1.5 Resend key', async t => {
+  const dir = tempDir(t);
+  const first = await crashMidSend(t, dir, { cut: toolCall('k-2', 'submit_service_request', intake) });
+  const firstKey = first.emails().find(e => e.body.to[0] === 'office@example.com').key;
+  const second = await fixture(t, { dir });
+  await second.post(note('k-2', 'Gate 5', 'n1'));
+  await second.app.sweepOutbox(Date.now() + 31000);
+  const office = second.emails().filter(e => e.body.to[0] === 'office@example.com').map(e => e.key);
+  assert.equal(office.length, 2, 'note alert + the finished new-job alert');
+  assert.ok(office.includes(firstKey)); assert.match(firstKey, /-alert-new-0$/);
+  assert.equal(second.sms().length, 2);
+});
+
+test('an office alert that reached no channel stays in the outbox and the sweep delivers it', async t => {
+  let fail = true;
+  const { app, post, dir, emails } = await fixture(t, { extra: emailOnly, behave: () => fail ? 500 : 200 });
+  const saved = await post(toolCall('k-3', 'submit_service_request', intake));
+  assert.equal(saved.saved, true); assert.equal(saved.office_alert, 'needs_review');
+  assert.equal(outboxRows(dir), 1);
+  fail = false;
+  const before = emails().length;
+  assert.equal((await app.sweepOutbox(Date.now() + 31000)).length, 1);
+  assert.equal(emails().length - before, 1); assert.equal(outboxRows(dir), 0);
+  assert.equal((await post(toolCall('k-3', 'submit_service_request', intake))).office_alert, 'sent');
+});
+
+test('when every pass fails, the sweep gives up loudly and tells Anchorline (OFFICE_EMAIL)', async t => {
+  const errors = [];
+  t.mock.method(console, 'error', line => errors.push(String(line)));
+  const { app, post, dir, emails } = await fixture(t, { extra: { ...emailOnly, OFFICE_EMAIL: 'ops@anchorline.example' },
+    behave: (url, body) => body.to?.[0] === 'office@example.com' ? 500 : 200 });
+  const saved = await post(toolCall('k-4', 'submit_service_request', intake));
+  let now = Date.now() + 31000;
+  for (let i = 0; i < 6; i++, now += 61000) await app.sweepOutbox(now);
+  assert.equal(outboxRows(dir), 0);
+  assert.equal(emails().filter(e => e.body.to[0] === 'office@example.com').length, 6, 'first try + 5 passes');
+  const notice = emails().filter(e => e.body.to[0] === 'ops@anchorline.example' && /ALERT NOT DELIVERED/.test(e.body.subject));
+  assert.equal(notice.length, 1); assert.match(notice[0].body.text, new RegExp(saved.request_id));
+  assert.doesNotMatch(notice[0].body.text, /Linda|Birch|6155550142/);
+  assert.ok(errors.some(l => /^OUTBOX GAVE UP: office alert not delivered kind=submit call=k-4/.test(l)));
+});
+
+test('an outbox row older than an hour (left by a rollback) is dropped, never sent late', async t => {
+  const dir = tempDir(t);
+  await crashMidSend(t, dir, { cut: toolCall('k-5', 'submit_service_request', intake) });
+  const second = await fixture(t, { dir });
+  assert.deepEqual(await second.app.sweepOutbox(Date.now() + 2 * 3600000), []);
+  assert.equal(second.sent.length, 0); assert.equal(outboxRows(dir), 0);
 });
 
 test('a retried add_customer_email sends one confirmation; a corrected address is saved and sent', async t => {
