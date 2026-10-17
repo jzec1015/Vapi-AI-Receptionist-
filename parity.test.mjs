@@ -74,6 +74,17 @@ const spoken = s => s.url === 'https://api.vapi.ai/call' ? JSON.parse(JSON.strin
 // v1.8.1 keys a note alert's email by its tool call (<id>-alert-note-<hash>) instead of the note count, so a Vapi retry is one email.
 const noteKey = headers => headers?.['Idempotency-Key']?.includes('-alert-note-')
   ? { ...headers, 'Idempotency-Key': headers['Idempotency-Key'].replace(/-alert-note-(\d+|[0-9a-f]{32})$/, '-alert-note-<key>') } : headers;
+// The note-fail-line change adds say and note to every saved:false add_request_note / add_customer_email result (every other field unchanged).
+const NOTE_TOOLS = new Set(['add_request_note', 'add_customer_email']);
+const withoutSayLine = (steps, replies) => replies.map((reply, i) => {
+  const name = steps[i].message?.toolCallList?.[0]?.function?.name;
+  if (!NOTE_TOOLS.has(name) || !reply.json.map) return reply;
+  return { ...reply, json: reply.json.map(r => {
+    if (r.saved !== false) return r;
+    assert.equal(r.say, 'Mention that when the team calls you, so they have it.'); assert.match(r.note, /^NOT saved/);
+    const { say, note, ...rest } = r; return rest;
+  }) };
+});
 const shape = s => isAlert(s) ? { url: s.url, method: s.method, headers: noteKey(s.headers), to: s.body.to, from: s.body.from } : spoken(s);
 
 for (const [name, steps] of Object.entries(scenarios)) {
@@ -81,7 +92,7 @@ for (const [name, steps] of Object.entries(scenarios)) {
     const before = await run(t, createV150, steps);
     const after = await run(t, createApp, steps);
     assert.ok(name === 'test call' || before.sent.length > 0, "scenario sends something");
-    assert.deepEqual(after.replies, before.replies);
+    assert.deepEqual(withoutSayLine(steps, after.replies), before.replies);
     assert.deepEqual(after.sent.map(callbackRule).map(shape), before.sent.map(shape));
     assert.ok(!after.sent.some(s => s.method === 'GET'), 'no Vapi call lookups without a transfer route');
   });

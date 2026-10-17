@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
-import { createApp, alertText } from './server.mjs';
+import { createApp, alertText, NOT_SAVED_SAY } from './server.mjs';
 
 // Vapi retries a tool call (server.backoffPlan) with the same body: same toolCall id, same arguments. A retry must never
 // double-send, must re-send what failed, and must finish sends cut off by a restart.
@@ -717,4 +717,82 @@ test('a 7am digest send that hangs never delays a held urgent ring: it goes on t
   const hung = await ringTime(true);
   assert.equal(control, 10000, 'with no hang the ring goes on the first 5 s tick after it is due');
   assert.equal(hung, control, `with the digest send hanging the ring went at ${hung} ms instead of ${control} ms`);
+});
+
+// Every saved:false result of add_request_note / add_customer_email carries the line to speak (say) and a note that it was
+// not saved, so gpt-4.1 does not improvise "I'll note that..." or "I'll let the team know...". The fields already there stay.
+const notSaved = (result, name, error) => {
+  assert.equal(result.saved, false); assert.equal(result.retryable, false); assert.equal(result.error, error);
+  assert.equal(result.say, NOT_SAVED_SAY); assert.equal(result.say, 'Mention that when the team calls you, so they have it.');
+  assert.match(result.note, /^NOT saved: nothing was noted, added or passed on\./);
+  assert.match(result.note, new RegExp(`call ${name} once more\\. If it still isn't saved, say only the say line\\.`));
+  assert.match(result.note, /Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that"/);
+  assert.deepEqual(Object.keys(result), ['saved', 'retryable', 'error', 'say', 'note']);
+};
+const noCall = (name, args) => ({ message: { type: 'tool-calls', toolCallList: [{ id: 'tc-x', function: { name, arguments: args } }] } });
+const failTrigger = (dir, table) => { const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+  try { db.exec(`CREATE TRIGGER fail_${table} BEFORE INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'disk full'); END`); } finally { db.close(); } };
+
+test('every saved:false add_request_note result carries the say line and the not-saved note', async t => {
+  const { post, dir, saved, sms } = await fixture(t);
+  const N = 'add_request_note';
+  notSaved(await post(noCall(N, { note: 'Gate code 1' })), N, 'Missing Vapi call, chat or session ID');
+  notSaved(await post(note('z-1', 'Gate code 1', 'tc-1')), N, 'No saved request yet; save the request first');
+  // A retry of a refused call is refused again, with the same line (nothing was stored for it).
+  notSaved(await post(note('z-1', 'Gate code 1', 'tc-1')), N, 'No saved request yet; save the request first');
+  await post(toolCall('z-1', 'submit_service_request', intake, 'tc-submit'));
+  notSaved(await post(note('z-1', '   ', 'tc-2')), N, 'Missing or invalid note');
+  notSaved(await post(note('z-1', 'x'.repeat(1001), 'tc-3')), N, 'Missing or invalid note');
+  notSaved(await post(toolCall('z-1', N, {}, 'tc-4')), N, 'Missing or invalid note');
+  notSaved(await post(toolCall('z-1', N, '{not json', 'tc-5')), N, 'Unable to add note');
+  assert.equal((await post(note('z-1', 'Gate 1', 'same'))).note_added, true);
+  notSaved(await post(note('z-1', 'Gate 2', 'same')), N, 'Not added: this tool call was already used for a different note. Call add_request_note again.');
+  const smsBefore = sms().length;
+  failTrigger(dir, 'tool_calls');
+  notSaved(await post(note('z-1', 'Back door code 9', 'tc-6')), N, 'Unable to add note');
+  assert.deepEqual(saved('z-1').notes, ['Gate 1']); assert.equal(sms().length, smsBefore);
+});
+
+test('every saved:false add_customer_email result carries the say line and the not-saved note', async t => {
+  const { post, dir, saved, emails } = await fixture(t);
+  const E = 'add_customer_email';
+  notSaved(await post(noCall(E, { email: 'a@example.org', confirmed_after_spelling_back: true })), E, 'Missing Vapi call, chat or session ID');
+  notSaved(await post(email('z-2', 'a@example.org', 'tc-1')), E, 'No saved request yet; save the request first');
+  await post(toolCall('z-2', 'submit_service_request', intake, 'tc-submit'));
+  notSaved(await post(toolCall('z-2', E, { email: 'a@example.org', confirmed_after_spelling_back: false }, 'tc-2')), E,
+    'Not added: spell the email back letter by letter and get a clear yes first.');
+  notSaved(await post(toolCall('z-2', E, { email: 'a@example.org' }, 'tc-3')), E, 'Not added: spell the email back letter by letter and get a clear yes first.');
+  notSaved(await post(email('z-2', 'not-an-email', 'tc-4')), E, 'Invalid email');
+  notSaved(await post(email('z-2', `${'a'.repeat(250)}@example.org`, 'tc-5')), E, 'Invalid email');
+  notSaved(await post(toolCall('z-2', E, '{not json', 'tc-6')), E, 'Unable to add email');
+  assert.equal((await post(email('z-2', 'a@example.org', 'same'))).caller_email, 'accepted');
+  notSaved(await post(email('z-2', 'b@example.org', 'same')), E, 'Not added: this tool call was already used for a different email. Call add_customer_email again.');
+  const emailsBefore = emails().length;
+  failTrigger(dir, 'tool_calls');
+  notSaved(await post(email('z-2', 'c@example.org', 'tc-7')), E, 'Unable to add email');
+  assert.equal(saved('z-2').email, 'a@example.org'); assert.equal(emails().length, emailsBefore);
+});
+
+test('saved:true note and email results, and their duplicates, are unchanged: no say or note fields', async t => {
+  const { post } = await fixture(t);
+  await post(toolCall('z-3', 'submit_service_request', intake, 'tc-submit'));
+  const added = await post(note('z-3', 'Gate code 4471', 'tc-n'));
+  assert.deepEqual(Object.keys(added), ['saved', 'request_id', 'note_added', 'office_alert']);
+  assert.equal(added.saved, true); assert.equal(added.office_alert, 'sent');
+  const again = await post(note('z-3', 'Gate code 4471', 'tc-n'));
+  assert.deepEqual(again, { ...added, duplicate: true });
+  const mail = await post(email('z-3', 'linda@example.org', 'tc-e'));
+  assert.deepEqual(Object.keys(mail), ['saved', 'request_id', 'email_added', 'caller_email']);
+  assert.equal(mail.saved, true); assert.equal(mail.caller_email, 'accepted');
+  assert.deepEqual(await post(email('z-3', 'linda@example.org', 'tc-e')), { ...mail, duplicate: true });
+});
+
+test('submit_service_request and other tools never get the note/email say line', async t => {
+  const { post } = await fixture(t);
+  const refused = await post(toolCall('z-4', 'submit_service_request', { ...intake, email_confirmed: true, email: 'bad', email_status: 'confirmed' }));
+  assert.equal(refused.saved, false); assert.equal(refused.say, undefined); assert.equal(refused.note, undefined);
+  const noId = await post(noCall('submit_service_request', intake));
+  assert.equal(noId.saved, false); assert.equal(noId.say, undefined); assert.equal(noId.note, undefined);
+  const unknown = await post(toolCall('z-4', 'some_other_tool', {}));
+  assert.equal(unknown.saved, false); assert.equal(unknown.say, undefined); assert.equal(unknown.note, undefined);
 });

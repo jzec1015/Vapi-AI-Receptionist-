@@ -32,6 +32,16 @@ const sha = value => createHash('sha256').update(String(value)).digest('hex');
 const logSafe = value => String(value ?? 'none').replace(/[^\w.:-]/g, '_').slice(0, 120) || 'none';
 const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).includes('needs_review') ? 'needs_review' : r?.saved === false ? (r.retryable ? 'retryable_error' : 'refused')
   : r?.booked === false ? `not_booked_${logSafe(r.status)}` : r?.error ? 'refused' : 'ok';
+// add_request_note and add_customer_email results that saved nothing carry the exact words to speak. Without them gpt-4.1
+// sometimes improvises a false promise ("I'll note that you prefer...", "I'll let the team know..."). Every existing field is
+// kept; note follows THE ONE RULE in templates/emma-prompt.txt (trouble line, fix the error, one retry, then this line).
+export const NOT_SAVED_SAY = 'Mention that when the team calls you, so they have it.';
+const NOT_SAVED_TOOLS = ['add_request_note', 'add_customer_email'];
+export const notSavedNote = name => `NOT saved: nothing was noted, added or passed on. If this is your first try, say "I'm having trouble saving that, ` +
+  `one moment.", fix what error says, and call ${name} once more. If it still isn't saved, say only the say line. Never say "I'll note that", ` +
+  `"I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`;
+const withNotSavedLine = (name, result) => NOT_SAVED_TOOLS.includes(name) && result?.saved === false
+  ? { ...result, say: NOT_SAVED_SAY, note: notSavedNote(name) } : result;
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Why a request is test traffic, or null for a live request. Test requests are stored but
@@ -1493,6 +1503,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
             result = saved ? JSON.parse(saved.result) : failure('Unable to process request');
           }
         }
+        result = withNotSavedLine(name, result);
         results.push({ toolCallId: tool.id, result: JSON.stringify(result) });
         // Operational log only: tool, IDs, outcome and time, never arguments or caller details.
         console.log(`tool-call name=${logSafe(name)} call=${logSafe(callId)} tool_call=${logSafe(tool.id)} outcome=${toolOutcome(result)} ms=${Date.now() - started}`);
