@@ -712,3 +712,25 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   assert.doesNotMatch(prompt, /oh one four four/);
   assert.doesNotMatch(prompt, /\{\{/);
 });
+
+test('the voice upgrade adds its spoken style and address read-back once, without a second phone read-back rule', () => {
+  const shop = { id: 'client-5', business: 'Riverbend Plumbing', owner_name: 'Dana Whitfield', shop_number: '+16155550100', city: 'Nashville', state: 'TN', services: 'Drains' };
+  const config = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key });
+  const prompt = config.model.messages[0].content;
+  const once = text => assert.equal(prompt.split(text).length - 1, 1, `"${text}" appears exactly once`);
+  // Voice and turn-taking settings.
+  assert.equal(config.voice.stability, 0.4);
+  assert.deepEqual(config.startSpeakingPlan.smartEndpointingPlan, { provider: 'livekit' });
+  assert.deepEqual(config.startSpeakingPlan.customEndpointingRules, [{ type: 'assistant', regex: '(number to reach|phone number|callback number|best number|good number)', timeoutSeconds: 1.5 }]);
+  assert.ok(config.stopSpeakingPlan.acknowledgementPhrases.includes('mm-hmm'));
+  // Spoken-style section sits right before THE PHONE NUMBER RULE, which is still last; its sample read-back uses the shop's area code.
+  const talk = prompt.indexOf('HOW YOU ACTUALLY TALK');
+  assert.ok(talk > prompt.indexOf('STAYING NATURAL') && talk < prompt.indexOf('THE PHONE NUMBER RULE ('));
+  assert.match(prompt, /"Okay, six one five, five five five, oh one four two\. That right\?"/);
+  assert.doesNotMatch(prompt, /seven two oh|Of course, we can help with that"\), then|say "Quick question,"|repeat the whole number once more|Always read back the house number/);
+  // Address read-back is its own reply, stated once, in item 3 next to the five-or-more-digit check.
+  const address = prompt.slice(prompt.indexOf('3. The service address.'), prompt.indexOf('4. The best callback number'));
+  assert.match(address, /make the read-back its own reply, only the question \("That's 412 Gallatin Pike\?"\) with nothing after it, then stop and wait for their answer\. If the house number has five or more digits/);
+  for (const text of ['its own reply', 'skip any question the caller already answered', 'never fill it in from your own question', 'keep it and use it; never drop it', 'HOW YOU ACTUALLY TALK']) once(text);
+  assert.doesNotMatch(prompt, /drains are affected|address read-back question/);
+});
