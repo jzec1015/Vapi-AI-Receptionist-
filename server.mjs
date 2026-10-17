@@ -34,14 +34,23 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
   : r?.booked === false ? `not_booked_${logSafe(r.status)}` : r?.error ? 'refused' : 'ok';
 // add_request_note and add_customer_email results that saved nothing carry the exact words to speak. Without them gpt-4.1
 // sometimes improvises a false promise ("I'll note that you prefer...", "I'll let the team know..."). Every existing field is
-// kept; note follows THE ONE RULE in templates/emma-prompt.txt (trouble line, fix the error, one retry, then this line).
+// kept. note: an unconfirmed email waits for the caller's yes (never a retry before they speak); a retryable error is retried
+// once in the same reply (THE ONE RULE in templates/emma-prompt.txt); any other error goes straight to the say line.
 export const NOT_SAVED_SAY = 'Mention that when the team calls you, so they have it.';
 const NOT_SAVED_TOOLS = ['add_request_note', 'add_customer_email'];
-export const notSavedNote = name => `NOT saved: nothing was noted, added or passed on. If this is your first try, say "I'm having trouble saving that, ` +
-  `one moment.", fix what error says, and call ${name} once more. If it still isn't saved, say only the say line. Never say "I'll note that", ` +
-  `"I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`;
+const UNCONFIRMED_EMAIL = 'Not added: spell the email back letter by letter and get a clear yes first.';
+const NO_PROMISE = 'Never say "I\'ll note that", "I\'ll let the team know", "I\'ll pass that on", "I\'ve added that" or anything similar.';
+export const notSavedNote = (name, result = {}) => result.error === UNCONFIRMED_EMAIL
+  ? 'NOT saved: the email is not confirmed yet. Spell the email back letter by letter, then stop and wait for the caller\'s clear yes. ' +
+    `Only after they say yes, call ${name} again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ` +
+    `again before the caller speaks. If they don't confirm it, say only the say line. ${NO_PROMISE}`
+  : result.retryable === true
+    ? 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what error says, ' +
+      `and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. If it still ` +
+      `isn't saved, say only the say line. ${NO_PROMISE}`
+    : `NOT saved: nothing was noted, added or passed on. Say only the say line. ${NO_PROMISE}`;
 const withNotSavedLine = (name, result) => NOT_SAVED_TOOLS.includes(name) && result?.saved === false
-  ? { ...result, say: NOT_SAVED_SAY, note: notSavedNote(name) } : result;
+  ? { ...result, say: NOT_SAVED_SAY, note: notSavedNote(name, result) } : result;
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Why a request is test traffic, or null for a live request. Test requests are stored but
@@ -1165,7 +1174,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   async function addEmail(callId, args, assistantId, toolCallId = '') {
     const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
     if (!row) return failure('No saved request yet; save the request first');
-    if (args?.confirmed_after_spelling_back !== true) return failure('Not added: spell the email back letter by letter and get a clear yes first.');
+    if (args?.confirmed_after_spelling_back !== true) return failure(UNCONFIRMED_EMAIL);
     const email = typeof args?.email === 'string' ? args.email.trim() : '';
     if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return failure('Invalid email');
     const name = 'add_customer_email', argsKey = sha(email.toLowerCase()), stored = toolRow(name, callId, toolCallId, argsKey);
