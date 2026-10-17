@@ -337,6 +337,9 @@ export function createBooking(env = process.env, send = fetch, store = new Map()
     if (args?.caller_agreed !== true || typeof args?.window_id !== 'string') return { booked: false, appointment_confirmed: false, error: 'Read the window back and get a clear yes first.' };
     const mode = a.cfg.mode === 'book' ? 'book' : 'request';
     return serial(async () => {
+      // A Vapi retry that queued behind the first attempt finds its result here instead of booking twice.
+      const done = await store.get(ctx.callId);
+      if (done) return { ...done, duplicate: true };
       try {
         // Re-read the live schedule inside the lock: never trust what was offered a minute ago.
         const fresh = await windows(a);

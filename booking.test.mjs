@@ -107,6 +107,15 @@ test('HCP book mode: schedules on a free tech, then is idempotent per call', asy
   assert.equal(again.duplicate, true); assert.equal(http.hit(/POST .*\/jobs$/).length, 1);
 });
 
+test('HCP book mode: a concurrent retry of book_window books once', async () => {
+  const http = hcpMock(() => [hcpJob('a', W2, W3, ['t1'])]);
+  const b = createBooking(routesEnv({ ...base, provider: 'housecallpro', mode: 'book' }), http.send, new Map(), { now: () => NOW });
+  const [one, two] = await Promise.all([b.handle('book_window', ctx(), { window_id: W2, caller_agreed: true }),
+    b.handle('book_window', ctx(), { window_id: W2, caller_agreed: true })]);
+  assert.equal(one.status, 'scheduled'); assert.equal(two.duplicate, true); assert.equal(two.external_id, one.external_id);
+  assert.equal(http.hit(/POST .*\/jobs$/).length, 1);
+});
+
 test('HCP book mode: a window filled since it was offered is refused with alternatives', async () => {
   let jobs = [];
   const http = hcpMock(() => jobs);

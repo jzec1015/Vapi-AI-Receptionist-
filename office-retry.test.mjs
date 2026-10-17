@@ -100,6 +100,30 @@ test('an urgent ring that was placed counts as reaching the office', async t => 
   assert.equal(rows()[0].done, 'needs_review', 'closed: the owner is being rung (escalation handles an unanswered ring)');
 });
 
+test('urgent ring placed and answered while SMS and email failed: no Anchorline give-up email, no re-texts', async t => {
+  quiet(t);
+  const urgentEnv = { VAPI_API_KEY: 'fixture-only', ALERT_CALL_FROM_ID: 'phone-1', ALERT_ROUTES: JSON.stringify({ 'client-a': { ...route, call: ['+15550000009'] } }) };
+  const { app, post, sent, down, rows } = await fixture(t, { env: urgentEnv });
+  down.add('telnyx'); down.add('resend');
+  const saved = await result(await post(toolCall('urgent-answered', { ...intake, issue: 'URGENT - burst pipe' })));
+  assert.equal(saved.saved, true);
+  const ring = sent.find(s => s.provider === 'vapi');
+  assert.ok(ring, 'the owner was rung');
+  // The alert call's own end-of-call report: the owner heard it.
+  const vapiId = `vapi-${sent.indexOf(ring) + 1}`;
+  assert.equal((await post({ message: { type: 'end-of-call-report', endedReason: 'assistant-ended-call', durationSeconds: 40,
+    call: { id: vapiId, type: 'outboundPhoneCall' } } })).status, 200);
+  const smsTries = sent.filter(s => s.provider === 'telnyx').length;
+  const start = Date.now();
+  for (let now = start + 30000; now < start + 2 * 60 * MIN; now += 5 * MIN)
+    await Promise.all([app.sweepOutbox(now), app.sweepOfficeRetries(now), app.sweepEscalations(now)]);
+  assert.equal(rows()[0].done, 'needs_review', 'the office retry was closed by the ring');
+  const toAnchorline = sent.filter(s => s.provider === 'office' && /Office alert failed|ALERT NOT DELIVERED|UNANSWERED/.test(s.body.subject));
+  assert.deepEqual(toAnchorline, [], 'nothing claims the office was not reached');
+  assert.equal(sent.filter(s => s.provider === 'telnyx').length, smsTries, 'no re-texts');
+  assert.equal(sent.filter(s => s.provider === 'vapi').length, 1, 'answered: no backup or second ring');
+});
+
 test('after 5 failed retries Anchorline is told once, and that notice is retried until accepted', async t => {
   quiet(t);
   const { app, post, sent, down, rows } = await fixture(t);

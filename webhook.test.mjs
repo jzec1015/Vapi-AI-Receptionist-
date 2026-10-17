@@ -55,14 +55,15 @@ test('missing call identity, wrong tool and invalid intake never report a save',
   assert.equal((await result(await post(payload('invalid', { ...details, name: '' })))).saved, false);
 });
 
-test('email provider failure preserves the request and does not resend on retry', async t => {
+// v1.8.1: a failed send is re-attempted on a Vapi retry (only the channel that failed; same Resend key).
+test('email provider failure preserves the request and re-sends once on retry', async t => {
   let sends = 0;
   const post = await fixture(t, { RESEND_API_KEY: 'fixture-only', EMAIL_FROM: 'test@example.com' }, async () => { sends++; return new Response('{}', { status: 503 }); });
   const request = payload('mail-failure', { ...details, is_test: false, email: 'test@example.com', email_confirmed: true });
   const first = await result(await post(request));
   assert.equal(first.saved, true); assert.equal(first.caller_email, 'needs_review');
   const retry = await result(await post(request));
-  assert.equal(retry.request_id, first.request_id); assert.equal(sends, 1);
+  assert.equal(retry.request_id, first.request_id); assert.equal(retry.duplicate, true); assert.equal(sends, 2);
 });
 
 test('conversation identity preserves voice keys and rejects malformed identifiers', () => {
