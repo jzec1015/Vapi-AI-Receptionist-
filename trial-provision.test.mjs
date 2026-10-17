@@ -814,7 +814,7 @@ test('social round 2: an interrupted read-back is read again in full, and phone 
   assert.ok(phone.indexOf('If the caller corrects any digit, read the whole corrected number back') < phone.indexOf('Only a number you couldn'), 'the correction read-back rule comes first and is unchanged');
   // A capped caller who must be saved right away is saved, and the office is told why there is no number.
   assert.match(prompt, /If you couldn't get a number \(THE PHONE NUMBER RULE\), save those callers right away too\./);
-  assert.match(prompt, /They are saved first; for everyone else, once it's confirmed, or you couldn't get one, read back the address if you haven't \(item 3\), then ask for the email and preferred time/);
+  assert.match(prompt, /They are saved first; for everyone else, once it's confirmed, or you couldn't get one, and the address is read back \(THE PHONE NUMBER RULE\), ask for the email and preferred time/);
   once("couldn't confirm a callback number, bad line");
   // Caller ID can be blocked and Emma can't see it, so no line promises the team "has" the calling number.
   assert.doesNotMatch(prompt, /team will have the number you're calling from|sent this to the team with the number/);
@@ -835,36 +835,39 @@ test('social round 3: honest no-number failure line, notes allowed in job_detail
   assert.equal(prompt.split('if it shows on our end').length - 1, 3);
 });
 
-test('read-back fixes: phone read-back before any follow-up, only a plain yes counts, address read back after the save', () => {
+test('read-back fixes: phone then address read-back before any follow-up, only a plain yes counts, no promise after a failed note', () => {
   const shop = { id: 'client-9', business: 'Riverbend Plumbing', owner_name: 'Dana Whitfield', shop_number: '+16155550100', city: 'Nashville', state: 'TN', services: 'Drains' };
   const prompt = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key }).model.messages[0].content;
   const once = text => assert.equal(prompt.split(text).length - 1, 1, `"${text}" appears exactly once`);
   const section = (name, next) => prompt.slice(prompt.indexOf(name), prompt.indexOf(next, prompt.indexOf(name)));
-  const wrapping0 = section('WRAPPING UP', 'ENDING THE CALL');
-  // H1: the follow-up rule itself points to the read-back, and the phone rule says the read-back beats any follow-up.
+  // H1 (+ edit 2): the follow-up rule itself points to both read-backs, and the phone rule says the read-back beats any follow-up.
   const curious = section('BE CURIOUS', 'WHAT TO GET');
-  assert.match(curious, /ask ONE short follow-up that fits it, and a second only if the job is still unclear, unless they've just given a callback number: read it back first, see THE PHONE NUMBER RULE\./);
+  assert.match(curious, /ask ONE short follow-up that fits it, and a second only if the job is still unclear, unless they've just given a callback number or an address: read those back first, see THE PHONE NUMBER RULE\./);
   const phone = section('THE PHONE NUMBER RULE (', 'SHOP DETAILS');
   assert.match(phone, /then stop talking and wait for their answer\. The read-back comes before any follow-up or sizing question\./);
-  once("unless they've just given a callback number");
+  once("unless they've just given a callback number or an address");
   once('before any follow-up or sizing question');
-  // H2: only a plain yes to the read-back itself sets callback_read_back; anything else gets one more read-back, then the fallback.
+  // H2 + M1: only a plain yes to the read-back itself sets callback_read_back; anything else gets one more read-back, a bare no a fresh ask, then the fallback.
   assert.match(phone, /Set callback_read_back true only if you actually read it back in this call and they said yes\. Only a plain yes to the read-back itself counts; another topic, a question or silence is not a yes, so answer briefly if needed, then read the whole number back once more\. After a bare no, ask for the number again\. If you still get no yes, use the fallback below, noting "couldn't confirm a callback number"\./);
-  once('After a bare no, ask for the number again.');
-  // S1: before the save, the address is read back (if not yet) before the email ask; the after-save rule only catches an address still unread, so it is never read twice.
-  assert.match(wrapping0, /For callers who skip the email, follow item 6\. They are saved first; for everyone else, once it's confirmed, or you couldn't get one, read back the address if you haven't \(item 3\), then ask for the email and preferred time \(items 6 and 7\), then call submit_service_request right away\./);
-  assert.ok(wrapping0.indexOf("read back the address if you haven't") < wrapping0.indexOf("if they gave an address you haven't read back yet"), 'the pre-save address step comes before the after-save catch');
-  once("read back the address if you haven't (item 3)");
-  // S2: the item 6 save-first callers come before the address step, so an urgent caller is saved before any address read-back.
-  assert.ok(wrapping0.indexOf('For callers who skip the email, follow item 6. They are saved first') < wrapping0.indexOf("read back the address if you haven't"), 'item 6 save-first comes before the address step');
-  once('They are saved first; for everyone else');
   once('Only a plain yes to the read-back itself counts');
-  // H3: WRAPPING UP reads an unread address back on its own after the save, before the close and "Anything else?".
+  once('After a bare no, ask for the number again.');
+  // H3 (edit 1): the address step is stated once, in THE PHONE NUMBER RULE, right after the yes; item 6 callers are saved in that same turn and the ringing line waits for the address yes.
+  const address = "After their yes or the fallback, if they gave an address not yet read back, your very next reply is ONLY its read-back question, before any follow-up; if item 6 saves them right away, call submit_service_request in that same turn, and say the ringing line only after they confirm the address.";
+  assert.ok(phone.includes(address), 'the address step is in THE PHONE NUMBER RULE');
+  once(address);
+  assert.ok(phone.indexOf('Only a plain yes to the read-back itself counts') < phone.indexOf(address), 'the address step follows the yes rule');
+  once('say the ringing line only after they confirm the address');
+  // WRAPPING UP only points to it: item 6 callers are saved first, everyone else gets the address read-back before the email ask, and the close waits for it.
   const wrapping = section('WRAPPING UP', 'ENDING THE CALL');
-  assert.match(wrapping, /After the save, if they gave an address you haven't read back yet, your next reply is only that read-back question \(item 3\)\. If they ask something, add a detail or correct one AFTER it's saved, call add_request_note/);
+  assert.match(wrapping, /For callers who skip the email, follow item 6\. They are saved first; for everyone else, once it's confirmed, or you couldn't get one, and the address is read back \(THE PHONE NUMBER RULE\), ask for the email and preferred time \(items 6 and 7\), then call submit_service_request right away\./);
+  assert.ok(wrapping.indexOf('For callers who skip the email, follow item 6. They are saved first') < wrapping.indexOf('and the address is read back'), 'item 6 save-first comes before the address step');
+  once('They are saved first; for everyone else');
   assert.match(wrapping, /Only after it is saved and any address read back, close warmly and honestly: "Alright, I've got all that over to the team\./);
-  assert.ok(wrapping.indexOf('if they gave an address you haven') < wrapping.indexOf('Anything else you'), 'the address read-back comes before "Anything else?"');
-  once("if they gave an address you haven't read back yet");
+  assert.doesNotMatch(prompt, /After the save, if they gave an address|read back the address if you haven't|your next reply is only that read-back question/);
+  // Edit 3: no "I'll let the team know" after a failed note or email; the failed-note line is used instead.
+  const rule = section('THE ONE RULE YOU NEVER BREAK', 'WRAPPING UP');
+  assert.match(rule, /If add_customer_email or add_request_note still isn't saved, say "Mention that when the team calls you, so they have it\." Never promise "I'll let the team know" or "I'll pass that on"\./);
+  once("Never promise \"I'll let the team know\"");
   // Still consistent: item 3 keeps C5 (save first for item 6 callers) and the phone rule stays last.
   assert.match(prompt, /unless item 6 says to save right away; then save first, read the address back after, and add any correction with add_request_note\./);
   assert.ok(prompt.indexOf('THE PHONE NUMBER RULE (') > prompt.indexOf('HOW YOU ACTUALLY TALK') && prompt.indexOf('THE PHONE NUMBER RULE (') < prompt.indexOf('<<<SHOP DETAILS'));
