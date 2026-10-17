@@ -96,11 +96,10 @@ function submitCalls(message) {
 // with no such call it returns '' and the hang-up lead falls back to the caller ID.
 export function confirmedCallback(message) {
   const last = submitCalls(message).at(-1);
-  if (last?.callback_read_back !== true || typeof last.callback_phone !== 'string') return '';
-  if (/[^\d\s()+.\-]/.test(last.callback_phone)) return '';
-  const digits = digitsOf(last.callback_phone);
-  return /^[2-9]\d{9}$/.test(digits) ? digits : '';
+  return last?.callback_read_back === true ? readBackDigits(last.callback_phone) : '';
 }
+// A callback_phone that can count as confirmed (see confirmedCallback), as 10 digits, or ''.
+const readBackDigits = phone => typeof phone === 'string' && !/[^\d\s()+.\-]/.test(phone) && /^[2-9]\d{9}$/.test(digitsOf(phone)) ? digitsOf(phone) : '';
 // The end of the call's transcript (at most max characters, cut at a line or word), so the office sees what the caller said.
 export function transcriptExcerpt(message, max = 1500) {
   const text = (String(message.artifact?.transcript || message.transcript || '').trim() ||
@@ -199,9 +198,45 @@ export function subjectLine(head, topic, address, phone, max = 90) {
 // callback_source existed may carry a number an older transcript rule picked; it is never called confirmed.
 export const hangupCallbackLabel = details => !details.callback_phone ? '' :
   details.callback_source === 'tool' ? 'confirmed on the call' : 'from the call transcript, not verified';
+// The numbers on a saved job, for every alert that names one: the SMS and email card (alertText), the subject, the spoken
+// alert call, the warm-transfer intro, the "nobody picked up" email and the office receipt. callback_phone is the
+// confirmed callback number only with callback_source 'tool': Emma saved it through submit_service_request with
+// callback_read_back true (submit; confirmedCallback for a hang-up lead). Otherwise the office gets the caller ID, said
+// as "calling from", never as the callback number; a callback_phone that was not read back appears only in writing,
+// labelled "not confirmed". A blocked caller ID (no digits, or a carrier's Anonymous/Restricted/Unavailable/Unknown
+// placeholder number) counts as none. Each value is formatPhone'd, or ''.
+const BLOCKED_CALLER_IDS = new Set(['266696687', '7378742833', '86282452253', '8656696']);
+export function callbackNumbers(details) {
+  const id = digitsOf(details.caller_id);
+  const callerId = id.length >= 7 && !BLOCKED_CALLER_IDS.has(id) ? formatPhone(details.caller_id) : '';
+  const confirmed = details.callback_phone && details.callback_source === 'tool' ? formatPhone(details.callback_phone) : '';
+  const unconfirmed = details.callback_phone && !confirmed ? formatPhone(details.callback_phone) : '';
+  const other = !!callerId && digitsOf(details.callback_phone) !== id;
+  return { confirmed, callerId, unconfirmed, other };
+}
+// Written form (SMS, email card, office receipt), e.g. "(615) 555-0142 (confirmed on the call; caller ID (615) 555-0100)",
+// "(615) 555-0100 (caller ID; gave (615) 555-0199, not confirmed)", "(615) 555-0100 (caller ID)".
+export function callbackText(details) {
+  const { confirmed, callerId, unconfirmed, other } = callbackNumbers(details);
+  if (confirmed) return `${confirmed} (confirmed on the call${other ? `; caller ID ${callerId}` : ''})`;
+  if (callerId) return `${callerId} (caller ID${unconfirmed && other ? `; gave ${unconfirmed}, not confirmed` : ''})`;
+  return unconfirmed ? `${unconfirmed} (not confirmed; no caller ID)` : 'no number given (no caller ID)';
+}
+// Spoken form, read by the alert call (to: 'alert') or the warm-transfer intro (to: 'transfer'). formatPhone keeps the
+// digits grouped as (615) 555-0142, which the voice reads in three groups.
+export function spokenCallback(details, to = 'alert') {
+  const { confirmed, callerId } = callbackNumbers(details);
+  const given = !!details.callback_phone;
+  if (confirmed) return to === 'transfer' ? `Their callback number is ${confirmed}.` : `Callback number: ${confirmed}.`;
+  if (callerId) return to === 'transfer' ? `They're calling from ${callerId}.`
+    : `They were calling from ${callerId}. ${given ? 'Their callback number wasn\'t confirmed, so check your email.' : 'They didn\'t give a callback number.'}`;
+  return `There's no ${given ? 'confirmed callback number' : 'number for them'} and no caller ID, so check your email${to === 'transfer' ? ' after the call' : ''}.`;
+}
 export function alertSubject(details, kind = 'new') {
   const urgent = isUrgent(details.issue);
-  const phone = formatPhone(details.callback_phone || details.caller_id) || 'no number given';
+  const numbers = callbackNumbers(details);
+  const phone = kind === 'hangup' ? formatPhone(details.callback_phone || details.caller_id) || 'no number given'
+    : numbers.confirmed || (numbers.callerId ? `${numbers.callerId} (caller ID)` : numbers.unconfirmed ? `${numbers.unconfirmed} (not confirmed)` : 'no number given');
   const unverified = details.callback_phone && details.callback_source !== 'tool' ? ' (not verified)' : '';
   if (kind === 'hangup') return `Caller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${unverified}${SEP}call them back`;
   if (kind === 'unanswered') return subjectLine('UNANSWERED URGENT', details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
@@ -247,7 +282,8 @@ const gsm = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036
 export function alertText(route, details, kind = 'new', channel = 'sms', { delayedMin = 0 } = {}) {
   const urgent = isUrgent(details.issue);
   const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
-  const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
+  // Every alert but a hang-up lead labels its numbers with callbackText.
+  const phone = kind !== 'hangup' ? callbackText(details) : details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
   // A hang-up lead's callback number carries how it was found (hangupCallbackLabel), plus the caller ID when that differs.
   const callerIdToo = details.caller_id && digitsOf(details.caller_id) !== digitsOf(details.callback_phone) ? `; caller ID ${formatPhone(details.caller_id)}` : '';
   const also = kind === 'hangup' && details.callback_phone ? ` (${hangupCallbackLabel(details)}${callerIdToo})` : '';
@@ -318,8 +354,7 @@ Reference: ${id.slice(0, 8)}`
 // stage: primary, backup (the primary ring went unanswered) or retry (the primary, once more).
 export function alertCall(route, details, phoneNumberId, to, missedTransfer = false, stage = 'primary') {
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
-  const phone = details.callback_phone ? formatPhone(details.callback_phone) : details.caller_id ? formatPhone(details.caller_id) : 'no number given';
-  const job = `${details.name}, at ${details.address || 'no address given'}. ${issue}. Callback number: ${phone}.`;
+  const job = `${details.name}, at ${details.address || 'no address given'}. ${issue}. ${spokenCallback(details, 'alert')}`;
   const missed = (missedTransfer ? ' I tried to put them through to you live but couldn\'t reach you, so please call them back.' : '') +
     (stage === 'backup' ? ' I couldn\'t reach the main number, so I\'m calling you as the backup.' : stage === 'retry' ? ' This is my second try; I couldn\'t reach you a few minutes ago.' : '');
   return {
@@ -329,7 +364,8 @@ export function alertCall(route, details, phoneNumberId, to, missedTransfer = fa
       firstMessage: `Hi, this is an urgent job alert for ${route.business}. ${job}${missed} It's also in your email. Want me to repeat that?`,
       voice: { provider: '11labs', voiceId: 'EXAVITQu4vr4xnSDxMaL', model: 'eleven_turbo_v2_5' },
       model: { provider: 'openai', model: 'gpt-4.1', maxTokens: 120, messages: [{ role: 'system', content:
-        `You just delivered this urgent job alert for ${route.business}: ${job} If asked, repeat it slowly, especially the callback number. ` +
+        `You just delivered this urgent job alert for ${route.business}: ${job} If asked, repeat it slowly, especially the number. ` +
+        'Never call a number the callback number unless the alert above does. ' +
         'You cannot do anything else. When they say thanks, no, or goodbye, say a short goodbye and end the call. ' +
         // Ending the call is read as "a person heard it" (answeredCall), so a voicemail must never be ended by the assistant.
         'If you only hear a voicemail greeting, a beep or a recording, never end the call yourself; just wait.' }] }
@@ -344,9 +380,8 @@ export const isE164 = value => typeof value === 'string' && /^\+[1-9]\d{7,14}$/.
 // caller is connected. Voicemail, no answer or a decline returns the caller to Emma (fallbackPlan).
 export function transferDestination(route, details) {
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
-  const phone = details.callback_phone ? formatPhone(details.callback_phone) : details.caller_id ? formatPhone(details.caller_id) : 'no number given';
   const intro = `Hi, it's Emma from ${route.business} with an urgent caller on hold: ${details.name}, at ${details.address || 'no address given'}. ${issue}. ` +
-    `Their number is ${phone}. Can you take the call now?`;
+    `${spokenCallback(details, 'transfer')} Can you take the call now?`;
   return {
     type: 'number', number: route.transfer, callerId: '{{phoneNumber.number}}',
     transferPlan: {
@@ -361,6 +396,7 @@ export function transferDestination(route, details) {
           'If they accept (yes, sure, go ahead, put them through), call transferSuccessful right away without saying more. ' +
           'If you hear voicemail, a recorded greeting, an automated message or a busy signal, call transferCancel at once and say nothing about the caller. ' +
           'If they say no, they cannot, or ask you to take a message, call transferCancel. If asked, repeat the details slowly, especially the number. ' +
+          'Never call a number the callback number unless the intro above does. ' +
           'Keep every reply to one short sentence.' }] }
       },
       fallbackPlan: { message: 'I couldn\'t get the owner on the line just now. Your request is already saved for the team. One moment.', endCallEnabled: false }
@@ -591,7 +627,7 @@ export function createApp(env = process.env, send = fetch) {
 Name: ${details.name}
 Address: ${details.address}
 Issue: ${details.issue}
-Callback: ${details.callback_phone || 'Not provided'}
+Phone: ${callbackText(details)}
 
 This records a request only. It does not confirm an appointment, dispatch, transfer, or callback.` };
     try {
@@ -1281,6 +1317,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     details.is_test = args.is_test;
     if (args.callback_phone != null && (typeof args.callback_phone !== 'string' || args.callback_phone.length > 100)) return failure('Invalid callback phone');
     details.callback_phone = args.callback_phone || '';
+    // Confirmed only when Emma read the number back and the caller said yes (callback_read_back true); see callbackNumbers.
+    details.callback_source = args.callback_read_back === true && readBackDigits(details.callback_phone) ? 'tool' : '';
     if (args.preferred_time != null && (typeof args.preferred_time !== 'string' || args.preferred_time.length > 200)) return failure('Invalid preferred time');
     details.preferred_time = (args.preferred_time || '').trim();
     // Job context from the receptionist's follow-up questions, so the office can plan the day.

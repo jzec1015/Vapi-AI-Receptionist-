@@ -10,7 +10,7 @@ const key = 'synthetic-test-key-not-used-in-production';
 const route = { business: 'Gold Star Plumbing', email: ['office@example.com'], sms: [], call: ['+15550000999'], backup: '+15550000888' };
 const baseEnv = { VAPI_API_KEY: 'fixture-only', ALERT_CALL_FROM_ID: 'from-line', RESEND_API_KEY: 'fixture-only', EMAIL_FROM: 'alerts@example.com', OFFICE_EMAIL: 'ops@example.com' };
 const intake = { name: 'Linda Harper', address: '1412 Dickerson Pike, Nashville, TN 37207', issue: 'URGENT - burst pipe', is_test: false,
-  callback_phone: '6155550142', email_status: 'skipped_emergency' };
+  callback_phone: '6155550142', callback_read_back: true, email_status: 'skipped_emergency' };
 const call = (id, extra = {}) => ({ id, assistantId: 'client-a', type: 'inboundPhoneCall', customer: { number: '+16155550100' }, ...extra });
 const toolCall = (id, args) => ({ message: { type: 'tool-calls', call: call(id), toolCallList: [{ id: 'tool-1', function: { name: 'submit_service_request', arguments: args } }] } });
 const report = (id, durationSeconds, extra = {}) => ({ message: { type: 'end-of-call-report', durationSeconds, endedReason: 'customer-ended-call', call: call(id), ...extra } });
@@ -40,20 +40,20 @@ async function fixture(t, { routes = { 'client-a': route }, env = {}, rings = {}
 const ended = (endedReason, seconds = 40) => ({ status: 'ended', endedReason, startedAt: '2026-10-16T10:00:00.000Z', endedAt: new Date(Date.parse('2026-10-16T10:00:00.000Z') + seconds * 1000).toISOString() });
 
 test('lock-screen subjects: what, where, who to call, never over 90 characters', () => {
-  assert.equal(alertSubject({ ...intake, notes: [] }), 'URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142');
-  assert.equal(alertSubject({ ...intake, issue: 'Water heater quote', notes: [] }), 'New job – Water heater quote – 1412 Dickerson Pike – (615) 555-0142');
-  assert.equal(alertSubject({ ...intake, notes: [] }, 'unanswered'), 'UNANSWERED URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142');
-  assert.equal(alertSubject({ ...intake, issue: 'Faucet', notes: ['Gate code 4471'] }, 'note'), 'Update – Gate code 4471 – 1412 Dickerson Pike – (615) 555-0142');
+  assert.equal(alertSubject({ ...intake, callback_source: 'tool', notes: [] }), 'URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142');
+  assert.equal(alertSubject({ ...intake, callback_source: 'tool', issue: 'Water heater quote', notes: [] }), 'New job – Water heater quote – 1412 Dickerson Pike – (615) 555-0142');
+  assert.equal(alertSubject({ ...intake, callback_source: 'tool', notes: [] }, 'unanswered'), 'UNANSWERED URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142');
+  assert.equal(alertSubject({ ...intake, callback_source: 'tool', issue: 'Faucet', notes: ['Gate code 4471'] }, 'note'), 'Update – Gate code 4471 – 1412 Dickerson Pike – (615) 555-0142');
   assert.equal(alertSubject({ issue: 'x', caller_id: '+16155550100', greeting_hangup: true }, 'hangup'), 'Caller hung up during greeting – (615) 555-0100 – call them back');
-  assert.equal(alertSubject({ ...intake, issue: 'Water heater is 15 years old', job_type: 'Water heater replacement', notes: [] }),
+  assert.equal(alertSubject({ ...intake, callback_source: 'tool', issue: 'Water heater is 15 years old', job_type: 'Water heater replacement', notes: [] }),
     'New job – Water heater is 15 years old – 1412 Dickerson Pike – (615) 555-0142', 'high-value subjects stay "New job"');
-  assert.equal(alertSubject({ ...intake, job_size: 'Big job (half day+)', notes: [] }), 'URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142', 'urgent subject unchanged');
-  assert.ok(alertSubject({ ...intake, issue: 'repipe ' + 'the whole downstairs bathroom and kitchen '.repeat(4), notes: [] }).length <= 90);
-  const long = alertSubject({ ...intake, issue: 'URGENT - ' + 'water pouring through the ceiling of the downstairs bathroom '.repeat(4),
+  assert.equal(alertSubject({ ...intake, callback_source: 'tool', job_size: 'Big job (half day+)', notes: [] }), 'URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142', 'urgent subject unchanged');
+  assert.ok(alertSubject({ ...intake, callback_source: 'tool', issue: 'repipe ' + 'the whole downstairs bathroom and kitchen '.repeat(4), notes: [] }).length <= 90);
+  const long = alertSubject({ ...intake, callback_source: 'tool', issue: 'URGENT - ' + 'water pouring through the ceiling of the downstairs bathroom '.repeat(4),
     address: '98765 Old Hickory Boulevard Apartment 1204 Building C', callback_phone: '', caller_id: '+16155550100', notes: [] });
   assert.ok(long.length <= 90, long);
-  assert.equal(long, "URGENT – water pouring through the… – 98765 Old Hickory Boulevard… – (615) 555-0100");
-  const noAddress = alertSubject({ ...intake, address: '', notes: [] });
+  assert.equal(long, "URGENT – water pouring… – 98765 Old Hickory Boulevard… – (615) 555-0100 (caller ID)");
+  const noAddress = alertSubject({ ...intake, callback_source: 'tool', address: '', notes: [] });
   assert.equal(noAddress, 'URGENT – burst pipe – (615) 555-0142');
 });
 
@@ -294,4 +294,33 @@ test('a single-tier digest lists only that tier\'s jobs, in save order', () => {
     { calls: 2, jobs: [job('Ann Cole', 'Leaky faucet'), job('Bo Diaz', 'Toilet runs')], hangups: [] });
   assert.equal(subject, 'Emma yesterday – 2 calls, 2 jobs saved');
   assert.match(text, /Jobs saved: 2\nUrgent jobs: 0\nHigh-value jobs: 0\nRoutine jobs: 2\n- Routine – Ann Cole – 9 Oak St – Leaky faucet\n- Routine – Bo Diaz – 9 Oak St – Toilet runs\nHang-ups: 0\n/);
+});
+
+test('an unanswered urgent job whose number was not read back: the email, backup and retry name the caller ID, never as the callback number', async t => {
+  const rings = { 'ring-1': ended('customer-did-not-answer', 30), 'ring-2': ended('customer-busy', 0) };
+  const { post, app, sent, emails } = await fixture(t, { rings });
+  const now = Date.now();
+  await post(toolCall('nr-1', { ...intake, callback_phone: '6155550199', callback_read_back: false }));
+  assert.deepEqual(await app.sweepEscalations(now + 3 * MIN), ['escalated']);
+  const unanswered = emails().filter(e => e.body.subject.startsWith('UNANSWERED URGENT – '));
+  assert.equal(unanswered[0].body.subject, 'UNANSWERED URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0100 (caller ID)');
+  assert.match(unanswered[0].body.text, /\nLinda Harper - \(615\) 555-0100 \(caller ID; gave \(615\) 555-0199, not confirmed\)\n/);
+  assert.deepEqual(await app.sweepEscalations(now + 6 * MIN), ['retried']);
+  const spoken = sent.filter(s => s.url === 'https://api.vapi.ai/call').map(s => s.body.assistant.firstMessage);
+  assert.equal(spoken.length, 3);
+  for (const text of spoken) {
+    assert.match(text, /burst pipe\. They were calling from \(615\) 555-0100\. Their callback number wasn't confirmed, so check your email\./);
+    assert.doesNotMatch(text, /Callback number:|555-0199/);
+  }
+});
+
+test('a confirmed callback number different from the caller ID is the one every ring says', async t => {
+  const { post, sent, emails } = await fixture(t);
+  await post(toolCall('cf-1', { ...intake, callback_phone: '615-555-0199', callback_read_back: true }));
+  const [ring] = sent.filter(s => s.url === 'https://api.vapi.ai/call');
+  assert.match(ring.body.assistant.firstMessage, /burst pipe\. Callback number: \(615\) 555-0199\. It's also in your email\./);
+  assert.doesNotMatch(ring.body.assistant.firstMessage, /555-0100|calling from/);
+  const card = emails().find(e => e.body.to[0] === 'office@example.com');
+  assert.equal(card.body.subject, 'URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0199');
+  assert.match(card.body.text, /\nLinda Harper - \(615\) 555-0199 \(confirmed on the call; caller ID \(615\) 555-0100\)\n/);
 });

@@ -130,7 +130,7 @@ test('a held alert waits for its window and survives a restart', async t => {
 
 test('transfer destination falls back to caller ID when no callback number was given', () => {
   const { transferPlan } = transferDestination(route, { ...intake, callback_phone: '', caller_id: '+16155550100' });
-  assert.match(transferPlan.transferAssistant.model.messages[0].content, /Their number is \(615\) 555-0100\./);
+  assert.match(transferPlan.transferAssistant.model.messages[0].content, /They're calling from \(615\) 555-0100\. Can you take the call now\?/);
 });
 
 test('an urgent test call on a transfer line never rings, transfers to or alerts the owner', async t => {
@@ -146,4 +146,67 @@ test('an urgent test call on a transfer line never rings, transfers to or alerts
   }
   assert.deepEqual(await app.sweepTransfers(Date.now() + 3600000), []);
   assert.deepEqual(sent, []);
+});
+
+// The callback rule (callbackNumbers): only a callback_phone saved with callback_read_back true is "the callback number";
+// otherwise the owner hears "calling from <caller ID>"; with neither, there is no number and the email is the place to look.
+test('the transfer intro, the alert call and the office texts name the callback number only when it was read back', async t => {
+  const full = { ...route, sms: ['+15550000001'], email: ['office@example.com'] };
+  const env = { TELNYX_API_KEY: 'fixture-only', TELNYX_FROM: '+15550000000', OFFICE_EMAIL: 'ops@example.com' };
+  const { callback_read_back, ...unconfirmed } = intake;
+  const cases = [
+    { name: 'confirmed, differs from the caller ID', args: { callback_phone: '(615) 555-0199', callback_read_back: true }, from: '+16155550100',
+      intro: 'Their callback number is (615) 555-0199. Can you take the call now?', alert: 'Callback number: (615) 555-0199. I tried',
+      line: 'Linda Harper - (615) 555-0199 (confirmed on the call; caller ID (615) 555-0100)', subject: '– (615) 555-0199', receipt: 'Phone: (615) 555-0199 (confirmed on the call; caller ID (615) 555-0100)' },
+    { name: 'confirmed, same as the caller ID', args: { callback_phone: '6155550100', callback_read_back: true }, from: '+16155550100',
+      intro: 'Their callback number is (615) 555-0100.', alert: 'Callback number: (615) 555-0100.',
+      line: 'Linda Harper - (615) 555-0100 (confirmed on the call)\n', subject: '– (615) 555-0100', receipt: 'Phone: (615) 555-0100 (confirmed on the call)\n' },
+    { name: 'no callback_phone', args: { callback_phone: '', callback_read_back: false }, from: '+16155550100',
+      intro: 'They\'re calling from (615) 555-0100. Can you take the call now?', alert: 'They were calling from (615) 555-0100. They didn\'t give a callback number.',
+      line: 'Linda Harper - (615) 555-0100 (caller ID)\n', subject: '– (615) 555-0100 (caller ID)', receipt: 'Phone: (615) 555-0100 (caller ID)\n' },
+    { name: 'callback_read_back false', args: { callback_phone: '6155550199', callback_read_back: false }, from: '+16155550100',
+      intro: 'They\'re calling from (615) 555-0100. Can you take the call now?', alert: 'They were calling from (615) 555-0100. Their callback number wasn\'t confirmed, so check your email.',
+      line: 'Linda Harper - (615) 555-0100 (caller ID; gave (615) 555-0199, not confirmed)', subject: '– (615) 555-0100 (caller ID)', receipt: 'Phone: (615) 555-0100 (caller ID; gave (615) 555-0199, not confirmed)' },
+    { name: 'callback_read_back missing', args: { callback_phone: '6155550199' }, from: '+16155550100',
+      intro: 'They\'re calling from (615) 555-0100.', alert: 'They were calling from (615) 555-0100. Their callback number wasn\'t confirmed',
+      line: '(caller ID; gave (615) 555-0199, not confirmed)', subject: '– (615) 555-0100 (caller ID)', receipt: 'Phone: (615) 555-0100 (caller ID; gave' },
+    { name: 'read back, but not a 10-digit number', args: { callback_phone: '555-0199 ext 4', callback_read_back: true }, from: '+16155550100',
+      intro: 'They\'re calling from (615) 555-0100.', alert: 'They were calling from (615) 555-0100. Their callback number wasn\'t confirmed',
+      line: '(615) 555-0100 (caller ID; gave 555-0199 ext 4, not confirmed)', subject: '– (615) 555-0100 (caller ID)', receipt: 'Phone: (615) 555-0100 (caller ID; gave 555-0199 ext 4, not confirmed)' },
+    { name: 'blocked caller ID, nothing given', args: { callback_phone: '', callback_read_back: false }, from: '+266696687',
+      intro: 'There\'s no number for them and no caller ID, so check your email after the call. Can you take the call now?',
+      alert: 'There\'s no number for them and no caller ID, so check your email. I tried', line: 'Linda Harper - no number given (no caller ID)\n',
+      subject: '– no number given', receipt: 'Phone: no number given (no caller ID)\n' },
+    { name: 'no caller ID at all, number not read back', args: { callback_phone: '6155550199', callback_read_back: false }, from: undefined,
+      intro: 'There\'s no confirmed callback number and no caller ID, so check your email after the call.',
+      alert: 'There\'s no confirmed callback number and no caller ID, so check your email.', line: 'Linda Harper - (615) 555-0199 (not confirmed; no caller ID)\n',
+      subject: '– (615) 555-0199 (not confirmed)', receipt: 'Phone: (615) 555-0199 (not confirmed; no caller ID)\n' },
+    { name: 'anonymous caller ID, confirmed number', args: { callback_phone: '6155550199', callback_read_back: true }, from: 'anonymous',
+      intro: 'Their callback number is (615) 555-0199.', alert: 'Callback number: (615) 555-0199.', line: 'Linda Harper - (615) 555-0199 (confirmed on the call)\n',
+      subject: '– (615) 555-0199', receipt: 'Phone: (615) 555-0199 (confirmed on the call)\n' }
+  ];
+  for (const [i, c] of cases.entries()) {
+    const { post, sent, alertCalls } = await fixture(t, { routes: { 'client-a': full }, env });
+    const id = `cb-${i}`;
+    const customer = c.from === undefined ? {} : { number: c.from };
+    const msg = (type, extra) => ({ message: { type, call: call(id, { customer }), ...extra } });
+    await post(msg('tool-calls', { toolCallList: [{ id: 'tool-1', function: { name: 'submit_service_request', arguments: { ...unconfirmed, ...c.args } } }] }));
+    const { destination } = await (await post(msg('transfer-destination-request'))).json();
+    const prompt = destination.transferPlan.transferAssistant.model.messages[0].content;
+    assert.ok(prompt.includes(c.intro), `${c.name}: intro\n${prompt}`);
+    await post(msg('tool-calls', { toolCallList: [{ id: 'tool-2', function: { name: 'transfer_no_answer', arguments: {} } }] }));
+    const spoken = alertCalls()[0].body.assistant;
+    assert.ok(spoken.firstMessage.includes(c.alert), `${c.name}: alert call\n${spoken.firstMessage}`);
+    assert.ok(spoken.model.messages[0].content.includes(c.alert.replace(/ I tried$/, '')), `${c.name}: alert call prompt`);
+    if (!c.args.callback_read_back || !c.alert.startsWith('Callback number')) {
+      // Never "callback number: <caller ID>" / "their callback number is <caller ID>" when nothing was read back.
+      for (const text of [prompt, spoken.firstMessage]) assert.doesNotMatch(text, /[Cc]allback number(:| is) \(/, c.name);
+    }
+    const sms = sent.filter(s => s.url.includes('telnyx'));
+    assert.equal(sms.length, 1); assert.ok(sms[0].body.text.includes(c.line), `${c.name}: sms\n${sms[0].body.text}`);
+    const card = sent.find(s => s.url.includes('resend') && s.body.to?.[0] === 'office@example.com');
+    assert.ok(card.body.text.includes(c.line), `${c.name}: email card`); assert.ok(card.body.subject.endsWith(c.subject.replace(/\n$/, '')), `${c.name}: subject ${card.body.subject}`);
+    const receipt = sent.find(s => s.url.includes('resend') && s.body.subject === 'Anchorline service request received');
+    assert.ok(receipt.body.text.includes(c.receipt), `${c.name}: office receipt\n${receipt.body.text}`);
+  }
 });

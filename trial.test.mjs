@@ -13,7 +13,7 @@ const key = 'synthetic-test-key-not-used-in-production';
 const routes = JSON.stringify({ 'gold-star': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'] } });
 const baseEnv = { VAPI_WEBHOOK_SECRET: key, ALERT_ROUTES: routes, TELNYX_API_KEY: 'fixture-only', TELNYX_FROM: '+15550000000',
   RESEND_API_KEY: 'fixture-only', EMAIL_FROM: 'alerts@example.com', OFFICE_EMAIL: 'jake@example.com' };
-const intake = { name: 'Linda Harper', address: '48 Birch Road', issue: 'Kitchen faucet dripping', is_test: false, callback_phone: '6155550142',
+const intake = { name: 'Linda Harper', address: '48 Birch Road', issue: 'Kitchen faucet dripping', is_test: false, callback_phone: '6155550142', callback_read_back: true,
   email_status: 'declined' };
 const call = (id, assistantId) => ({ id, assistantId, type: 'inboundPhoneCall', customer: { number: '+16155550100' } });
 const toolCall = (id, assistantId, args = intake) => ({ message: { type: 'tool-calls', call: call(id, assistantId),

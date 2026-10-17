@@ -23,10 +23,10 @@ const call = (id, extra = {}) => ({ id, assistantId: emma, type: 'inboundPhoneCa
 const tool = (id, name, args) => ({ message: { type: 'tool-calls', call: call(id), toolCallList: [{ id: 'tool-1', function: { name, arguments: args } }] } });
 const report = (id, durationSeconds, extra = {}) => ({ message: { type: 'end-of-call-report', durationSeconds, endedReason: 'customer-ended-call', call: call(id),
   analysis: { summary: 'Caller reported a leak and hung up.' }, ...extra } });
-const routine = { name: 'Linda Harper', address: '48 Birch Road', issue: 'Kitchen faucet dripping', is_test: false, callback_phone: '6155550142',
+const routine = { name: 'Linda Harper', address: '48 Birch Road', issue: 'Kitchen faucet dripping', is_test: false, callback_phone: '6155550142', callback_read_back: true,
   email: 'linda@example.com', email_confirmed: true, email_status: 'confirmed', preferred_time: 'Tuesday morning', job_type: 'Repair', job_size: 'Quick' };
 const urgent = { name: 'Linda Harper', address: '48 Birch Road', issue: 'URGENT - water spraying under kitchen sink', is_test: false,
-  callback_phone: '6155550142', email_status: 'skipped_emergency' };
+  callback_phone: '6155550142', callback_read_back: true, email_status: 'skipped_emergency' };
 
 const scenarios = {
   'normal call': [tool('n-1', 'submit_service_request', routine), tool('n-1', 'submit_service_request', routine), report('n-1', 120)],
@@ -63,6 +63,9 @@ async function run(t, factory, steps) {
     const i = ids.findIndex(x => x.startsWith(m) || m.startsWith(x)); if (i >= 0) return `ID${i}`; ids.push(m); return `ID${ids.length - 1}`; });
   return JSON.parse(text);
 }
+// The alert-callback change asks for "the number", and never to call a number the callback number unless the alert does.
+const CALLBACK_RULE = [' especially the number. Never call a number the callback number unless the alert above does.', ' especially the callback number.'];
+const callbackRule = s => s.url === 'https://api.vapi.ai/call' ? JSON.parse(JSON.stringify(s).replace(...CALLBACK_RULE)) : s;
 const isAlert = s => (s.url.includes('telnyx')) || (s.url.includes('resend') && s.headers['Idempotency-Key'].includes('-alert-'));
 // Office alert wording is allowed to differ; who gets what, from whom, and with which idempotency key may not.
 // v1.8 adds one sentence to the spoken alert's system prompt (never end a voicemail; ending the call now means "heard").
@@ -79,7 +82,7 @@ for (const [name, steps] of Object.entries(scenarios)) {
     const after = await run(t, createApp, steps);
     assert.ok(name === 'test call' || before.sent.length > 0, "scenario sends something");
     assert.deepEqual(after.replies, before.replies);
-    assert.deepEqual(after.sent.map(shape), before.sent.map(shape));
+    assert.deepEqual(after.sent.map(callbackRule).map(shape), before.sent.map(shape));
     assert.ok(!after.sent.some(s => s.method === 'GET'), 'no Vapi call lookups without a transfer route');
   });
 }

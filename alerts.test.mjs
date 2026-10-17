@@ -5,12 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
-import { createApp, alertText, alertSubject, digestEmail, confirmedCallback, transcriptExcerpt, priorityTier } from './server.mjs';
+import { createApp, alertText, alertSubject, digestEmail, confirmedCallback, transcriptExcerpt, priorityTier, callbackNumbers, callbackText, spokenCallback } from './server.mjs';
 
 const key = 'synthetic-test-key-not-used-in-production';
 const routes = JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'] } });
 const alertEnv = { ALERT_ROUTES: routes, TELNYX_API_KEY: 'fixture-only', TELNYX_FROM: '+15550000000', RESEND_API_KEY: 'fixture-only', EMAIL_FROM: 'alerts@example.com' };
-const intake = { name: 'Linda Harper', address: '48 Birch Road', issue: 'URGENT - water under kitchen sink', is_test: false, callback_phone: '6155550142' };
+const intake = { name: 'Linda Harper', address: '48 Birch Road', issue: 'URGENT - water under kitchen sink', is_test: false, callback_phone: '6155550142', callback_read_back: true };
 const toolCall = (id, name, args, call = {}) => ({ message: { type: 'tool-calls', call: { id, assistantId: 'client-a', customer: { number: '+16155550100' }, ...call },
   toolCallList: [{ id: 'tool-1', function: { name, arguments: args } }] } });
 async function fixture(t, extra = {}) {
@@ -372,9 +372,9 @@ test('priority tiers: urgent, high-value (big job or big-ticket work), routine',
   for (const [details, tier, why] of cases) assert.equal(priorityTier(details), tier, why);
 });
 
-test('the job card email shows the priority tier under the heading; the SMS is unchanged', () => {
+test('the job card email shows the priority tier under the heading; the SMS has no tier', () => {
   const route = { business: 'Gold Star Plumbing' };
-  const base = { name: 'Linda Harper', address: '48 Birch Road', callback_phone: '6155550142', notes: [], job_type: '', job_size: '', job_details: '' };
+  const base = { name: 'Linda Harper', address: '48 Birch Road', callback_phone: '6155550142', callback_source: 'tool', notes: [], job_type: '', job_size: '', job_details: '' };
   const big = { ...base, issue: 'Galvanized pipes rusting', job_type: 'Whole-house repipe', job_size: 'Big job (half day+)', preferred_time: 'Friday' };
   assert.match(alertText(route, big, 'new', 'email'), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: High-value job\nLinda Harper/);
   assert.match(alertText(route, { ...base, issue: 'URGENT - burst pipe' }, 'new', 'email'), /^Anchorline AI: URGENT call - Gold Star Plumbing\nPriority: Urgent\n/);
@@ -383,12 +383,79 @@ test('the job card email shows the priority tier under the heading; the SMS is u
   assert.doesNotMatch(alertText(route, { ...big, notes: ['Gate code'] }, 'note', 'email'), /Priority/);
   assert.doesNotMatch(alertText(route, { ...base, issue: 'Hung up before giving details', caller_id: '+16155550100' }, 'hangup', 'email'), /Priority/);
   for (const issue of ['URGENT - burst pipe', 'Dripping faucet']) assert.doesNotMatch(alertText(route, { ...base, issue }), /Priority/);
-  assert.equal(alertText(route, big), 'Anchorline AI: New call - Gold Star Plumbing\nLinda Harper - (615) 555-0142\n48 Birch Road\nGalvanized pipes rusting\n' +
+  assert.equal(alertText(route, big), 'Anchorline AI: New call - Gold Star Plumbing\nLinda Harper - (615) 555-0142 (confirmed on the call)\n48 Birch Road\nGalvanized pipes rusting\n' +
     'Job: Whole-house repipe - Big job (half day+)\nWants: Friday\nReply STOP to opt out');
-  // A long high-value SMS keeps exactly main's (v1.8.0) text: same Job, Details and Wants content up to the 280-character cut.
+  // A long high-value SMS keeps main's (v1.8.0) lines up to the 280-character cut; the number now says it was confirmed on the call.
   const long = { name: 'Dana Whitfield', address: '2210 Belmont Blvd, Nashville, TN 37212', issue: 'Water heater is 14 years old and leaking from the bottom',
-    callback_phone: '6155550187', job_type: 'Water heater replacement', job_size: 'Big job (half day+)', notes: [],
+    callback_phone: '6155550187', callback_source: 'tool', job_type: 'Water heater replacement', job_size: 'Big job (half day+)', notes: [],
     job_details: '50-gallon gas tank in the garage, wants a quote on tankless too', preferred_time: 'Tomorrow morning' };
-  assert.equal(alertText(route, long), 'Anchorline AI: New call - Gold Star Plumbing\nDana Whitfield - (615) 555-0187\n2210 Belmont Blvd, Nashville, TN 37212\n' +
-    'Water heater is 14 years old and leaking from the bottom\nJob: Water heater replacement - Big job (half day+)\nDetails: 50-gallon gas tank in the garage, wants a quot\nReply STOP to opt out');
+  assert.equal(alertText(route, long), 'Anchorline AI: New call - Gold Star Plumbing\nDana Whitfield - (615) 555-0187 (confirmed on the call)\n2210 Belmont Blvd, Nashville, TN 37212\n' +
+    'Water heater is 14 years old and leaking from the bottom\nJob: Water heater replacement - Big job (half day+)\nDetails: 50-gallon gas tank in \nReply STOP to opt out');
+});
+
+test('callbackNumbers: callback_phone is the callback number only when saved with callback_read_back true (callback_source tool)', () => {
+  const job = extra => ({ name: 'Linda Harper', address: '48 Birch Road', issue: 'URGENT - burst pipe', notes: ['Gate code 4471'], caller_id: '+16155550100', ...extra });
+  const confirmed = job({ callback_phone: '6155550199', callback_source: 'tool' });
+  assert.deepEqual(callbackNumbers(confirmed), { confirmed: '(615) 555-0199', callerId: '(615) 555-0100', unconfirmed: '', other: true });
+  assert.equal(callbackText(confirmed), '(615) 555-0199 (confirmed on the call; caller ID (615) 555-0100)');
+  assert.equal(spokenCallback(confirmed), 'Callback number: (615) 555-0199.');
+  assert.equal(spokenCallback(confirmed, 'transfer'), 'Their callback number is (615) 555-0199.');
+  // Not read back (no callback_source, or anything but 'tool'): the caller ID, said as "calling from".
+  for (const source of [undefined, '', 'transcript']) {
+    const notRead = job({ callback_phone: '6155550199', callback_source: source });
+    assert.equal(callbackText(notRead), '(615) 555-0100 (caller ID; gave (615) 555-0199, not confirmed)', String(source));
+    assert.equal(spokenCallback(notRead), 'They were calling from (615) 555-0100. Their callback number wasn\'t confirmed, so check your email.');
+    assert.equal(spokenCallback(notRead, 'transfer'), 'They\'re calling from (615) 555-0100.');
+    assert.equal(alertSubject(notRead), 'URGENT – burst pipe – 48 Birch Road – (615) 555-0100 (caller ID)');
+    assert.equal(alertSubject(notRead, 'note'), 'URGENT update – Gate code 4471 – 48 Birch Road – (615) 555-0100 (caller ID)');
+  }
+  const none = job({ callback_phone: '' });
+  assert.equal(callbackText(none), '(615) 555-0100 (caller ID)');
+  assert.equal(spokenCallback(none), 'They were calling from (615) 555-0100. They didn\'t give a callback number.');
+  // A blocked or empty caller ID is no caller ID.
+  for (const caller_id of ['', undefined, 'anonymous', 'Restricted', '+266696687', '+17378742833', '+86282452253', '+8656696', '+1 ']) {
+    const blocked = job({ callback_phone: '', caller_id });
+    assert.equal(callbackNumbers(blocked).callerId, '', String(caller_id));
+    assert.equal(callbackText(blocked), 'no number given (no caller ID)');
+    assert.equal(spokenCallback(blocked), 'There\'s no number for them and no caller ID, so check your email.');
+    assert.equal(spokenCallback(blocked, 'transfer'), 'There\'s no number for them and no caller ID, so check your email after the call.');
+    assert.equal(alertSubject(blocked), 'URGENT – burst pipe – 48 Birch Road – no number given');
+    assert.equal(alertText({ business: 'Gold Star Plumbing' }, blocked).split('\n')[1], 'Linda Harper - no number given (no caller ID)');
+    const given = job({ callback_phone: '6155550199', caller_id });
+    assert.equal(callbackText(given), '(615) 555-0199 (not confirmed; no caller ID)');
+    assert.equal(spokenCallback(given), 'There\'s no confirmed callback number and no caller ID, so check your email.');
+    assert.equal(alertSubject(given), 'URGENT – burst pipe – 48 Birch Road – (615) 555-0199 (not confirmed)');
+  }
+});
+
+test('the SMS and email card label every number the same way; hang-up leads keep their own labels', () => {
+  const route = { business: 'Gold Star Plumbing' };
+  const job = { name: 'Linda Harper', address: '48 Birch Road', issue: 'URGENT - burst pipe', notes: ['Gate code 4471'], caller_id: '+16155550100' };
+  const cases = [
+    [{ callback_phone: '6155550199', callback_source: 'tool' }, 'Linda Harper - (615) 555-0199 (confirmed on the call; caller ID (615) 555-0100)'],
+    [{ callback_phone: '6155550100', callback_source: 'tool' }, 'Linda Harper - (615) 555-0100 (confirmed on the call)'],
+    [{ callback_phone: '6155550199' }, 'Linda Harper - (615) 555-0100 (caller ID; gave (615) 555-0199, not confirmed)'],
+    [{ callback_phone: '6155550100' }, 'Linda Harper - (615) 555-0100 (caller ID)'],
+    [{ callback_phone: '' }, 'Linda Harper - (615) 555-0100 (caller ID)']
+  ];
+  for (const [extra, line] of cases) for (const kind of ['new', 'note']) for (const channel of ['sms', 'email'])
+    assert.equal(alertText(route, { ...job, ...extra }, kind, channel).split('\n').find(l => l.startsWith('Linda Harper')), line, `${kind} ${channel} ${JSON.stringify(extra)}`);
+  // The SMS keeps its GSM-7 alphabet and 280-character cut with the longest label.
+  const sms = alertText(route, { ...job, callback_phone: '6155550199', callback_source: 'tool', issue: 'URGENT - ' + 'water everywhere '.repeat(30) });
+  assert.ok(sms.length <= 280 + '\nReply STOP to opt out'.length); assert.match(sms, /^[\n\x20-\x7E]+$/);
+  // Hang-up leads are unchanged (hangupCallbackLabel).
+  assert.equal(alertText(route, { ...job, issue: 'Hung up', callback_phone: '', callback_source: '' }, 'hangup').split('\n')[1], 'Linda Harper - (615) 555-0100 (caller ID)');
+  assert.equal(alertText(route, { ...job, issue: 'Hung up', callback_phone: '6155550199', callback_source: 'tool' }, 'hangup').split('\n')[1],
+    'Linda Harper - (615) 555-0199 (confirmed on the call; caller ID (615) 555-0100)');
+});
+
+test('a saved job keeps callback_source tool only when Emma sent callback_read_back true with a 10-digit number', async t => {
+  const { post, dir } = await fixture(t);
+  const saves = { 'rb-1': { callback_read_back: true }, 'rb-2': { callback_read_back: false }, 'rb-3': {}, 'rb-4': { callback_read_back: 'true' },
+    'rb-5': { callback_phone: '555-0199', callback_read_back: true }, 'rb-6': { callback_phone: '', callback_read_back: true } };
+  for (const [id, extra] of Object.entries(saves)) await post(toolCall(id, 'submit_service_request', { ...intake, callback_read_back: undefined, ...extra }));
+  const db = new DatabaseSync(join(dir, 'requests.sqlite'), { readOnly: true });
+  t.after(() => db.close());
+  const source = id => JSON.parse(db.prepare('SELECT details FROM requests WHERE call_id = ?').get(id).details).callback_source;
+  assert.deepEqual(Object.keys(saves).map(source), ['tool', '', '', '', '', '']);
 });
