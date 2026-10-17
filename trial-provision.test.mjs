@@ -852,16 +852,11 @@ test('read-back fixes: phone then address read-back before any follow-up, only a
   once('Only a plain yes to the read-back itself counts');
   once('After a bare no, ask for the number again.');
   // H3 (edit 1): the address step is stated once, in THE PHONE NUMBER RULE, right after the yes; item 6 callers are saved in that same turn and the ringing line waits for the address yes.
-  // Run 3/6 fix: item 6 callers are saved FIRST in the reply that asks the address read-back (a tool call isn't speech), a correction goes in a note, and the ringing line waits.
-  const address = "After their yes or the fallback, if they gave an address not yet read back, your very next reply is ONLY its read-back question, before any follow-up. If item 6 saves them right away, that same reply calls submit_service_request FIRST, then asks the address question; a tool call isn't speech, so never hold the save for the next turn. Add any address correction with add_request_note, and say the ringing line only after they confirm the address.";
+  const address = "After their yes or the fallback, if they gave an address not yet read back, your very next reply is ONLY its read-back question, before any follow-up; if item 6 saves them right away, call submit_service_request in that same turn, and say the ringing line only after they confirm the address.";
   assert.ok(phone.includes(address), 'the address step is in THE PHONE NUMBER RULE');
   once(address);
   assert.ok(phone.indexOf('Only a plain yes to the read-back itself counts') < phone.indexOf(address), 'the address step follows the yes rule');
   once('say the ringing line only after they confirm the address');
-  once('that same reply calls submit_service_request FIRST, then asks the address question');
-  once("a tool call isn't speech, so never hold the save for the next turn.");
-  assert.ok(phone.indexOf('calls submit_service_request FIRST') < phone.indexOf('Add any address correction with add_request_note') && phone.indexOf('Add any address correction with add_request_note') < phone.indexOf('say the ringing line only after they confirm the address'), 'save first, then correction note, then ringing line');
-  assert.doesNotMatch(phone, /call submit_service_request in that same turn/);
   // WRAPPING UP only points to it: item 6 callers are saved first, everyone else gets the address read-back before the email ask, and the close waits for it.
   const wrapping = section('WRAPPING UP', 'ENDING THE CALL');
   assert.match(wrapping, /For callers who skip the email, follow item 6\. They are saved first; for everyone else, once it's confirmed, or you couldn't get one, and the address is read back \(THE PHONE NUMBER RULE\), ask for the email and preferred time \(items 6 and 7\), then call submit_service_request right away\./);
