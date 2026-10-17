@@ -723,7 +723,7 @@ test('the voice upgrade adds its spoken style and address read-back once, withou
   assert.deepEqual(config.startSpeakingPlan.smartEndpointingPlan, { provider: 'livekit' });
   assert.deepEqual(config.startSpeakingPlan.customEndpointingRules, [{ type: 'assistant', regex: '(number to reach|phone number|callback number|best number|good number)', timeoutSeconds: 1.5 }]);
   assert.ok(config.stopSpeakingPlan.acknowledgementPhrases.includes('mm-hmm'));
-  // Spoken-style section sits right before THE PHONE NUMBER RULE, which is still last; its sample read-back uses the shop's area code.
+  // Spoken-style section sits right before THE PHONE NUMBER RULE, which is still last.
   const talk = prompt.indexOf('HOW YOU ACTUALLY TALK');
   assert.ok(talk > prompt.indexOf('STAYING NATURAL') && talk < prompt.indexOf('THE PHONE NUMBER RULE ('));
   // C2: the sample lines carry no read-back of their own; the read-back is worded only in item 4 and THE PHONE NUMBER RULE.
@@ -740,11 +740,22 @@ test('the voice upgrade adds its spoken style and address read-back once, withou
   assert.doesNotMatch(prompt, /seven two oh|Of course, we can help with that"\), then|say "Quick question,"|repeat the whole number once more|Always read back the house number/);
   // Address read-back is its own reply, stated once, in item 3 next to the five-or-more-digit check.
   const address = prompt.slice(prompt.indexOf('3. The service address.'), prompt.indexOf('4. The best callback number'));
-  assert.match(address, /make the read-back its own reply, only the question \("That's four twelve Gallatin Pike\?"\) with nothing after it, then stop and wait for their answer\. If they give the callback number and the address together, the phone number read-back comes first, as THE PHONE NUMBER RULE says, and the address read-back is your next reply after they answer it\. If the house number has five or more digits/);
+  assert.match(address, /make the read-back its own reply, only the question \("That's four twelve Gallatin Pike\?"\) with nothing after it, then stop and wait for their answer\. If they give the callback number and the address together, the phone number read-back comes first, as THE PHONE NUMBER RULE says, and the address read-back is your next reply once they have confirmed the number, unless item 6 says to save right away; then save first, read the address back after, and add any correction with add_request_note\. If the house number has five or more digits/);
   // C3: the example is spoken as words, like item 4 says for street numbers; C1: the phone rule itself is unchanged and last.
   assert.doesNotMatch(prompt, /412 Gallatin/);
   assert.match(prompt, /your very next reply must be ONLY the read-back question \("So that's six one five, five five five, oh one four two\?"\), with no tool call and nothing else; then stop talking and wait for their answer\./);
   assert.ok(prompt.indexOf('THE PHONE NUMBER RULE (') > prompt.indexOf('HOW YOU ACTUALLY TALK'));
   for (const text of ['its own reply', 'skip any question the caller already answered', 'never fill it in from your own question', 'keep it and use it; never drop it', 'HOW YOU ACTUALLY TALK']) once(text);
   assert.doesNotMatch(prompt, /drains are affected|address read-back question/);
+  // C5: callers item 6 saves right away (urgent, rushed, leaving, refusing) are saved before the address read-back; item 6 itself is unchanged.
+  assert.match(prompt, /For those callers, skip the email and time questions and save as soon as the number is confirmed \(right away if they refused a number\)/);
+  assert.match(address, /unless item 6 says to save right away; then save first, read the address back after, and add any correction with add_request_note\./);
+  assert.match(prompt, /keep it and use it; never drop it\. A phone number given early still gets its read-back first \(THE PHONE NUMBER RULE\)\./);
+  // N1: "never the same sentence twice" covers free-form talk only, so scripted lines (cut-out, save trouble, read-backs) may recur.
+  assert.match(style, /Never say the same free-form sentence twice in a call; the exact lines quoted elsewhere in this prompt may come up again whenever they apply\./);
+  assert.doesNotMatch(prompt, /Never say the same sentence twice/);
+  // N2: the only closing line is WRAPPING UP's, followed by "Anything else you'd like me to pass along?".
+  assert.doesNotMatch(prompt, /you're all set|Wrapping up, once/);
+  once('Alright, I\'ve got all that over to the team.');
+  assert.match(prompt, /"Alright, I've got all that over to the team\. Someone will be in touch with you soon\." Then ask, "Anything else you'd like me to pass along\?"/);
 });
