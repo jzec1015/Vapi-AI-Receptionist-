@@ -869,6 +869,9 @@ test('read-back fixes: phone then address read-back before any follow-up, only a
   assert.match(rule, /If add_customer_email or add_request_note still isn't saved, say "Mention that when the team calls you, so they have it\."/);
   once("nothing was saved, even after an earlier save: no \"I'll let the team know\" or similar, never say it was sent or added");
   assert.doesNotMatch(rule, /"I'll pass that on" or anything similar unless/);
+  // Save-fail retry: the retry call goes in the same reply as the trouble line, before the caller speaks; the 0503 text around it is unchanged.
+  assert.match(rule, /and never say you're ringing Dana\. Never stop after the trouble line; retry in that same reply, before the caller speaks\. Say "I'm having trouble saving that, one moment\.", fix what the error says if it tells you, and call the same tool again once\./);
+  once('retry in that same reply, before the caller speaks');
   // Still consistent: item 3 keeps C5 (save first for item 6 callers) and the phone rule stays last.
   assert.match(prompt, /unless item 6 says to save right away; then save first, read the address back after, and add any correction with add_request_note\./);
   assert.ok(prompt.indexOf('THE PHONE NUMBER RULE (') > prompt.indexOf('HOW YOU ACTUALLY TALK') && prompt.indexOf('THE PHONE NUMBER RULE (') < prompt.indexOf('<<<SHOP DETAILS'));
