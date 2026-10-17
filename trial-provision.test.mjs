@@ -686,11 +686,10 @@ test('Emma checks cut-off and impossible answers, never hangs up on her own ques
   assert.doesNotMatch(prompt, /If a save is refused/);
   assert.match(prompt, /Only if it returns saved true and caller_email "accepted", tell them their confirmation is on its way; if it returned saved true without "accepted", say "The team will confirm your email when they call\."/);
   // Who may be saved without an email: one statement in item 6, a pointer in WRAPPING UP.
-  assert.match(prompt, /Never save before you have asked for the email, unless the caller refuses details \(see NEVER LOSE A CALLER\), the call is an emergency, or the caller sounds rushed or upset\. For an emergency or a rushed or upset caller, skip the email and time questions and save right after the number is confirmed, with email_status "skipped_emergency" if the job is urgent, even when the caller is also rushed or upset, and "declined" otherwise\./);
-  assert.match(prompt, /6\. \(Skip 6 and 7 for anything urgent, like flooding, active leaks, sewage, no water or gas, and for a rushed or upset caller; see the end of this item\.\)/);
-  assert.match(prompt, /use email_status "declined" \(or "skipped_emergency" if the job is urgent\) and save immediately\./);
-  assert.doesNotMatch(prompt, /SKIP 6 and 7/);
-  assert.match(wrapping, /If the call is an emergency or the caller sounds rushed or upset, follow item 6\./);
+  assert.match(prompt, /Never save before you have asked for the email, except when the job is urgent, the caller sounds rushed or upset, says goodbye or wants to go, won't give an email, or refuses details \(see NEVER LOSE A CALLER\)\. For those callers, skip the email and time questions and save as soon as the number is confirmed \(right away if they refused a number\), with email_status "skipped_emergency" if the job is urgent, even when the caller is also rushed or upset, and "declined" otherwise\./);
+  assert.match(prompt, /6\. \(Some callers skip 6 and 7; see the end of this item\.\)/);
+  assert.doesNotMatch(prompt, /SKIP 6 and 7|If the caller says goodbye, wants to go/);
+  assert.match(wrapping, /For callers who skip the email, follow item 6\./);
   once('skip the email and time questions');
   assert.doesNotMatch(prompt, /twice more|at most twice/);
   // THE PHONE NUMBER RULE holds the whole read-back rule and is still the last rule, right before the shop details.
