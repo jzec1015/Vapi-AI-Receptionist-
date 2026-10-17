@@ -874,15 +874,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       if (details.is_test) { set({ done: 'suppressed_test' }); return 'suppressed_test'; }
       const route = routeOf(request.assistant_id);
       let why = `Every alert channel failed ${Math.min(row.attempts + 1, OFFICE_RETRIES + 1)} times`;
-      // A channel of this alert already went out (a crash after the send, before the first try was settled): the office
-      // was reached. Close the row without sending; office_alert says 'sent' if it was still unfinished, else stays.
-      if (db.prepare("SELECT 1 FROM deliveries WHERE ref = ? AND status = 'sent'").get(row.email_key)) {
-        set({ attempts, done: 'sent' });
-        db.prepare(`UPDATE requests SET result = json_set(result, '$.office_alert', 'sent') WHERE call_id = ? AND json_valid(result)
-          AND json_extract(result, '$.office_alert') IN ('pending', 'needs_review')`).run(row.call_id);
-        console.log(`office-alert retry call=${row.call_id} request=${request.id} attempt=${attempts} outcome=already_sent`);
-        return 'already_sent';
-      }
+      // After a crash, alertOutcome skips channels the ledger has as sent and sends the cut ones once.
+      // Known gap: sent_after_retry may label a row whose channels were finished after a crash.
       if (route && row.attempts < OFFICE_RETRIES) {
         // A job saved over an hour ago still goes to the shop (nothing is lost), once, marked as delayed.
         const age = Math.floor((now - Date.parse(request.created_at)) / 60000);

@@ -399,18 +399,83 @@ test('a long delayed SMS keeps the 302-character limit and the STOP footer; othe
   assert.equal(alertText(routeA, long, 'new', 'email', { delayedMin: 0 }), alertText(routeA, long, 'new', 'email'));
 });
 
-test('office retry after a crash that came after a channel was sent: closes the row, sends nothing, no sent_after_retry', async t => {
-  const dir = tempDir(t);
-  const first = await fixture(t, { dir, extra: twoNumbers, behave: (url, body) => body.to === '+15550000001' ? 200 : never() });
-  first.post(toolCall('a-1', 'submit_service_request', intake)).catch(() => {});
+// A process that dies after SMS #1 went out, with SMS #2 and the email cut off (still 'sending' in the ledger).
+async function partialCrash(t, dir, cut) {
+  const first = await fixture(t, { dir, extra: twoNumbers, behave: (url, body) => url.includes('telnyx') && body.to === '+15550000001' ? 200 : never() });
+  const url = `http://127.0.0.1:${first.app.address().port}/vapi/webhook`;
+  fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': key }, body: JSON.stringify(cut) }).catch(() => {});
   await settleLater(150);
   await first.stop();
+}
+const ledger = (dir, ref) => { const db = new DatabaseSync(join(dir, 'requests.sqlite')); try { return Object.fromEntries(db.prepare('SELECT channel, status FROM deliveries WHERE ref = ?').all(ref).map(r => [r.channel, r.status])); } finally { db.close(); } };
+const officeAlert = dir => { const db = new DatabaseSync(join(dir, 'requests.sqlite')); try { return JSON.parse(db.prepare('SELECT result FROM requests').get().result || '{}').office_alert; } catch { return undefined; } finally { db.close(); } };
+const hangup = (id, summary = 'Caller Linda Harper at 48 Birch Road reported a leak.') => ({ message: { type: 'end-of-call-report', durationSeconds: 45, analysis: { summary },
+  call: { id, assistantId: 'client-a', type: 'inboundPhoneCall', customer: { number: '+16155550100' } } } });
+const perTo = (f, to) => f.sent.filter(s => s.body.to === to || s.body.to?.[0] === to).length;
+
+test('office retry after a crash that came after a channel was sent: the cut channels are sent once, the sent one is not re-sent', async t => {
+  const dir = tempDir(t);
+  await partialCrash(t, dir, toolCall('a-1', 'submit_service_request', intake));
   const second = await fixture(t, { dir, extra: twoNumbers });
-  assert.deepEqual(await second.app.sweepOfficeRetries(Date.now() + MIN + 1000), ['already_sent']);
-  assert.equal(second.sent.length, 0, 'the office was already reached: nothing is re-sent by the office retry');
+  assert.deepEqual(await second.app.sweepOfficeRetries(Date.now() + MIN + 1000), ['sent']);
+  for (let i = 2; i < 8; i++) await second.app.sweepOfficeRetries(Date.now() + i * MIN);
+  assert.equal(perTo(second, '+15550000001'), 0, 'SMS #1 already went out');
+  assert.equal(perTo(second, '+15550000002'), 1); assert.equal(perTo(second, 'office@example.com'), 1);
+  const id = requestId(dir, 'a-1');
+  assert.deepEqual(ledger(dir, `${id}-alert-new-0`), { 'sms:+15550000001': 'sent', 'sms:+15550000002': 'sent', email: 'sent' });
   assert.equal(retryRow(dir, 'a-1').done, 'sent');
-  const db = new DatabaseSync(join(dir, 'requests.sqlite'));
-  try { assert.equal(JSON.parse(db.prepare('SELECT result FROM requests').get().result).office_alert, 'sent'); } finally { db.close(); }
+  // Known gap (accepted): the row is labelled sent_after_retry although SMS #1 went out on the first try.
+  assert.equal(officeAlert(dir), 'sent_after_retry');
+});
+
+test('hang-up crash after SMS #1, SMS #2 and the email cut: the office retry sends each cut channel once, SMS #1 never', async t => {
+  t.mock.method(console, 'warn', () => {});
+  const dir = tempDir(t);
+  await partialCrash(t, dir, hangup('h-1'));
+  const id = requestId(dir, 'h-1');
+  assert.deepEqual(ledger(dir, `${id}-alert-hangup-0`), { 'sms:+15550000001': 'sent', 'sms:+15550000002': 'sending', email: 'sending' });
+  const second = await fixture(t, { dir, extra: twoNumbers });
+  const now = Date.now();
+  const outcomes = [];
+  for (let i = 1; i < 10; i++) outcomes.push(...(await Promise.all([second.app.sweepOutbox(now + i * MIN + 1000), second.app.sweepOfficeRetries(now + i * MIN + 1000)]))[1]);
+  assert.deepEqual(outcomes, ['sent'], 'one office retry pass, which delivered');
+  assert.equal(perTo(second, '+15550000001'), 0);
+  assert.equal(perTo(second, '+15550000002'), 1); assert.equal(perTo(second, 'office@example.com'), 1);
+  assert.deepEqual(second.emails().map(e => e.key), [`${id}-alert-hangup-0`]);
+  assert.deepEqual(ledger(dir, `${id}-alert-hangup-0`), { 'sms:+15550000001': 'sent', 'sms:+15550000002': 'sent', email: 'sent' });
+  assert.equal(retryRow(dir, 'h-1').done, 'sent');
+});
+
+test('stale submit (restart 2 h later) cut after SMS #1: office_alert is not sent until office_retries delivers SMS #2 and the email once', async t => {
+  t.mock.method(console, 'warn', () => {}); t.mock.method(console, 'log', () => {});
+  const dir = tempDir(t);
+  await partialCrash(t, dir, toolCall('a-2', 'submit_service_request', intake));
+  const second = await fixture(t, { dir, extra: twoNumbers });
+  const later = Date.now() + 2 * 3600000;
+  assert.deepEqual(await second.app.sweepOutbox(later), []);
+  assert.equal(second.sent.length, 0, 'the outbox drops the stale row and sends nothing');
+  assert.notEqual(officeAlert(dir), 'sent', 'nothing has been finished yet');
+  const outcomes = [];
+  for (let i = 0; i < 8; i++) outcomes.push(...(await Promise.all([second.app.sweepOutbox(later + i * MIN), second.app.sweepOfficeRetries(later + i * MIN)]))[1]);
+  assert.deepEqual(outcomes, ['sent']);
+  assert.equal(perTo(second, '+15550000001'), 0);
+  assert.equal(perTo(second, '+15550000002'), 1); assert.equal(perTo(second, 'office@example.com'), 1);
+  assert.match(second.sms()[0].body.text, /^Anchorline AI: \(delayed \d+ min\) New call/);
+  assert.equal(retryRow(dir, 'a-2').done, 'sent');
+  assert.equal(officeAlert(dir), 'sent_after_retry');
+});
+
+test('a stale submit with a long issue, sent by the office retry sweep: the delayed SMS is at most 302 characters with the STOP footer', async t => {
+  t.mock.method(console, 'warn', () => {}); t.mock.method(console, 'log', () => {});
+  const dir = tempDir(t);
+  await crashMidSend(t, dir, { cut: toolCall('a-3', 'submit_service_request', { ...intake, issue: 'Slow drain in the kitchen and the basement '.repeat(20) }) });
+  const second = await fixture(t, { dir });
+  assert.deepEqual(await second.app.sweepOfficeRetries(Date.now() + 3 * 3600000), ['sent']);
+  assert.equal(second.sms().length, 1);
+  const text = second.sms()[0].body.text;
+  assert.ok(text.length <= 302, `${text.length} characters`);
+  assert.match(text, /^Anchorline AI: \(delayed \d+ min\) New call - Gold Star Plumbing\n/);
+  assert.match(text, /\nReply STOP to opt out$/);
 });
 
 test('email X fails, the caller corrects it to Y, then submit is retried: Y gets exactly one confirmation', async t => {
