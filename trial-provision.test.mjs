@@ -645,3 +645,37 @@ test('the phone number read-back rule is the last rule Emma reads, before the sh
   assert.match(text, /If the caller corrects any digit, read the whole corrected number back and wait for a yes before saving/);
   assert.match(text, /In an emergency this read-back is still the one question you ask before saving/);
 });
+
+test('Emma checks cut-off and impossible answers, never hangs up on her own question, and is honest when a save fails', () => {
+  const shop = { id: 'client-4', business: 'Acme Plumbing', owner_name: 'Dana Smith', shop_number: '+17205550155', city: 'Denver', state: 'CO', services: 'Drains' };
+  const prompt = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key }).model.messages[0].content;
+  const section = (name, next) => prompt.slice(prompt.indexOf(name), prompt.indexOf(next, prompt.indexOf(name)));
+  const once = (text, pattern) => assert.equal(prompt.split(text).length - 1, 1, `${pattern || text} appears exactly once`);
+  // Cut-out line and odd-value check, in STAYING NATURAL.
+  const natural = section('STAYING NATURAL', 'THE PHONE NUMBER RULE');
+  assert.match(natural, /cut off, garbled, or doesn't fit what you asked, never guess/);
+  assert.match(natural, /"Sorry, you cut out there, could you say that again\?"/);
+  assert.match(natural, /If a detail sounds impossible, check it once before you use it: a house number with five or more digits \(see item 3\), a phone number that isn't ten digits, or an email with no @ or no domain/);
+  // House-number check where the address is read back (item 3).
+  const address = section('3. The service address.', '4. The best callback number');
+  assert.match(address, /If the house number has five or more digits, don't read it back; ask instead, "Sorry, could you say the house number once more, slowly\?"/);
+  // No endCall in a reply that asks a question.
+  const ending = section('ENDING THE CALL', 'THINGS YOU DON\'T DO');
+  assert.match(ending, /Never end the call in a reply that asks a question, like "Anything else you'd like me to pass along\?"; ask it, then wait for their answer\. Only end the call in a later reply/);
+  // A failed save: retry once, never claim it was sent or that the owner is being rung, then promise a callback and restate the job.
+  const rule = section('THE ONE RULE YOU NEVER BREAK', 'WRAPPING UP');
+  assert.match(rule, /If submit_service_request, add_request_note or add_customer_email returns an error, times out, or doesn't return saved true, nothing was saved/);
+  assert.match(rule, /never say it was sent or added, and never say you're ringing Dana\./);
+  assert.match(rule, /Say "I'm having trouble saving that, one moment\." and call the same tool again once\./);
+  assert.match(rule, /If submit_service_request fails again, say "I'm sorry, I couldn't save that, but the team still gets a record of this call and will call you back at" and read back the number they gave, then repeat the problem, their name and the address/);
+  assert.match(prompt, /If it fails twice, don't claim it was added; say "Mention that when the team calls you, so they have it\."/);
+  // The early-number paragraph sits inside THE PHONE NUMBER RULE, which is still the last rule.
+  const phone = prompt.slice(prompt.indexOf('THE PHONE NUMBER RULE'), prompt.indexOf('SHOP DETAILS') + 'SHOP DETAILS'.length);
+  assert.match(phone, /This applies even when the caller rattles off their number early, in the same breath as everything else: before you save, your reply must be only the read-back of the whole number, and you wait for their yes\. Set callback_read_back true only if you actually read it back in this call and they said yes\.\n\nSHOP DETAILS/);
+  assert.doesNotMatch(prompt, /drains are affected/);
+  assert.ok(prompt.lastIndexOf('THE PHONE NUMBER RULE') > prompt.lastIndexOf('STAYING NATURAL'), 'the phone number rule is still the last rule');
+  for (const text of ['THE PHONE NUMBER RULE', 'you cut out there', 'If a detail sounds impossible', 'Never end the call in a reply that asks a question',
+    "I'm having trouble saving that, one moment.", "I couldn't save that", 'If the house number has five or more digits', 'rattles off their number early',
+    "never say you're ringing"]) once(text);
+  assert.doesNotMatch(prompt, /\{\{/);
+});
