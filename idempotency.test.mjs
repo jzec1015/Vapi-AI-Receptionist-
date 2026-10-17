@@ -722,6 +722,9 @@ test('a 7am digest send that hangs never delays a held urgent ring: it goes on t
 // Every saved:false result of add_request_note / add_customer_email carries the line to speak (say) and a note that it was
 // not saved, so gpt-4.1 does not improvise "I'll note that..." or "I'll let the team know...". The fields already there stay.
 const UNCONFIRMED = 'Not added: spell the email back letter by letter and get a clear yes first.';
+const retryNote = name => 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what error ' +
+  `says if it tells you how, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
+  `If it still isn't saved, say only the say line. Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`;
 const notSaved = (result, name, error) => {
   assert.equal(result.saved, false); assert.equal(result.retryable, false); assert.equal(result.error, error);
   assert.equal(result.say, NOT_SAVED_SAY); assert.equal(result.say, 'Mention that when the team calls you, so they have it.');
@@ -731,11 +734,9 @@ const notSaved = (result, name, error) => {
     assert.match(result.note, /If they don't confirm it, say only the say line\./);
     assert.doesNotMatch(result.note, /trouble|once more|same reply/);
   } else {
-    // retryable:false: straight to the say line, never "call once more".
-    assert.match(result.note, /^NOT saved: nothing was noted, added or passed on\. Say only the say line\. /);
-    assert.doesNotMatch(result.note, /once more|again|retry|trouble/);
+    // THE ONE RULE: trouble line, one retry in that same reply, then only the say line (retryable is not consulted).
+    assert.equal(result.note, retryNote(name));
   }
-  assert.ok(!result.note.includes(name) || error === UNCONFIRMED);
   assert.match(result.note, /Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar\.$/);
   assert.deepEqual(Object.keys(result), ['saved', 'retryable', 'error', 'say', 'note']);
 };
@@ -807,17 +808,10 @@ test('submit_service_request and other tools never get the note/email say line',
   assert.equal(unknown.saved, false); assert.equal(unknown.say, undefined); assert.equal(unknown.note, undefined);
 });
 
-test('the not-saved note: an unconfirmed email waits for the yes; a retryable error retries once in the same reply; others go straight to the say line', () => {
-  for (const name of ['add_request_note', 'add_customer_email']) {
-    const retry = notSavedNote(name, { saved: false, retryable: true, error: 'Unable to add note' });
-    assert.equal(retry, `NOT saved: nothing was noted, added or passed on. Say "I'm having trouble saving that, one moment.", fix what error says, and call ${name} ` +
-      `once more in that same reply, before the caller speaks; never stop after the trouble line. If it still isn't saved, say only the say line. ` +
-      `Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`);
-    const final = notSavedNote(name, { saved: false, retryable: false, error: 'Unable to add note' });
-    assert.equal(final, 'NOT saved: nothing was noted, added or passed on. Say only the say line. ' +
-      `Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`);
-    assert.equal(notSavedNote(name, { saved: false, error: 'x' }), final, 'no retryable field counts as not retryable');
-  }
+test('the not-saved note: an unconfirmed email waits for the yes; every other failure retries once in the same reply, whatever retryable says', () => {
+  for (const name of ['add_request_note', 'add_customer_email'])
+    for (const result of [{ saved: false, retryable: true, error: 'Unable to add note' }, { saved: false, retryable: false, error: 'Unable to add note' }, { saved: false, error: 'x' }])
+      assert.equal(notSavedNote(name, result), retryNote(name));
   const unconfirmed = notSavedNote('add_customer_email', { saved: false, retryable: false, error: UNCONFIRMED });
   assert.match(unconfirmed, /wait for the caller's clear yes/); assert.match(unconfirmed, /never call again before the caller speaks/);
   assert.doesNotMatch(unconfirmed, /once more|same reply|trouble/);

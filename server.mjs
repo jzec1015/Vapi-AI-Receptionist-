@@ -34,8 +34,8 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
   : r?.booked === false ? `not_booked_${logSafe(r.status)}` : r?.error ? 'refused' : 'ok';
 // add_request_note and add_customer_email results that saved nothing carry the exact words to speak. Without them gpt-4.1
 // sometimes improvises a false promise ("I'll note that you prefer...", "I'll let the team know..."). Every existing field is
-// kept. note: an unconfirmed email waits for the caller's yes (never a retry before they speak); a retryable error is retried
-// once in the same reply (THE ONE RULE in templates/emma-prompt.txt); any other error goes straight to the say line.
+// kept. note: an unconfirmed email waits for the caller's yes (never a retry before they speak); every other error follows
+// THE ONE RULE in templates/emma-prompt.txt (trouble line, one retry in the same reply, then the say line), whatever retryable says.
 export const NOT_SAVED_SAY = 'Mention that when the team calls you, so they have it.';
 const NOT_SAVED_TOOLS = ['add_request_note', 'add_customer_email'];
 const UNCONFIRMED_EMAIL = 'Not added: spell the email back letter by letter and get a clear yes first.';
@@ -44,11 +44,9 @@ export const notSavedNote = (name, result = {}) => result.error === UNCONFIRMED_
   ? 'NOT saved: the email is not confirmed yet. Spell the email back letter by letter, then stop and wait for the caller\'s clear yes. ' +
     `Only after they say yes, call ${name} again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ` +
     `again before the caller speaks. If they don't confirm it, say only the say line. ${NO_PROMISE}`
-  : result.retryable === true
-    ? 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what error says, ' +
-      `and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. If it still ` +
-      `isn't saved, say only the say line. ${NO_PROMISE}`
-    : `NOT saved: nothing was noted, added or passed on. Say only the say line. ${NO_PROMISE}`;
+  : 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what error says if it ' +
+    `tells you how, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
+    `If it still isn't saved, say only the say line. ${NO_PROMISE}`;
 const withNotSavedLine = (name, result) => NOT_SAVED_TOOLS.includes(name) && result?.saved === false
   ? { ...result, say: NOT_SAVED_SAY, note: notSavedNote(name, result) } : result;
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
