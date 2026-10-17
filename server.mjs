@@ -54,23 +54,56 @@ export function formatPhone(value) {
 export const isUrgent = issue => /^\s*URGENT\b/i.test(issue);
 // Priority tier of a saved request, worked out when a job card or digest is written (never stored):
 //   urgent      the issue starts with "URGENT"
-//   high-value  not urgent, and job_size is "Big job (half day+)" or the job type, issue or details name a big-ticket job:
-//               a water heater to replace or install, tankless, repipe, main/sewer line, sewer replacement, slab leak,
-//               whole-house, remodel, new construction (whole words, any case; a water heater repair, pilot light, a
-//               faucet/toilet swap or a water heater that "was replaced" before stays routine)
+//   high-value  not urgent, and job_size is "Big job (half day+)" (Emma's prompt files water heater replacement, main line
+//               or sewer, repiping, multiple fixtures and water damage there), or Emma's job_type label names a big-ticket
+//               job (HIGH_VALUE below). Only when job_type is empty are the issue and job_details read instead.
 //   routine     everything else, including requests with no job details (hang-ups keep their own section)
-// Water heater + replace/install in the same sentence: "replace the old 50-gallon water heater", "the water heater needs to be
-// replaced", "water heater leaking, wants a replacement quote". Not "replace the faucet by the water heater" (the replace word
-// before the heater must be about the heater) nor "replaced the water heater last year" / "it was replaced" (already done).
-const HEATER = '(?:(?:the|a|an|my|our|their|his|her|old|existing|broken|leaking|leaky|gas|electric|\\d+[- ]?gal(?:lon)?)\\s+){0,4}water\\s+heaters?\\b';
-const HIGH_VALUE = new RegExp(['\\btankless\\b', `\\b(?:new|replace|replacing|replacement|install|installing)\\s+${HEATER}`,
-  '\\bwater\\s+heaters?\\b[^.;!?\\n]*?(?<!\\b(?:was|were|had|got|been)\\s+)\\b(?:replace|replaced|replacing|replacement|install|installed|installing|installation|new\\s+(?:one|unit|tank|heater))\\b',
-  '\\bre-?pip(?:e|es|ed|ing)\\b', '\\bmain\\s+(?:water\\s+|sewer\\s+|drain\\s+)?lines?\\b', '\\bsewer\\s+(?:lines?|mains?|laterals?|replacement)\\b',
-  '\\bslab\\s+leaks?\\b', '\\bwhole[\\s-]+(?:house|home)\\b', '\\bremodel(?:s|ed|ing)?\\b', '\\bnew\\s+construction\\b'].join('|'), 'i');
+// Big-ticket families (whole words, any case):
+//   water heater  replace/install/new + water heater, or water heater ... replace/install/new one later in the sentence
+//                 (not "water heater repair", "pilot light", "replace the faucet by the water heater"); also tankless
+//   repipe        repipe, re-pipe, repiping
+//   main/sewer    main/sewer line with replace, repair, backup, dig, excavate, collapsed, broken or cracked about the line
+//                 (not "replace the shutoff valve on the main water line", not "sewer line camera inspection")
+//   other         slab leak, remodel, new construction, whole-house re-plumb/repipe/filter/softener ("whole house" alone
+//                 is how callers describe low pressure, so it does not count)
+// One guard for every family: a match does not count when its clause (the comma-separated part of the sentence where the
+// match ends, i.e. where the deciding word is) is NEGATED ("do not need", "not looking to", "isn't") or FINISHED work ("already", "last year", "had ... put in",
+// "was replaced", a clause that starts "Replaced ...").
+const HEATER = String.raw`(?:(?:the|a|an|my|our|their|his|her|old|existing|broken|leaking|leaky|gas|electric|\d+[- ]?gal(?:lon)?)\s+){0,4}water\s+heaters?\b`;
+const LINE = String.raw`(?:main(?:\s+(?:water|sewer|drain))?|sewer)\s+(?:lines?|mains?|laterals?|pipes?)\b`;
+const LINE_WORK = String.raw`(?:replace\w*|repair\w*|dig(?:s|ging)?|excavat\w*)`;
+const BACKUP = String.raw`(?:back(?:ed|ing)?[\s-]?ups?|dig(?:s|ging)?|excavat\w*)`;
+const HIGH_VALUE = [
+  String.raw`\b(?:new|replace|replacing|replacement|install|installing)\s+${HEATER}`,
+  String.raw`\bwater\s+heaters?\b.*?\b(?:replace|replaced|replacing|replacement|install|installed|installing|installation|new\s+(?:one|unit|tank|heater))\b`,
+  String.raw`\btankless\b`,
+  String.raw`\bre-?pip(?:e|es|ed|ing)\b`,
+  String.raw`\b${LINE}.*?\b(?:${LINE_WORK}|${BACKUP}|collaps\w*|broken|cracked)\b`,
+  String.raw`\b${LINE_WORK}\s+(?:(?:the|a|our|my|their|old|broken|cracked|whole)\s+){0,3}${LINE}`,
+  String.raw`\b${BACKUP}\b.*?\b${LINE}`,
+  String.raw`\bsewer\s+(?:replacement|repair)\b`,
+  String.raw`\bslab\s+leaks?\b`,
+  String.raw`\bremodel(?:s|ed|ing)?\b`,
+  String.raw`\bnew\s+construction\b`,
+  String.raw`\bwhole[\s-]+(?:house|home)\s+(?:re-?plumb\w*|re-?pip\w*|plumbing|water\s+(?:filter|filtration|softener)\w*|filt\w*|softener\w*)`,
+].map(source => new RegExp(source, 'gi'));
+const NEGATED = /\b(?:not|never|without|don'?t|doesn'?t|didn'?t|isn'?t|aren'?t|wasn'?t|won'?t|no\s+(?:need|longer))\b|\bno\b(?!\s+(?:hot\s+)?(?:water|heat|pressure)\b)/i;
+const FINISHED = /\b(?:already|last\s+(?:year|month|week|spring|summer|fall|winter)|(?:years?|months?|weeks?)\s+ago|(?:was|were|been|got|had)\s+(?:[\w'-]+\s+){0,4}?(?:replaced|installed|put\s+in|redone|repiped|remodeled))\b|^\s*(?:just\s+|recently\s+)?(?:replaced|installed|remodeled|repiped|redid)\b/i;
+function namesBigJob(text) {
+  for (const sentence of String(text || '').replace(/[‘’]/g, "'").split(/[.;!?\n]+/)) for (const pattern of HIGH_VALUE) {
+    for (const m of sentence.matchAll(pattern)) {
+      const end = m.index + m[0].length, next = sentence.indexOf(',', end);
+      const clause = sentence.slice(sentence.lastIndexOf(',', end - 1) + 1, next < 0 ? undefined : next);
+      if (!NEGATED.test(clause) && !FINISHED.test(clause)) return true;
+    }
+  }
+  return false;
+}
 export function priorityTier(details = {}) {
   if (isUrgent(details.issue)) return 'urgent';
-  if (/^\s*big job\b/i.test(details.job_size || '') || HIGH_VALUE.test([details.job_type, details.issue, details.job_details].filter(Boolean).join(' \n '))) return 'high-value';
-  return 'routine';
+  if (/^\s*big job\b/i.test(details.job_size || '')) return 'high-value';
+  const label = String(details.job_type || '').trim();
+  return namesBigJob(label || [details.issue, details.job_details].filter(Boolean).join('\n')) ? 'high-value' : 'routine';
 }
 const TIER_LABEL = { urgent: 'Urgent', 'high-value': 'High-value job', routine: 'Routine' };
 const TIER_ORDER = ['urgent', 'high-value', 'routine'];
