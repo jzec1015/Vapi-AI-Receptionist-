@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
-import { createApp, alertText, phoneNumbersIn, confirmedCallback, transcriptExcerpt, priorityTier } from './server.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { createApp, alertText, alertSubject, digestEmail, confirmedCallback, transcriptExcerpt, priorityTier } from './server.mjs';
 
 const key = 'synthetic-test-key-not-used-in-production';
 const routes = JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'] } });
@@ -21,7 +22,7 @@ async function fixture(t, extra = {}) {
   t.after(async () => { await new Promise(resolve => app.close(resolve)); rmSync(dir, { recursive: true }); });
   const url = `http://127.0.0.1:${app.address().port}/vapi/webhook`;
   const post = async body => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': key }, body: JSON.stringify(body) });
-  return { post, sent };
+  return { post, sent, dir };
 }
 const result = async response => JSON.parse((await response.json()).results[0].result);
 
@@ -80,92 +81,133 @@ const hangupReport = (id, artifact, extra = {}) => ({ message: { type: 'end-of-c
 const said = (...turns) => ({ messages: [{ role: 'system', message: 'You are Emma' }, ...turns.map(([role, message], i) => ({ role, message, secondsFromStart: i * 5 }))],
   transcript: turns.map(([role, text]) => `${role === 'bot' ? 'AI' : 'User'}: ${text}`).join('\n') });
 
-test('a hang-up after a failed save keeps the read-back number the caller confirmed and the transcript', async t => {
-  const { post, sent } = await fixture(t);
+// Emma's submit_service_request call as Vapi logs it in artifact.messages (the shape of a real Gold Star test call), and
+// the same call as artifact.messagesOpenAIFormatted carries it.
+const saveArgs = extra => JSON.stringify({ name: 'Linda Harper', address: '48 Birch Road', issue: 'Water heater leaking', is_test: false, email: '', ...extra });
+const vapiSave = (extra, id = 'call_1') => [{ role: 'tool_calls', message: '', toolCalls: [{ id, type: 'function', function: { name: 'submit_service_request', arguments: saveArgs(extra) } }] },
+  { role: 'tool_call_result', name: 'submit_service_request', toolCallId: id, result: '{"saved":false,"retryable":true,"error":"Not saved"}' }];
+const openAiSave = (extra, id = 'call_1') => [{ role: 'assistant', tool_calls: [{ id, type: 'function', function: { name: 'submit_service_request', arguments: saveArgs(extra) } }] },
+  { role: 'tool', tool_call_id: id, content: '{"saved":false,"retryable":true,"error":"Not saved"}' }];
+const ASK = ['bot', 'So that’s six one five, five five five, oh one four two?'];
+const READ_BACK = { callback_phone: '6155550142', callback_read_back: true };
+const storedLead = (dir, callId) => {
+  const db = new DatabaseSync(join(dir, 'requests.sqlite'), { readOnly: true });
+  try { return JSON.parse(db.prepare('SELECT details FROM requests WHERE call_id = ?').get(callId).details); } finally { db.close(); }
+};
+
+test('a hang-up after a failed save takes the confirmed number from Emma’s own save call and keeps the transcript', async t => {
+  const { post, sent, dir } = await fixture(t);
   const artifact = said(['bot', 'Hi, thanks for calling Gold Star Plumbing. How can I help?'], ['user', 'My water heater is leaking all over the garage.'],
-    ['bot', "What's the best number to call you back?"], ['user', '615 555 0142.'],
-    ['bot', 'So that\u2019s six one five, five five five, oh one four two?'], ['user', "Yeah, that's it."],
-    ['tool_calls', ''], ['tool_call_result', 'retryable'],
+    ['bot', "What's the best number to call you back?"], ['user', '615 555 0142.'], ASK, ['user', "Yeah, that's it."],
     ['bot', 'Sorry, our system is down. The team will call you back at six one five, five five five, oh one four two.'], ['user', 'Okay, thanks.']);
+  artifact.messages.splice(7, 0, ...vapiSave(READ_BACK));
   await post(hangupReport('hang-readback', artifact));
   const email = sent.find(s => s.url.includes('resend')).body;
-  assert.equal(email.subject, 'Caller hung up \u2013 (615) 555-0142 \u2013 call them back');
+  assert.equal(email.subject, 'Caller hung up – (615) 555-0142 – call them back');
   assert.match(email.text, /Unknown caller - \(615\) 555-0142 \(confirmed on the call; caller ID \(615\) 555-0100\)\n/);
   assert.match(email.text, /Hung up before finishing\nTranscript \(end of call\):\nAI: Hi, thanks[\s\S]*User: My water heater is leaking all over the garage\./);
-  assert.match(sent.find(s => s.url.includes('telnyx')).body.text, /^Anchorline AI: Caller hung up - Gold Star Plumbing\nUnknown caller - \(615\) 555-0142 /);
+  assert.match(sent.find(s => s.url.includes('telnyx')).body.text,
+    /^Anchorline AI: Caller hung up - Gold Star Plumbing\nUnknown caller - \(615\) 555-0142 \(confirmed on the call; caller ID \(615\) 555-0100\)\n/);
+  const lead = storedLead(dir, 'hang-readback');
+  assert.equal(lead.callback_phone, '6155550142'); assert.equal(lead.callback_source, 'tool');
 });
 
-test('a hang-up with a summary keeps it and adds the transcript; numerals count as a read-back', async t => {
-  const { post, sent } = await fixture(t);
+test('a read-back and a yes in the transcript alone are never called confirmed: the office gets the caller ID', async t => {
+  const { post, sent, dir } = await fixture(t);
   await post(hangupReport('hang-numerals', { transcript: 'AI: Is 615-555-0177 the best number?\nUser: Correct.\nAI: And the address?' },
     { analysis: { summary: 'Caller reported a leak.' } }));
-  const email = sent.find(s => s.url.includes('resend')).body;
-  assert.equal(email.subject, 'Caller hung up \u2013 (615) 555-0177 \u2013 call them back');
-  assert.match(email.text, /Hung up before finishing\. Summary: Caller reported a leak\.\nTranscript \(end of call\):\nAI: Is 615-555-0177/);
-});
-
-test('an unconfirmed read-back is never used; a corrected and confirmed one is', async t => {
-  const { post, sent } = await fixture(t);
-  await post(hangupReport('hang-no', said(['bot', 'So that is 6 1 5, 5 5 5, 0 1 4 2?'], ['user', "No, it's 615 555 0199."], ['bot', 'Got it, and your address?'])));
-  const first = sent.find(s => s.url.includes('resend')).body;
-  assert.equal(first.subject, 'Caller hung up \u2013 (615) 555-0100 \u2013 call them back');
-  assert.match(first.text, /\(615\) 555-0100 \(caller ID\)/);
-  await post(hangupReport('hang-fixed', said(['bot', 'So that is 6 1 5, 5 5 5, 0 1 4 2?'], ['user', "No, it's 615 555 0199."],
-    ['bot', 'Sorry about that. Six one five, five five five, zero one nine nine?'], ['user', "Yes, that's right."])));
-  assert.equal(sent.filter(s => s.url.includes('resend')).at(-1).body.subject, 'Caller hung up \u2013 (615) 555-0199 \u2013 call them back');
+  await post(hangupReport('hang-yes', said(ASK, ['user', 'Yes.'], ['bot', 'And the address?'])));
+  const emails = sent.filter(s => s.url.includes('resend')).map(s => s.body);
+  for (const email of emails) {
+    assert.equal(email.subject, 'Caller hung up – (615) 555-0100 – call them back');
+    assert.match(email.text, /Unknown caller - \(615\) 555-0100 \(caller ID\)\n/); assert.doesNotMatch(email.text, /confirmed|not verified/);
+  }
+  assert.match(emails[0].text, /Hung up before finishing\. Summary: Caller reported a leak\.\nTranscript \(end of call\):\nAI: Is 615-555-0177/);
+  for (const sms of sent.filter(s => s.url.includes('telnyx'))) assert.equal(sms.body.text.split('\n')[1], 'Unknown caller - (615) 555-0100 (caller ID)');
+  const lead = storedLead(dir, 'hang-yes');
+  assert.equal(lead.callback_phone, ''); assert.equal(lead.callback_source, '');
 });
 
 test('a hang-up report without a transcript is the same lead as before', async t => {
   const { post, sent } = await fixture(t);
   await post(hangupReport('hang-bare', undefined));
   const email = sent.find(s => s.url.includes('resend')).body;
-  assert.equal(email.subject, 'Caller hung up \u2013 (615) 555-0100 \u2013 call them back');
+  assert.equal(email.subject, 'Caller hung up – (615) 555-0100 – call them back');
   assert.match(email.text, /\(615\) 555-0100 \(caller ID\)\nHung up before giving details\n\nRequest reference: /);
 });
 
-test('a confirmed read-back on a test caller number keeps the hang-up suppressed', async t => {
+test('a save call with a test caller number keeps the hang-up suppressed', async t => {
   const { post, sent } = await fixture(t, { TEST_CALLER_NUMBERS: '+16155550142' });
-  await post(hangupReport('hang-testnum', said(['bot', 'That is 615 555 0142, right?'], ['user', 'Yep.'])));
+  const artifact = said(ASK, ['user', 'Yep.']);
+  artifact.messages.push(...vapiSave(READ_BACK));
+  await post(hangupReport('hang-testnum', artifact));
   assert.equal(sent.length, 0);
 });
 
-test('read-back parsing: spoken and written numbers, confirmations, excerpt length', () => {
-  assert.deepEqual(phoneNumbersIn('six one five, five five five, oh one four two'), ['6155550142']);
-  assert.deepEqual(phoneNumbersIn('Oh, so that is (615) 555-0142? And 1-615-555-0199.'), ['6155550142', '6155550199']);
-  assert.deepEqual(phoneNumbersIn('5 0 1 Woodland Street. What is the best number?'), []);
-  assert.deepEqual(phoneNumbersIn('six one five five five five oh one four'), []);
-  assert.deepEqual(phoneNumbersIn('2 4 0 6 1 5 5 5 5 0 1 4 2'), []);
-  const msg = turns => ({ artifact: said(...turns) });
-  assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?'], ['user', 'Right.']])), '6155550142');
-  assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?'], ['user', 'Uh, yes.']])), '6155550142');
-  assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?'], ['user', 'Not quite, it ends in 43.']])), '');
-  assert.equal(confirmedCallback(msg([['bot', '5 0 1 Woodland Street, right? And your number?'], ['user', "Yes, that's right. It's 615 555 1992."]])), '');
-  assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?']])), '');
+test('confirmedCallback: only Emma’s last submit_service_request call with callback_read_back true', () => {
+  const N = '6155550142';
+  const vapi = (...parts) => ({ artifact: { messages: parts.flat() } });
+  const turns = (...list) => list.map(([role, message]) => ({ role, message }));
+  // Both message shapes Vapi sends; arguments as a JSON string or an object.
+  assert.equal(confirmedCallback(vapi(turns(ASK, ['user', 'Yes.']), vapiSave(READ_BACK))), N);
+  assert.equal(confirmedCallback({ artifact: { messagesOpenAIFormatted: [{ role: 'assistant', content: ASK[1] }, { role: 'user', content: 'Yes.' }, ...openAiSave(READ_BACK)] } }), N);
+  assert.equal(confirmedCallback({ messages: [...openAiSave(READ_BACK)] }), N);
+  assert.equal(confirmedCallback(vapi([{ role: 'tool_calls', toolCalls: [{ function: { name: 'submit_service_request', arguments: READ_BACK } }] }])), N);
+  // Normalised to 10 digits; anything that is not one US number is not used.
+  for (const phone of ['(615) 555-0142', '+1 615-555-0142', '1.615.555.0142']) assert.equal(confirmedCallback(vapi(vapiSave({ ...READ_BACK, callback_phone: phone }))), N, phone);
+  for (const phone of ['', '555-0142', '615 555 0142 ext 3', 'six one five five five five oh one four two', '615 555 0142 or 615 555 0199', '0155550142'])
+    assert.equal(confirmedCallback(vapi(vapiSave({ ...READ_BACK, callback_phone: phone }))), '', phone);
+  // callback_read_back must be exactly true.
+  for (const flag of [false, 'true', undefined]) assert.equal(confirmedCallback(vapi(vapiSave({ callback_phone: N, callback_read_back: flag }))), '', String(flag));
+  // The last save call decides, even when an earlier one had a different number or a read-back.
+  assert.equal(confirmedCallback(vapi(vapiSave(READ_BACK, 'a'), vapiSave({ callback_phone: '6155550199', callback_read_back: true }, 'b'))), '6155550199');
+  assert.equal(confirmedCallback(vapi(vapiSave(READ_BACK, 'a'), vapiSave({ callback_phone: '', callback_read_back: false }, 'b'))), '');
+  // Other tools, results, broken arguments and user turns are not save calls.
+  assert.equal(confirmedCallback(vapi([{ role: 'tool_calls', toolCalls: [{ function: { name: 'add_request_note', arguments: saveArgs(READ_BACK) } }] }])), '');
+  assert.equal(confirmedCallback(vapi([{ role: 'tool_call_result', name: 'submit_service_request', result: saveArgs(READ_BACK) }])), '');
+  assert.equal(confirmedCallback(vapi([{ role: 'tool_calls', toolCalls: [{ function: { name: 'submit_service_request', arguments: '{"callback_phone":"6155550142",' } }] }])), '');
+  assert.equal(confirmedCallback(vapi([{ role: 'user', toolCalls: [{ function: { name: 'submit_service_request', arguments: saveArgs(READ_BACK) } }] }])), '');
   assert.equal(confirmedCallback({}), '');
-  assert.equal(confirmedCallback({ artifact: { messages: [{ role: 'assistant', content: 'So 615 555 0142?' }, { role: 'user', content: 'Yes.' }] } }), '6155550142');
-  // Never mark a number confirmed unless the caller's next turn is a plain yes to Emma's read-back question.
-  const N = '6155550142', ask = ['bot', 'Is it six one five, five five five, oh one four two?'];
-  for (const reply of ['Yes, but it ends in 43.', 'Yeah no, that is my old number.', 'Yes... wait.', 'Yes?', 'Right, but the last digit is 3.',
-    "Correct me if I'm wrong but I said 0143."]) assert.equal(confirmedCallback(msg([ask, ['user', reply]])), '', reply);
-  assert.equal(confirmedCallback(msg([ask, ['user', 'Mhm.']])), N);
-  for (const reply of ['Yes, oh one four three.', 'Yeah, ending in four three.', "Yeah, last digit's three."])
-    assert.equal(confirmedCallback(msg([ask, ['user', reply]])), '', reply);
-  for (const later of ['That phone number is wrong, it should be oh one four three.', 'The last four are oh one four three.', "No, that's not it, it's oh one four three."])
-    assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'Thanks. Anything else?'], ['user', later]])), '', later);
-  assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'Sorry, so 615 555 0143, and what is the address?'], ['user', 'Yes, 12 Elm.']])), '');
-  for (const reply of ["Yes ma'am.", "Yeah that's correct, thank you.", 'Oh yes.']) assert.equal(confirmedCallback(msg([ask, ['user', reply]])), N, reply);
-  assert.equal(confirmedCallback(msg([['bot', 'Okay, 615 555 0142. Is that right?'], ['user', "Yep, that's it."]])), N);
-  assert.equal(confirmedCallback(msg([['bot', 'I have 615 555 0142. Is this urgent?'], ['user', 'Yeah, water everywhere']])), '');
-  assert.equal(confirmedCallback(msg([['bot', 'Got it, 615 555 0142.'], ['bot', 'Is this an emergency?'], ['user', 'Yes!']])), '');
-  assert.equal(confirmedCallback(msg([['bot', 'You can also reach the office at 615 555 0100.'], ['user', 'Right, okay.']])), '');
-  assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'So 615 555 0143?']])), '', 'a later unconfirmed read-back clears it');
-  assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'And the address?'], ['user', 'Oh, actually that number ends in 43.']])), '');
-  assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'So 615 555 0199?'], ['user', 'Yes.']])), '6155550199');
+  // Retractions in the transcript never yield a confirmed number without a save call (grader rounds 1-3), however worded.
+  const later = reply => vapi(turns(ASK, ['user', 'Yes.'], ['bot', 'And the address?'], ['user', reply]));
+  for (const reply of ['Yes.', 'Mhm.', "Yeah, that's it.", 'Yes. Scratch that.', 'Yes. Never mind, use my work line.', 'Yes. Hang on.', 'Yeah, um, let me check.',
+    'Yes, or maybe my other cell.', 'Correct, well, almost.', 'Yes, I think so.', 'Yes, but it ends in 43.'])
+    assert.equal(confirmedCallback(vapi(turns(ASK, ['user', reply]))), '', reply);
+  for (const reply of ['Hold on, scratch that number.', 'Hmm, I gave you my old one.', "That number's off by one digit.", 'Oh, the area code is actually 555.'])
+    assert.equal(confirmedCallback(later(reply)), '', reply);
+  assert.equal(confirmedCallback(vapi(turns(['bot', 'Is our number 615 555 0100 the one you called?'], ['user', 'Yes.']))), '');
+  // A retraction after Emma's save call: the save call is what Emma submitted after the caller's yes, so it still stands.
+  assert.equal(confirmedCallback(vapi(turns(ASK, ['user', 'Yes.']), vapiSave(READ_BACK), turns(['user', 'Scratch that.']))), N);
+});
+
+test('hang-up labels: confirmed only for a save call; an older stored number is not verified', () => {
+  const route = { business: 'Gold Star Plumbing' };
+  const lead = extra => ({ name: 'Unknown caller', address: '', issue: 'Hung up before finishing', caller_id: '+16155550100', ...extra });
+  const tool = lead({ callback_phone: '6155550142', callback_source: 'tool' });
+  assert.match(alertText(route, tool, 'hangup'), /\nUnknown caller - \(615\) 555-0142 \(confirmed on the call; caller ID \(615\) 555-0100\)\n/);
+  assert.match(alertText(route, tool, 'hangup', 'email'), /\nUnknown caller - \(615\) 555-0142 \(confirmed on the call; caller ID \(615\) 555-0100\)\n/);
+  assert.match(alertText(route, lead({ callback_phone: '6155550100', callback_source: 'tool' }), 'hangup'), /\nUnknown caller - \(615\) 555-0100 \(confirmed on the call\)\n/);
+  assert.equal(alertSubject(tool, 'hangup'), 'Caller hung up – (615) 555-0142 – call them back');
+  // A hang-up stored before callback_source existed (an older transcript rule picked the number): never "confirmed".
+  const old = lead({ callback_phone: '6155550142' });
+  for (const channel of ['sms', 'email']) {
+    const text = alertText(route, old, 'hangup', channel);
+    assert.match(text, /\nUnknown caller - \(615\) 555-0142 \(from the call transcript, not verified; caller ID \(615\) 555-0100\)\n/); assert.doesNotMatch(text, /confirmed/);
+  }
+  assert.equal(alertSubject(old, 'hangup'), 'Caller hung up – (615) 555-0142 (not verified) – call them back');
+  const none = lead({ callback_phone: '', callback_source: '' });
+  assert.match(alertText(route, none, 'hangup'), /\nUnknown caller - \(615\) 555-0100 \(caller ID\)\n/);
+  assert.equal(alertSubject(none, 'hangup'), 'Caller hung up – (615) 555-0100 – call them back');
+  const { text } = digestEmail(route, 'Thursday, October 15', { calls: 3, jobs: [], hangups: [{ details: tool }, { details: old }, { details: none }] });
+  assert.match(text, /Hang-ups: 3\n- \(615\) 555-0142 \(confirmed on the call\) – call them back\n- \(615\) 555-0142 \(from the call transcript, not verified\) – call them back\n- \(615\) 555-0100 – call them back\n/);
+});
+
+test('transcript excerpt: length, speaker tag, empty report', () => {
   const turn = { artifact: { transcript: `AI: Hi.\nUser: ${'blah '.repeat(400)}the end` } };
-  assert.match(transcriptExcerpt(turn), /^\u2026User: \u2026blah/); assert.ok(transcriptExcerpt(turn).length <= 1500);
+  assert.match(transcriptExcerpt(turn), /^…User: …blah/); assert.ok(transcriptExcerpt(turn).length <= 1500);
   const long = { artifact: { transcript: Array.from({ length: 80 }, (_, i) => `${i % 2 ? 'User' : 'AI'}: line ${i} of the call`).join('\n') } };
   const excerpt = transcriptExcerpt(long);
-  assert.ok(excerpt.length <= 1500); assert.match(excerpt, /^\u2026(AI|User): line \d+/); assert.match(excerpt, /User: line 79 of the call$/);
+  assert.ok(excerpt.length <= 1500); assert.match(excerpt, /^…(AI|User): line \d+/); assert.match(excerpt, /User: line 79 of the call$/);
   assert.equal(transcriptExcerpt({}), '');
 });
 

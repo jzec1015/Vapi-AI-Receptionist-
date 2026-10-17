@@ -50,26 +50,6 @@ export function formatPhone(value) {
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : String(value || '');
 }
 
-// Phone numbers in one turn of speech: 10-digit US numbers written as numerals ("615-555-0142") or read out
-// ("six one five, five five five, oh one four two"). A run of digits ends at any other word or at ? or !; a run that is
-// not exactly one number (an address glued to it, a missing digit) yields nothing rather than a guess.
-const DIGIT_WORDS = { zero: '0', oh: '0', o: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
-// Runs of digits in one turn of speech, numerals or digit words, each as a digit string ("oh one four three" -> "0143").
-export function digitRuns(text) {
-  const runs = [];
-  let run = '';
-  for (const token of String(text || '').toLowerCase().split(/([?!\n])|[\s,.;:()+\-\u2013\u2014]+/)) {
-    if (!token) continue;
-    if (/^\d+$/.test(token)) run += token;
-    else if (Object.hasOwn(DIGIT_WORDS, token)) run += DIGIT_WORDS[token];
-    else { if (run) runs.push(run); run = ''; }
-  }
-  if (run) runs.push(run);
-  return runs;
-}
-export function phoneNumbersIn(text) {
-  return digitRuns(text).map(run => run.replace(/^0+/, '').replace(/^1(?=\d{10}$)/, '')).filter(d => /^[2-9]\d{9}$/.test(d));
-}
 // The spoken turns of a call from Vapi's end-of-call report: artifact.messages (role bot/user, text in message; or
 // OpenAI-style assistant/user with content), else the artifact.transcript lines ("AI: ..." / "User: ...").
 export function callTurns(message) {
@@ -84,51 +64,37 @@ export function callTurns(message) {
   }
   return turns;
 }
-// The callback number to trust from a call that ended before a save, as 10 digits; '' when there is no clean confirmation.
-// A number counts only when Emma ASKED it back (the number is in her question, or her question right after it is just
-// "is that right?") and the caller's very next turn is a plain yes ("yes", "yeah", "that's right", "mhm") with nothing
-// after it that could be a correction: no digits (numerals or words), no "no", "but", "wait", "ending", "last" or "?".
-// Anything later that could change it clears it: another number Emma says, a caller turn with three or more digits that
-// are not part of the number, or words like "wrong", "should be", "ends in". A wrong number marked confirmed is worse
-// than none: with none, the office calls the caller ID.
-const CONFIRMED = /^\W*(?:(?:uh|um|mm|oh|okay|ok)\W+)?(?:yes|yeah|yep|yup|ya|correct|that'?s (?:right|correct|it)|that is (?:right|correct)|right|exactly|you got it|uh[- ]?huh|mhm+|mm[- ]?hmm)\b/i;
-const DOUBT = /\?|\d|\b(?:no|nope|nah|not|but|actually|wait|hold on|except|wrong|old|ends?|ending|last|digits?|should|instead|meant|change|different|sorry|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/i;
-const CORRECTION = /\b(?:ends? (?:in|with)|ending (?:in|with)|wrong|should be|last (?:four|three|two|digits?|number)|not (?:my|the right|it|right)|old number|different number|meant)\b/i;
-const CHECK_QUESTION = /^\W*(?:(?:is|was|did i get|have i got)\s+)?(?:that|it|this|those|i)?\s*(?:right|correct|all right)?\W*(?:right|correct)?\?\s*$/i;
-function readBackIn(text) {
-  const number = phoneNumbersIn(text).at(-1);
-  if (!number) return '';
-  const sentences = String(text).split(/(?<=[.?!])\s+/);
-  let k = -1;
-  sentences.forEach((sentence, i) => { if (phoneNumbersIn(sentence).includes(number)) k = i; });
-  if (k < 0) return '';
-  const after = sentences.slice(k + 1).join(' ').trim();
-  if (!after) return /\?\s*$/.test(sentences[k]) ? number : '';
-  return CHECK_QUESTION.test(after) ? number : '';
-}
-const plainYes = text => {
-  const t = String(text).replace(/\u2019/g, "'").trim();
-  const yes = t.match(CONFIRMED);
-  return !!yes && !DOUBT.test(t.slice(yes[0].length)) && !/\?|\d/.test(t) && t.split(/\s+/).length <= 8;
-};
-export function confirmedCallback(message) {
-  const turns = [];
-  for (const turn of callTurns(message)) {
-    if (turns.at(-1)?.role === turn.role) turns.at(-1).text += ` ${turn.text}`;
-    else turns.push({ ...turn });
+// The arguments of every submit_service_request call Emma made, oldest first, from Vapi's end-of-call report. Vapi lists
+// a tool call as {role: 'tool_calls', toolCalls: [{function: {name, arguments}}]} in artifact.messages and as
+// {role: 'assistant', tool_calls: [...]} in artifact.messagesOpenAIFormatted; arguments is a JSON string (an object is
+// read as is). The first of artifact.messages, artifact.messagesOpenAIFormatted and messages that holds any such call is
+// used (they are the same call in different formats). Arguments that are not valid JSON count as {}.
+function submitCalls(message) {
+  const args = raw => {
+    if (raw && typeof raw === 'object') return raw;
+    try { const parsed = JSON.parse(raw); return parsed && typeof parsed === 'object' ? parsed : {}; } catch { return {}; }
+  };
+  for (const list of [message.artifact?.messages, message.artifact?.messagesOpenAIFormatted, message.messages]) {
+    if (!Array.isArray(list)) continue;
+    const calls = list.filter(m => ['tool_calls', 'assistant'].includes(m?.role))
+      .flatMap(m => [m.toolCalls, m.tool_calls].filter(Array.isArray).flat())
+      .filter(call => call?.function?.name === 'submit_service_request').map(call => args(call.function.arguments));
+    if (calls.length) return calls;
   }
-  let number = '';
-  turns.forEach((turn, i) => {
-    if (turn.role === 'user') {
-      if (CORRECTION.test(turn.text) || digitRuns(turn.text).some(run => run.length >= 3 && !number.includes(run.replace(/^1(?=\d{10}$)/, '')))) number = '';
-      return;
-    }
-    const read = readBackIn(turn.text);
-    if (!read) { if (phoneNumbersIn(turn.text).some(n => n !== number)) number = ''; return; }
-    const reply = turns[i + 1];
-    number = reply?.role === 'user' && plainYes(reply.text) ? read : '';
-  });
-  return number;
+  return [];
+}
+// The callback number the caller confirmed on a call that ended without a saved request, as 10 digits, or ''.
+// It comes only from Emma's own submit_service_request call (a save that failed, or a call that dropped mid-save): the
+// LAST such call decides, and only when its callback_read_back is exactly true and its callback_phone is a string of
+// digits, spaces and ( ) + . - holding 10 digits that start 2-9 (an 11th, leading 1 is dropped). Emma's prompt lets her
+// set callback_read_back true only after reading the number back and hearing a yes. The transcript is not read for this:
+// with no such call it returns '' and the hang-up lead falls back to the caller ID.
+export function confirmedCallback(message) {
+  const last = submitCalls(message).at(-1);
+  if (last?.callback_read_back !== true || typeof last.callback_phone !== 'string') return '';
+  if (/[^\d\s()+.\-]/.test(last.callback_phone)) return '';
+  const digits = digitsOf(last.callback_phone);
+  return /^[2-9]\d{9}$/.test(digits) ? digits : '';
 }
 // The end of the call's transcript (at most max characters, cut at a line or word), so the office sees what the caller said.
 export function transcriptExcerpt(message, max = 1500) {
@@ -223,10 +189,16 @@ export function subjectLine(head, topic, address, phone, max = 90) {
   if (what.length < 12 && place) { place = clip(street, room - 12); what = clip(topic, room - place.length); }
   return [head, what, place, phone].filter(Boolean).join(SEP).slice(0, max);
 }
+// How a hang-up lead's callback_phone was found, for the office alert and the digest. callback_source 'tool': Emma's own
+// submit_service_request call with callback_read_back true (confirmedCallback). A hang-up lead stored before
+// callback_source existed may carry a number an older transcript rule picked; it is never called confirmed.
+export const hangupCallbackLabel = details => !details.callback_phone ? '' :
+  details.callback_source === 'tool' ? 'confirmed on the call' : 'from the call transcript, not verified';
 export function alertSubject(details, kind = 'new') {
   const urgent = isUrgent(details.issue);
   const phone = formatPhone(details.callback_phone || details.caller_id) || 'no number given';
-  if (kind === 'hangup') return `Caller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${SEP}call them back`;
+  const unverified = details.callback_phone && details.callback_source !== 'tool' ? ' (not verified)' : '';
+  if (kind === 'hangup') return `Caller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${unverified}${SEP}call them back`;
   if (kind === 'unanswered') return subjectLine('UNANSWERED URGENT', details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
   const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : urgent ? 'URGENT' : 'New job';
   return subjectLine(head, kind === 'note' ? details.notes.at(-1) : details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
@@ -270,9 +242,9 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   const urgent = isUrgent(details.issue);
   const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
-  // A hang-up lead's callback number came from Emma's read-back; the caller ID is shown too when it differs.
-  const also = kind === 'hangup' && details.callback_phone && details.caller_id && digitsOf(details.caller_id) !== digitsOf(details.callback_phone)
-    ? ` (confirmed on the call; caller ID ${formatPhone(details.caller_id)})` : '';
+  // A hang-up lead's callback number carries how it was found (hangupCallbackLabel), plus the caller ID when that differs.
+  const callerIdToo = details.caller_id && digitsOf(details.caller_id) !== digitsOf(details.callback_phone) ? `; caller ID ${formatPhone(details.caller_id)}` : '';
+  const also = kind === 'hangup' && details.callback_phone ? ` (${hangupCallbackLabel(details)}${callerIdToo})` : '';
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
   const lines = [`Anchorline AI: ${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} - ${phone}${also}`];
   if (details.address) lines.push(details.address);
@@ -303,7 +275,7 @@ export function digestEmail(route, label, stats) {
     ...urgent.map(u => `- Urgent${SEP}${u.details.name}${SEP}${street(u.details)}${SEP}${u.ring}`),
     `High-value jobs: ${high.length}`, ...high.map(h => `- High-value${SEP}${h.details.name}${SEP}${street(h.details)}${SEP}${what(h.details)}`),
     `Routine jobs: ${routine.length}`, ...routine.map(r => `- Routine${SEP}${r.details.name}${SEP}${street(r.details)}${SEP}${what(r.details)}`),
-    `Hang-ups: ${hangups.length}`, ...hangups.map(h => `- ${formatPhone(h.details.callback_phone || h.details.caller_id)}${h.details.greeting_hangup ? ' (hung up during greeting)' : ''}${SEP}call them back`), '',
+    `Hang-ups: ${hangups.length}`, ...hangups.map(h => `- ${formatPhone(h.details.callback_phone || h.details.caller_id)}${h.details.callback_phone ? ` (${hangupCallbackLabel(h.details)})` : ''}${h.details.greeting_hangup ? ' (hung up during greeting)' : ''}${SEP}call them back`), '',
     calls ? 'Every job was emailed to you as it came in.' : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working. ' +
       'If you expected calls, check that your shop line still forwards to Emma.', '', 'Anchorline AI'];
   return { subject, text: lines.join('\n') };
@@ -988,15 +960,16 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const summary = String(message.analysis?.summary || message.summary || '').trim().slice(0, 1000);
     // A caller who said "test call" is a test; never alert a client about it.
     const said = `${message.artifact?.transcript || message.transcript || ''} ${summary}`;
-    // What the caller said and the number Emma read back and they confirmed (e.g. a save that failed mid-deploy), from the
-    // report's own transcript: no extra Vapi call. Only a number Emma asked back and the caller answered with a plain yes
-    // (confirmedCallback); otherwise callback_phone stays empty and the office uses the caller ID.
+    // From the report itself (no extra Vapi call): the end of the transcript, and the callback number from Emma's own
+    // submit_service_request call with callback_read_back true, e.g. a save that failed or a call that dropped mid-save
+    // (confirmedCallback; callback_source 'tool'). Without one, callback_phone and callback_source stay '' and the office
+    // uses the caller ID; any number said on the call is only in the transcript excerpt.
     const excerpt = greeting ? '' : transcriptExcerpt(message);
     const callback = greeting ? '' : confirmedCallback(message);
     const issue = greeting ? 'Hung up during the greeting, before giving any details' :
       `${summary ? `Hung up before finishing. Summary: ${summary}` : excerpt ? 'Hung up before finishing' : 'Hung up before giving details'}` +
       `${excerpt ? `\nTranscript (end of call):\n${excerpt}` : ''}`;
-    const details = { name: 'Unknown caller', address: '', issue, is_test: /test call/i.test(said), callback_phone: callback, caller_id: callerId, email: '', notes: [],
+    const details = { name: 'Unknown caller', address: '', issue, is_test: /test call/i.test(said), callback_phone: callback, callback_source: callback ? 'tool' : '', caller_id: callerId, email: '', notes: [],
       ...(greeting ? { greeting_hangup: true } : {}), ...(recordingOf(message) ? { recording_url: recordingOf(message) } : {}) };
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
