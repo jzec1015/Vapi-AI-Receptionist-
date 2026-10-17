@@ -63,6 +63,7 @@ export const isUrgent = issue => /^\s*URGENT\b/i.test(issue);
 //                 (not "water heater repair", "pilot light", "replace the faucet by the water heater"); also tankless
 //   repipe        repipe, re-pipe, repiping
 //   main/sewer    main/sewer line with replace, repair, backup, dig, excavate, collapsed, broken or cracked about the line
+//                 and any sewer or sewage backup (not "sewer smell")
 //                 (not "replace the shutoff valve on the main water line", not "sewer line camera inspection")
 //   other         slab leak, remodel, new construction, whole-house re-plumb/repipe/filter/softener ("whole house" alone
 //                 is how callers describe low pressure, so it does not count)
@@ -82,6 +83,7 @@ const HIGH_VALUE = [
   String.raw`\b${LINE_WORK}\s+(?:(?:the|a|our|my|their|old|broken|cracked|whole)\s+){0,3}${LINE}`,
   String.raw`\b${BACKUP}\b.*?\b${LINE}`,
   String.raw`\bsewer\s+(?:replacement|repair)\b`,
+  String.raw`\bsew(?:er|age)\s+back(?:ed|ing)?[\s-]?ups?\b`,
   String.raw`\bslab\s+leaks?\b`,
   String.raw`\bremodel(?:s|ed|ing)?\b`,
   String.raw`\bnew\s+construction\b`,
