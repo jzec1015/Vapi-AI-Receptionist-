@@ -814,7 +814,7 @@ test('social round 2: an interrupted read-back is read again in full, and phone 
   assert.ok(phone.indexOf('If the caller corrects any digit, read the whole corrected number back') < phone.indexOf('Only a number you couldn'), 'the correction read-back rule comes first and is unchanged');
   // A capped caller who must be saved right away is saved, and the office is told why there is no number.
   assert.match(prompt, /If you couldn't get a number \(THE PHONE NUMBER RULE\), save those callers right away too\./);
-  assert.match(prompt, /Once it's confirmed, or you couldn't get one, ask for the email and preferred time/);
+  assert.match(prompt, /Once it's confirmed, or you couldn't get one, read back the address if you haven't \(item 3\), then ask for the email and preferred time/);
   once("couldn't confirm a callback number, bad line");
   // Caller ID can be blocked and Emma can't see it, so no line promises the team "has" the calling number.
   assert.doesNotMatch(prompt, /team will have the number you're calling from|sent this to the team with the number/);
@@ -840,6 +840,7 @@ test('read-back fixes: phone read-back before any follow-up, only a plain yes co
   const prompt = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key }).model.messages[0].content;
   const once = text => assert.equal(prompt.split(text).length - 1, 1, `"${text}" appears exactly once`);
   const section = (name, next) => prompt.slice(prompt.indexOf(name), prompt.indexOf(next, prompt.indexOf(name)));
+  const wrapping0 = section('WRAPPING UP', 'ENDING THE CALL');
   // H1: the follow-up rule itself points to the read-back, and the phone rule says the read-back beats any follow-up.
   const curious = section('BE CURIOUS', 'WHAT TO GET');
   assert.match(curious, /ask ONE short follow-up that fits it, and a second only if the job is still unclear, unless they've just given a callback number: read it back first, see THE PHONE NUMBER RULE\./);
@@ -848,7 +849,12 @@ test('read-back fixes: phone read-back before any follow-up, only a plain yes co
   once("unless they've just given a callback number");
   once('before any follow-up or sizing question');
   // H2: only a plain yes to the read-back itself sets callback_read_back; anything else gets one more read-back, then the fallback.
-  assert.match(phone, /Set callback_read_back true only if you actually read it back in this call and they said yes\. Only a plain yes to the read-back itself counts; another topic, a question, a no or silence is not a yes, so answer briefly if needed, then read the whole number back once more\. If that still gets no yes, use the fallback below, noting "couldn't confirm a callback number"\./);
+  assert.match(phone, /Set callback_read_back true only if you actually read it back in this call and they said yes\. Only a plain yes to the read-back itself counts; another topic, a question or silence is not a yes, so answer briefly if needed, then read the whole number back once more\. After a bare no, ask for the number again\. If you still get no yes, use the fallback below, noting "couldn't confirm a callback number"\./);
+  once('After a bare no, ask for the number again.');
+  // S1: before the save, the address is read back (if not yet) before the email ask; the after-save rule only catches an address still unread, so it is never read twice.
+  assert.match(wrapping0, /Once it's confirmed, or you couldn't get one, read back the address if you haven't \(item 3\), then ask for the email and preferred time \(items 6 and 7\), then call submit_service_request right away\./);
+  assert.ok(wrapping0.indexOf("read back the address if you haven't") < wrapping0.indexOf("if they gave an address you haven't read back yet"), 'the pre-save address step comes before the after-save catch');
+  once("read back the address if you haven't (item 3)");
   once('Only a plain yes to the read-back itself counts');
   // H3: WRAPPING UP reads an unread address back on its own after the save, before the close and "Anything else?".
   const wrapping = section('WRAPPING UP', 'ENDING THE CALL');
