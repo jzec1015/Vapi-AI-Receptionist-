@@ -767,7 +767,7 @@ test('social pass: Emma yields to interruptions, re-reads only a correction, cap
   const section = (name, next) => prompt.slice(prompt.indexOf(name), prompt.indexOf(next, prompt.indexOf(name)));
   // c: interrupted mid-sentence, she stops, uses what they said, and never restarts.
   const sound = section('HOW YOU SOUND', 'BE CURIOUS');
-  assert.match(sound, /If the caller starts talking while you're speaking, stop\. Use what they just said; if it answers your question, go straight to the next thing\. Never repeat or restart the sentence you were cut off in\./);
+  assert.match(sound, /If the caller starts talking while you're speaking, stop\. Use what they just said; if it answers your question, go straight to the next thing\. Never repeat or restart the sentence you were cut off in, except a read-back/);
   assert.match(sound, /Use your own words, except the read-backs and the exact lines quoted in this prompt\./);
   // f: a correction is said back alone; the phone number keeps its whole read-back.
   assert.match(prompt, /If they correct something, take it once and say back only the corrected part \("Got it, two-forty Elm\." or "Kowalski with a K, got it\."\), then carry on without re-asking the rest\. The phone number is the exception: it always gets the whole read-back\./);
@@ -780,9 +780,10 @@ test('social pass: Emma yields to interruptions, re-reads only a correction, cap
   assert.match(natural, /Never use the same wording twice in a row, and never ask for the same detail more than twice; then move on with what you have/);
   assert.match(prompt, /Asks to repeat follow STAYING NATURAL instead\./);
   const phone = section('THE PHONE NUMBER RULE (', 'SHOP DETAILS');
-  assert.match(phone, /If you have no number they've said yes to after asking twice, stop asking, say "No problem, the team will have the number you're calling from," and from then on treat it as no number given\. The only exceptions are that case and a caller who refuses to give a number \(see NEVER LOSE A CALLER\): then save with callback_phone empty\./);
+  assert.match(phone, /If you still can't make out a whole number after asking for it twice, stop asking, say "No problem, I'll pass on the number you're calling from, if it shows on our end," add "couldn't confirm a callback number, bad line" to job_details, and from then on treat it as no number given\./);
+  assert.match(phone, /The only exceptions are that fallback and a caller who refuses to give a number \(see NEVER LOSE A CALLER\): then save with callback_phone empty\./);
   assert.doesNotMatch(prompt, /Sorry, I only caught part of that|Sorry about that, could you spell just that part again|Sorry, I want to get that right/);
-  once('the team will have the number you');
+  once("I'll pass on the number you're calling from");
   // Safety flag: a goodbye then waiting for theirs; "nothing else" is no longer a reason to end the call.
   const ending = section('ENDING THE CALL', 'THINGS YOU DON\'T DO');
   assert.match(ending, /Never hang up first\. When they say there's nothing else, say one short goodbye \("Take care, Dorothy\."\) and wait for theirs\./);
@@ -796,4 +797,29 @@ test('social pass: Emma yields to interruptions, re-reads only a correction, cap
     assert.ok(line.split(/\s+/).length <= 25, `quoted line over 25 words: ${line}`);
   // d: shorter than the voice-upgrade text (3,098 template words), with each rule still stated once.
   assert.ok(prompt.split(/\s+/).length < 2900, `prompt has ${prompt.split(/\s+/).length} words`);
+});
+
+test('social round 2: an interrupted read-back is read again in full, and phone corrections are not failed tries', () => {
+  const shop = { id: 'client-7', business: 'Riverbend Plumbing', owner_name: 'Dana Whitfield', shop_number: '+16155550100', city: 'Nashville', state: 'TN', services: 'Drains' };
+  const prompt = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key }).model.messages[0].content;
+  const once = text => assert.equal(prompt.split(text).length - 1, 1, `"${text}" appears exactly once`);
+  const section = (name, next) => prompt.slice(prompt.indexOf(name), prompt.indexOf(next, prompt.indexOf(name)));
+  // H1: the no-restart rule never cuts a read-back short; a barge-in yes to a half-read number doesn't count.
+  const sound = section('HOW YOU SOUND', 'BE CURIOUS');
+  assert.match(sound, /Never repeat or restart the sentence you were cut off in, except a read-back: if they cut into a read-back of the phone number, address or email, read the whole thing back again and wait for a clear yes\./);
+  once('except a read-back');
+  // M2: only a number she couldn't make out is a failed try; corrections are capped separately, so there is no endless loop.
+  const phone = section('THE PHONE NUMBER RULE (', 'SHOP DETAILS');
+  assert.match(phone, /Only a number you couldn't make out counts as a failed try; a caller correcting a digit after your read-back does not, but if you still have no yes after two corrections, use the same fallback\./);
+  assert.ok(phone.indexOf('If the caller corrects any digit, read the whole corrected number back') < phone.indexOf('Only a number you couldn'), 'the correction read-back rule comes first and is unchanged');
+  // A capped caller who must be saved right away is saved, and the office is told why there is no number.
+  assert.match(prompt, /If you couldn't get a number \(THE PHONE NUMBER RULE\), save those callers right away too\./);
+  assert.match(prompt, /Once it's confirmed, or you couldn't get one, ask for the email and preferred time/);
+  once("couldn't confirm a callback number, bad line");
+  // Caller ID can be blocked and Emma can't see it, so no line promises the team "has" the calling number.
+  assert.doesNotMatch(prompt, /team will have the number you're calling from|sent this to the team with the number/);
+  assert.match(prompt, /"Okay, I've sent this to the team, with the number you're calling from if it shows on our end\."/);
+  // Restored from the voice-upgrade text.
+  assert.match(prompt, /every letter and digit with none skipped \(count them against what they spelled\)/);
+  assert.match(prompt, /Don't invent hours or policies; offer to pass the question along\./);
 });
