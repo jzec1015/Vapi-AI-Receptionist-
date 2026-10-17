@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
-import { createApp, alertText } from './server.mjs';
+import { createApp, alertText, priorityTier } from './server.mjs';
 
 const key = 'synthetic-test-key-not-used-in-production';
 const routes = JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'] } });
@@ -163,4 +163,49 @@ test('a late email is only added after spell-back and then sends the confirmatio
   const added = await result(await post(toolCall('late-1', 'add_customer_email', { email: 'linda@example.com', confirmed_after_spelling_back: true })));
   assert.equal(added.email_added, true); assert.equal(added.caller_email, 'accepted');
   assert.ok(sent.some(s => s.url.includes('resend') && s.body.to[0] === 'linda@example.com' && /we received your request/.test(s.body.subject)));
+});
+
+test('priority tiers: urgent, high-value (big job or big-ticket work), routine', () => {
+  const cases = [
+    [{ issue: 'URGENT - burst pipe', job_size: 'Big job (half day+)', job_type: 'Repipe' }, 'urgent', 'urgent beats a big job'],
+    [{ issue: 'urgent - no water', job_size: 'Unknown' }, 'urgent', 'any case'],
+    [{ issue: 'No hot water', job_type: 'Water heater replacement' }, 'high-value', 'water heater replacement'],
+    [{ issue: 'Wants to replace the old 50-gallon water heater' }, 'high-value', 'replace ... water heater'],
+    [{ issue: 'Quote for a new gas water heater' }, 'high-value', 'new water heater'],
+    [{ issue: 'Interested in going tankless' }, 'high-value', 'tankless'],
+    [{ issue: 'No hot water', job_type: 'Water heater repair', job_details: 'Pilot light keeps going out' }, 'routine', 'water heater repair is not high-value'],
+    [{ issue: 'Pilot light out' }, 'routine', 'pilot light alone'],
+    [{ issue: 'Old galvanized pipes', job_type: 'Whole-house repipe' }, 'high-value', 'repipe'],
+    [{ issue: 'Needs repiping', job_size: 'Unknown' }, 'high-value', 'repiping'],
+    [{ issue: 'Backups in every drain', job_details: 'Main line clogged with roots' }, 'high-value', 'main line'],
+    [{ issue: 'Sewer line collapsed in the yard' }, 'high-value', 'sewer line'],
+    [{ issue: 'Warm spot on the floor', job_type: 'Slab leak' }, 'high-value', 'slab leak'],
+    [{ issue: 'Bathroom remodel rough-in' }, 'high-value', 'remodel'],
+    [{ issue: 'Plumbing for new construction' }, 'high-value', 'new construction'],
+    [{ issue: 'Leaky faucet', job_type: 'Replace a faucet', job_size: 'Quick job (under 1 hr)' }, 'routine', 'faucet replace'],
+    [{ issue: 'Toilet runs', job_type: 'Replace toilet', job_size: 'Standard job (1-3 hrs)' }, 'routine', 'toilet replace'],
+    [{ issue: 'Replace the faucet by the water heater' }, 'routine', 'faucet near a water heater'],
+    [{ issue: 'Something odd', job_size: 'Big job (half day+)' }, 'high-value', 'big job size'],
+    [{ issue: 'Something odd', job_size: 'Unknown' }, 'routine', 'unknown size'],
+    [{ issue: 'Main street address, drip under sink' }, 'routine', 'main without line'],
+    [{ issue: 'Hung up before giving details' }, 'routine', 'hang-up with no job info'],
+    [{}, 'routine', 'empty fields'],
+    [{ issue: '', job_type: '', job_size: '', job_details: '' }, 'routine', 'empty strings'],
+  ];
+  for (const [details, tier, why] of cases) assert.equal(priorityTier(details), tier, why);
+});
+
+test('the job card shows the priority tier under the heading', () => {
+  const route = { business: 'Gold Star Plumbing' };
+  const base = { name: 'Linda Harper', address: '48 Birch Road', callback_phone: '6155550142', notes: [], job_type: '', job_size: '', job_details: '' };
+  const big = { ...base, issue: 'Galvanized pipes rusting', job_type: 'Whole-house repipe', job_size: 'Big job (half day+)' };
+  assert.match(alertText(route, big, 'new', 'email'), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: High-value job\nLinda Harper/);
+  assert.match(alertText(route, big), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: High-value job\n/);
+  assert.match(alertText(route, { ...base, issue: 'URGENT - burst pipe' }, 'new', 'email'), /^Anchorline AI: URGENT call - Gold Star Plumbing\nPriority: Urgent\n/);
+  assert.match(alertText(route, { ...base, issue: 'Dripping faucet' }, 'new', 'email'), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: Routine\n/);
+  assert.doesNotMatch(alertText(route, { ...base, issue: 'Dripping faucet' }), /Priority/, 'routine SMS stays short');
+  assert.doesNotMatch(alertText(route, { ...base, issue: 'URGENT - burst pipe' }), /Priority/, 'urgent SMS already says URGENT');
+  assert.match(alertText(route, { ...big, recording_url: 'https://example.com/r.wav' }, 'new', 'email'), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: High-value job\nRecording: /);
+  assert.doesNotMatch(alertText(route, { ...big, notes: ['Gate code'] }, 'note', 'email'), /Priority/);
+  assert.doesNotMatch(alertText(route, { ...base, issue: 'Hung up before giving details', caller_id: '+16155550100' }, 'hangup', 'email'), /Priority/);
 });
