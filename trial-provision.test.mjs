@@ -726,11 +726,25 @@ test('the voice upgrade adds its spoken style and address read-back once, withou
   // Spoken-style section sits right before THE PHONE NUMBER RULE, which is still last; its sample read-back uses the shop's area code.
   const talk = prompt.indexOf('HOW YOU ACTUALLY TALK');
   assert.ok(talk > prompt.indexOf('STAYING NATURAL') && talk < prompt.indexOf('THE PHONE NUMBER RULE ('));
-  assert.match(prompt, /"Okay, six one five, five five five, oh one four two\. That right\?"/);
+  // C2: the sample lines carry no read-back of their own; the read-back is worded only in item 4 and THE PHONE NUMBER RULE.
+  const style = prompt.slice(talk, prompt.indexOf('THE PHONE NUMBER RULE ('));
+  assert.doesNotMatch(style, /Reading a number back|Let me make sure I've got it|six one five|five five five/);
+  assert.equal(prompt.split('five five five, oh one four two').length - 1, 2, 'only item 4 and THE PHONE NUMBER RULE read a number back');
+  // C4: the no-punctuation style rule covers only her free-form talk and doesn't override scripted lines, spelling or question marks.
+  assert.match(style, /In your own free-form talk, never use colons, dashes, lists, bullet points, parentheses or line breaks; use plain spoken sentences with commas and periods, and ask at most one question per reply\. This does not change the exact lines quoted elsewhere in this prompt, spelling an email back letter by letter, or ending a question with a question mark\./);
+  assert.doesNotMatch(prompt, /Exactly one question per reply|commas and periods only/);
+  // The email ask is one question; the 0503 letter-by-letter read-back is unchanged.
+  assert.match(prompt, /after the phone number is confirmed, ask "And what's a good email for a confirmation\? Spell it out for me, letter by letter\." Speech recognition/);
+  assert.doesNotMatch(prompt, /Could you spell it out for me/);
+  assert.match(prompt, /in small groups with pauses \("J-A-K-E\.\.\. Z-E-C\.\.\. two-zero-one-six"\)/);
   assert.doesNotMatch(prompt, /seven two oh|Of course, we can help with that"\), then|say "Quick question,"|repeat the whole number once more|Always read back the house number/);
   // Address read-back is its own reply, stated once, in item 3 next to the five-or-more-digit check.
   const address = prompt.slice(prompt.indexOf('3. The service address.'), prompt.indexOf('4. The best callback number'));
-  assert.match(address, /make the read-back its own reply, only the question \("That's 412 Gallatin Pike\?"\) with nothing after it, then stop and wait for their answer\. If the house number has five or more digits/);
+  assert.match(address, /make the read-back its own reply, only the question \("That's four twelve Gallatin Pike\?"\) with nothing after it, then stop and wait for their answer\. If they give the callback number and the address together, the phone number read-back comes first, as THE PHONE NUMBER RULE says, and the address read-back is your next reply after they answer it\. If the house number has five or more digits/);
+  // C3: the example is spoken as words, like item 4 says for street numbers; C1: the phone rule itself is unchanged and last.
+  assert.doesNotMatch(prompt, /412 Gallatin/);
+  assert.match(prompt, /your very next reply must be ONLY the read-back question \("So that's six one five, five five five, oh one four two\?"\), with no tool call and nothing else; then stop talking and wait for their answer\./);
+  assert.ok(prompt.indexOf('THE PHONE NUMBER RULE (') > prompt.indexOf('HOW YOU ACTUALLY TALK'));
   for (const text of ['its own reply', 'skip any question the caller already answered', 'never fill it in from your own question', 'keep it and use it; never drop it', 'HOW YOU ACTUALLY TALK']) once(text);
   assert.doesNotMatch(prompt, /drains are affected|address read-back question/);
 });
