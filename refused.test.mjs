@@ -77,5 +77,5 @@ test('existing customers and "Not a job" calls save without an email; other non-
   assert.equal((await save('pitch', { ...noEmail, issue: 'Not a job - SEO company pitching services' }, readBack)).saved, true);
   const plain = await save('plain', noEmail, readBack);
   assert.equal(plain.saved, true);
-  assert.match(plain.next, /ask for their email/);
+  assert.match(plain.next, /ask for their email/i);
 });

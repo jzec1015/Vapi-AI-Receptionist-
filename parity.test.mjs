@@ -54,7 +54,8 @@ async function run(t, factory, steps) {
   for (const body of steps) {
     const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': prodEnv.VAPI_WEBHOOK_SECRET }, body: JSON.stringify(body) });
     const json = await response.json();
-    replies.push({ status: response.status, json: json.results ? json.results.map(r => JSON.parse(r.result)) : json });
+    // `next` (v5+) is guidance to Emma about follow-up questions, not behaviour v1.5.0 had; everything else must match.
+    replies.push({ status: response.status, json: json.results ? json.results.map(r => { const { next, ...rest } = JSON.parse(r.result); return rest; }) : json });
   }
   if (app.sweepTransfers) await app.sweepTransfers(Date.now() + 3600000);
   // Request IDs are random UUIDs; replace each with its order of appearance.

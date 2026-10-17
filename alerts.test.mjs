@@ -150,7 +150,7 @@ test('job type, size and details reach the office alert', async t => {
 test('a non-urgent job is saved before the email, and Emma is told to offer it next', async t => {
   const { post } = await fixture(t);
   const r = await result(await post(toolCall('skip-1', 'submit_service_request', { ...intake, issue: 'Faucet drip', email_status: 'skipped_emergency' })));
-  assert.equal(r.saved, true); assert.match(r.next, /ask for their email/); assert.match(r.next, /add_customer_email/);
+  assert.equal(r.saved, true); assert.match(r.next, /ask for their email/i); assert.match(r.next, /add_customer_email/);
   const after = await result(await post(toolCall('skip-3', 'submit_service_request', { ...intake, issue: 'Faucet drip', email_status: 'ask_after_save' })));
   assert.equal(after.saved, true); assert.match(after.next, /add_customer_email/);
   const ok = await result(await post(toolCall('skip-2', 'submit_service_request', { ...intake, email_status: 'skipped_emergency' })));
@@ -194,7 +194,7 @@ test('an empty save is sent back with "resend every field", never an instruction
 test('"not_needed" on an ordinary job is saved first with the email offered next; a line with no route never claims anyone was told', async t => {
   const { post } = await fixture(t);
   const r = await result(await post(toolCall('nn-1', 'submit_service_request', { ...intake, issue: 'Slow drain', email_status: 'not_needed' })));
-  assert.equal(r.saved, true); assert.match(r.next, /ask for their email/);
+  assert.equal(r.saved, true); assert.match(r.next, /ask for their email/i);
   const unrouted = await result(await post(toolCall('nr-1', 'submit_service_request', { ...intake, issue: 'Slow drain', email_status: 'ask_after_save' }, { assistantId: 'no-such-route' })));
   assert.equal(unrouted.saved, true); assert.equal(unrouted.office_alert, 'not_configured');
   assert.match(unrouted.say, /It's saved, and the team will see it\./);

@@ -105,6 +105,24 @@ export const spokenDigits = text => {
   return out;
 };
 
+// A day or time the caller would like ("Tuesday", "next week", "after 3", "weekends", "tomorrow morning").
+export const TIME_WORDS = /\b(?:mon|tues?|wed(?:nes)?|thu(?:rs?)?|fri|sat(?:ur)?|sun)(?:day)?s?\b|\b(?:tomorrow|today|tonight|weekends?|next week|this week|morning|afternoon|evening|noon|any ?time|asap)\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.|o'?clock)\b|\b(?:after|before|around) \d{1,2}\b/i;
+// What the caller said after the request was saved: user turns after the last submit_service_request result in the
+// transcript, or (no tool messages in it) after the save's time.
+export function callerWordsAfterSave(transcript, savedAt) {
+  if (!Array.isArray(transcript) || !transcript.length) return '';
+  const isSave = m => /submit_service_request/.test(JSON.stringify(m?.toolCalls || m?.tool_calls || m?.name || ''))
+    || (m?.role === 'tool_call_result' && m?.name === 'submit_service_request');
+  let start = -1;
+  transcript.forEach((m, i) => { if (isSave(m)) start = i; });
+  const savedMs = Date.parse(savedAt);
+  const after = transcript.filter((m, i) => start >= 0 ? i > start
+    : Number.isFinite(savedMs) && Number(m?.time) > savedMs);
+  return after.filter(m => m && ['user', 'customer'].includes(m.role))
+    .map(m => (typeof m.message === 'string' ? m.message : typeof m.content === 'string' ? m.content : '').trim())
+    .filter(Boolean).join(' ').slice(0, 2000);
+}
+
 // The conversation so far on a Vapi tool-calls message, wherever this payload carries it: null when none is there.
 export const transcriptOf = (message = {}) => {
   for (const list of [message.artifact?.messages, message.call?.artifact?.messages, message.messages,
@@ -843,8 +861,33 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   // Safety net: a phone call that ended without a saved request still reaches the office.
   // A caller who hangs up within the greeting (under 10 s, no details) is a lead too: "call them back". That one is sent
   // only on a line with an alert route, and once per caller number per 30 minutes (a redial that hangs up again is the same lead).
+  // After a saved call ends: what the caller said AFTER the save (own/rent, landlord, a day or time, "now it's pouring")
+  // goes on the job as a note, even when Emma forgot add_request_note (round 6 lost every landlord and time this way).
+  // Re-tagged with the plumber rules; one short update alert only when it changes something the office acts on.
+  async function postSave(callId, message, route) {
+    const row = db.prepare('SELECT id, details, created_at FROM requests WHERE call_id = ?').get(callId);
+    if (!row) return null;
+    const details = JSON.parse(row.details);
+    if (details.post_save_checked || /^\s*not a job\b/i.test(details.issue || '')) return 'already_saved';
+    const words = callerWordsAfterSave(transcriptOf(message), row.created_at);
+    details.post_save_checked = true;
+    if (!words) { db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId); return 'already_saved'; }
+    details.notes = [...(details.notes || []), `After save, caller said: ${words.slice(0, 900)}`].slice(-20);
+    const newTags = ruleTags(words).filter(t => !(details.rule_tags || []).includes(t) && !['price_asked'].includes(t));
+    details.rule_tags = [...(details.rule_tags || []), ...newTags];
+    const upgrade = !/^\s*URGENT\b/i.test(details.issue) && newTags.some(t => URGENT_TAGS.has(t));
+    if (upgrade) { details.issue = `URGENT - ${details.issue}`; details.urgent_source = 'rules'; }
+    const noted = [details.preferred_time, ...(details.notes || []).slice(0, -1)].join(' ');
+    const newTime = TIME_WORDS.test(words) && !TIME_WORDS.test(noted);
+    const important = upgrade || newTags.includes('renter') || newTime;
+    db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
+    if (!important) return 'already_saved post_save=noted';
+    const office_alert = await alert(route, details, row.id, 'note');
+    if (upgrade && route && (!details.is_test || route.alertTests) && shouldRing(details.rule_tags, route)) await settle(ring(callId, route, details));
+    return `already_saved post_save=alert_${office_alert}`;
+  }
   async function hangup(callId, message, route) {
-    if (db.prepare('SELECT 1 FROM requests WHERE call_id = ?').get(callId)) return 'already_saved';
+    if (db.prepare('SELECT 1 FROM requests WHERE call_id = ?').get(callId)) return await postSave(callId, message, route);
     if (message.call?.type === 'outboundPhoneCall') return 'outbound';
     // Emma tried to save and the server sent it back (e.g. "wait for the caller's yes"), then the caller hung up: save
     // what she had, with a flag saying what was not confirmed. Works without caller ID (the payload has the callback number).
@@ -885,7 +928,9 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     classify(details, callId, message);
     const inserted = insert(true, callId, id, details, result, assistantIdOf(message));
     if (!inserted.changes) return 'already_saved';
-    result.office_alert = await alert(route, details, id, 'hangup');
+    // "Goodbye", "hello?", "just checking": a few words with nothing about a job is not a lead. Stored, never alerted.
+    const trivial = !greeting && !refused && !backupPhone && words.trim() && words.trim().split(/\s+/).length < 4 && !tags.length;
+    result.office_alert = trivial ? 'skipped_no_job_words' : await alert(route, details, id, 'hangup');
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
     return `${greeting ? 'greeting_hangup' : 'hangup'}_request_created alert=${result.office_alert}`;
   }
@@ -1046,9 +1091,17 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       // A line check, wrong number or test with no job: there is nothing to pass on, so Emma must not say she sent anything.
       if (details.is_test) result.sent_to_owner = false;
       result.say = 'This was not a job, so never say you sent or passed anything on. Close briefly: "Line\'s working, thanks for checking. Take care." (wrong number: "No problem, take care.")';
-    } else if (!details.email && !noEmailNeeded && !/^\s*URGENT\b/i.test(details.issue) && args.email_status === 'ask_after_save') {
-      // Saved before the email (a hang-up at the email question no longer loses the job): the email is an optional extra now.
-      result.next = 'Saved. Now ask for their email for a confirmation, spelled letter by letter; after you spell it back and they say yes, call add_customer_email. If they decline or it fails twice, move on.';
+    } else if (!noEmailNeeded && !/^\s*URGENT\b/i.test(details.issue)) {
+      // Saved before the follow-ups (a hang-up at the email question no longer loses the job). Every follow-up is listed so
+      // none is skipped, and each answer goes on the job as it is given (round 6 lost every landlord and preferred time).
+      const steps = [];
+      if (!details.rule_tags.includes('renter') && !details.rule_tags.includes('commercial'))
+        steps.push('Ask once: "Do you own the home, or rent?" If they rent, get the landlord or property manager\'s name and number, then add_request_note with them.');
+      if (!details.email && args.email_status === 'ask_after_save')
+        steps.push('Ask for their email for a confirmation, spelled letter by letter; after you spell it back and they say yes, call add_customer_email. If they decline or it fails twice, move on.');
+      if (!TIME_WORDS.test(String(details.preferred_time || '')))
+        steps.push('Ask what day or time works best for the team to come out, then add_request_note with their answer. Never promise that time.');
+      if (steps.length) result.next = `Saved. Now, one question per turn: ${steps.map((s, i) => `${i + 1}) ${s}`).join(' ')}`;
     }
     db.prepare('UPDATE requests SET result = ? WHERE call_id = ?').run(JSON.stringify(result), callId);
     return result;
