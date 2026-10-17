@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
-import { createApp, alertText } from './server.mjs';
+import { createApp, alertText, phoneNumbersIn, confirmedCallback, transcriptExcerpt } from './server.mjs';
 
 const key = 'synthetic-test-key-not-used-in-production';
 const routes = JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'] } });
@@ -72,6 +72,81 @@ test('a hang-up before saving still reaches the office once', async t => {
   const before = sent.length;
   await post(report('saved-call', 60));
   assert.equal(sent.length, before);
+});
+
+const hangupReport = (id, artifact, extra = {}) => ({ message: { type: 'end-of-call-report', durationSeconds: 95, artifact, ...extra,
+  call: { id, assistantId: 'client-a', type: 'inboundPhoneCall', customer: { number: '+16155550100' } } } });
+// The real shape: Vapi's artifact.messages (role bot/user, text in message) plus artifact.transcript.
+const said = (...turns) => ({ messages: [{ role: 'system', message: 'You are Emma' }, ...turns.map(([role, message], i) => ({ role, message, secondsFromStart: i * 5 }))],
+  transcript: turns.map(([role, text]) => `${role === 'bot' ? 'AI' : 'User'}: ${text}`).join('\n') });
+
+test('a hang-up after a failed save keeps the read-back number the caller confirmed and the transcript', async t => {
+  const { post, sent } = await fixture(t);
+  const artifact = said(['bot', 'Hi, thanks for calling Gold Star Plumbing. How can I help?'], ['user', 'My water heater is leaking all over the garage.'],
+    ['bot', "What's the best number to call you back?"], ['user', '615 555 0142.'],
+    ['bot', 'So that\u2019s six one five, five five five, oh one four two?'], ['user', "Yeah, that's it."],
+    ['tool_calls', ''], ['tool_call_result', 'retryable'],
+    ['bot', 'Sorry, our system is down. The team will call you back at six one five, five five five, oh one four two.'], ['user', 'Okay, thanks.']);
+  await post(hangupReport('hang-readback', artifact));
+  const email = sent.find(s => s.url.includes('resend')).body;
+  assert.equal(email.subject, 'Caller hung up \u2013 (615) 555-0142 \u2013 call them back');
+  assert.match(email.text, /Unknown caller - \(615\) 555-0142 \(confirmed on the call; caller ID \(615\) 555-0100\)\n/);
+  assert.match(email.text, /Hung up before finishing\nTranscript \(end of call\):\nAI: Hi, thanks[\s\S]*User: My water heater is leaking all over the garage\./);
+  assert.match(sent.find(s => s.url.includes('telnyx')).body.text, /^Anchorline AI: Caller hung up - Gold Star Plumbing\nUnknown caller - \(615\) 555-0142 /);
+});
+
+test('a hang-up with a summary keeps it and adds the transcript; numerals count as a read-back', async t => {
+  const { post, sent } = await fixture(t);
+  await post(hangupReport('hang-numerals', { transcript: 'AI: Is 615-555-0177 the best number?\nUser: Correct.\nAI: And the address?' },
+    { analysis: { summary: 'Caller reported a leak.' } }));
+  const email = sent.find(s => s.url.includes('resend')).body;
+  assert.equal(email.subject, 'Caller hung up \u2013 (615) 555-0177 \u2013 call them back');
+  assert.match(email.text, /Hung up before finishing\. Summary: Caller reported a leak\.\nTranscript \(end of call\):\nAI: Is 615-555-0177/);
+});
+
+test('an unconfirmed read-back is never used; a corrected and confirmed one is', async t => {
+  const { post, sent } = await fixture(t);
+  await post(hangupReport('hang-no', said(['bot', 'So that is 6 1 5, 5 5 5, 0 1 4 2?'], ['user', "No, it's 615 555 0199."], ['bot', 'Got it, and your address?'])));
+  const first = sent.find(s => s.url.includes('resend')).body;
+  assert.equal(first.subject, 'Caller hung up \u2013 (615) 555-0100 \u2013 call them back');
+  assert.match(first.text, /\(615\) 555-0100 \(caller ID\)/);
+  await post(hangupReport('hang-fixed', said(['bot', 'So that is 6 1 5, 5 5 5, 0 1 4 2?'], ['user', "No, it's 615 555 0199."],
+    ['bot', 'Sorry about that. Six one five, five five five, zero one nine nine?'], ['user', "Yes, that's right."])));
+  assert.equal(sent.filter(s => s.url.includes('resend')).at(-1).body.subject, 'Caller hung up \u2013 (615) 555-0199 \u2013 call them back');
+});
+
+test('a hang-up report without a transcript is the same lead as before', async t => {
+  const { post, sent } = await fixture(t);
+  await post(hangupReport('hang-bare', undefined));
+  const email = sent.find(s => s.url.includes('resend')).body;
+  assert.equal(email.subject, 'Caller hung up \u2013 (615) 555-0100 \u2013 call them back');
+  assert.match(email.text, /\(615\) 555-0100 \(caller ID\)\nHung up before giving details\n\nRequest reference: /);
+});
+
+test('a confirmed read-back on a test caller number keeps the hang-up suppressed', async t => {
+  const { post, sent } = await fixture(t, { TEST_CALLER_NUMBERS: '+16155550142' });
+  await post(hangupReport('hang-testnum', said(['bot', 'That is 615 555 0142, right?'], ['user', 'Yep.'])));
+  assert.equal(sent.length, 0);
+});
+
+test('read-back parsing: spoken and written numbers, confirmations, excerpt length', () => {
+  assert.deepEqual(phoneNumbersIn('six one five, five five five, oh one four two'), ['6155550142']);
+  assert.deepEqual(phoneNumbersIn('Oh, so that is (615) 555-0142? And 1-615-555-0199.'), ['6155550142', '6155550199']);
+  assert.deepEqual(phoneNumbersIn('5 0 1 Woodland Street. What is the best number?'), []);
+  assert.deepEqual(phoneNumbersIn('six one five five five five oh one four'), []);
+  assert.deepEqual(phoneNumbersIn('2 4 0 6 1 5 5 5 5 0 1 4 2'), []);
+  const msg = turns => ({ artifact: said(...turns) });
+  assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?'], ['user', 'Right.']])), '6155550142');
+  assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?'], ['user', 'Uh, yes.']])), '6155550142');
+  assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?'], ['user', 'Not quite, it ends in 43.']])), '');
+  assert.equal(confirmedCallback(msg([['bot', '5 0 1 Woodland Street, right? And your number?'], ['user', "Yes, that's right. It's 615 555 1992."]])), '');
+  assert.equal(confirmedCallback(msg([['bot', 'Is it 615 555 0142?']])), '');
+  assert.equal(confirmedCallback({}), '');
+  assert.equal(confirmedCallback({ artifact: { messages: [{ role: 'assistant', content: 'So 615 555 0142?' }, { role: 'user', content: 'Yes.' }] } }), '6155550142');
+  const long = { artifact: { transcript: Array.from({ length: 80 }, (_, i) => `${i % 2 ? 'User' : 'AI'}: line ${i} of the call`).join('\n') } };
+  const excerpt = transcriptExcerpt(long);
+  assert.ok(excerpt.length <= 1500); assert.match(excerpt, /^\u2026(AI|User): line \d+/); assert.match(excerpt, /User: line 79 of the call$/);
+  assert.equal(transcriptExcerpt({}), '');
 });
 
 test('alert emails never carry the SMS opt-out line and are not cut short', async t => {
