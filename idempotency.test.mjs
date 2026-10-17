@@ -1102,25 +1102,83 @@ const captureWarn = t => { const lines = [], warn = console.warn; console.warn =
   t.after(() => { console.warn = warn; }); return lines; };
 const writeTries = (lines, name, callId) => lines.filter(l => l.startsWith(`tool-write name=${name} call=${callId} `));
 
-test('a note write that hits a real SQLITE_BUSY once is retried by the server: saved true, one note, one row, one alert', async t => {
+// A trigger that fails INSERTs into tool_calls while fail_once has a row; clear() empties it.
+const failInsertOnce = file => { const db = new DatabaseSync(file);
+  try { db.exec(`CREATE TABLE fail_once (x); INSERT INTO fail_once VALUES (1);
+    CREATE TRIGGER fail_insert BEFORE INSERT ON tool_calls WHEN EXISTS (SELECT 1 FROM fail_once) BEGIN SELECT RAISE(ABORT, 'disk full'); END`); } finally { db.close(); }
+  return () => { const d = new DatabaseSync(file); try { d.exec('DELETE FROM fail_once'); } finally { d.close(); } }; };
+
+test('a note write that fails fast once is retried by the server: saved true, one note, one row, one alert', async t => {
   const { post, dir, saved, sms, emails } = await fixture(t);
   await post(toolCall('zb-1', 'submit_service_request', intake, 'tc-submit'));
   const smsBefore = sms().length;
-  // Another connection holds the write lock, so the server's BEGIN IMMEDIATE waits out busy_timeout (5 s) and throws
-  // SQLITE_BUSY. The release is due long before that, so it runs before the server's 100 ms retry.
-  const lock = new DatabaseSync(join(dir, 'requests.sqlite'));
-  t.after(() => { if (lock.isTransaction) lock.exec('ROLLBACK'); lock.close(); });
-  lock.exec('BEGIN IMMEDIATE');
+  const clear = failInsertOnce(join(dir, 'requests.sqlite'));
   const warn = captureWarn(t);
-  setTimeout(() => lock.exec('ROLLBACK'), 200);
+  // Cleared 50 ms in: after try 1 has thrown, before the 100 ms retry.
+  setTimeout(clear, 50);
   const result = await post(note('zb-1', 'Gate code 4471', 'n1'));
-  const tries = writeTries(warn, 'add_request_note', 'zb-1');
-  assert.equal(tries.length, 1); assert.match(tries[0], /try=1 error=database_is_locked$/);
+  assert.equal(writeTries(warn, 'add_request_note', 'zb-1').length, 1);
   assert.equal(result.saved, true); assert.equal(result.note_added, true); assert.equal(result.office_alert, 'sent');
   assert.equal(result.duplicate, undefined); assert.equal(result.say, undefined);
   assert.deepEqual(saved('zb-1').notes, ['Gate code 4471']);
   assert.equal(sms().length - smsBefore, 1); assert.equal(noteAlerts(emails).length, 1);
   assert.deepEqual(toolRows(dir, 'zb-1', 'add_request_note'), { tools: 1, outbox: 0 });
+});
+
+test('silence bound: a write that waits out busy_timeout (real SQLITE_BUSY) is not tried again; the result comes back after one 5 s wait', async t => {
+  const { post, dir, saved, sent } = await fixture(t);
+  const N = 'add_request_note';
+  await post(toolCall('zl-1', 'submit_service_request', intake, 'tc-submit'));
+  const before = saved('zl-1'), sentBefore = sent.length;
+  // Another connection holds the write lock for the whole request.
+  const lock = new DatabaseSync(join(dir, 'requests.sqlite'));
+  t.after(() => { if (lock.isTransaction) lock.exec('ROLLBACK'); lock.close(); });
+  lock.exec('BEGIN IMMEDIATE');
+  const warn = captureWarn(t), logs = [], log = console.log;
+  console.log = (...a) => { logs.push(a.join(' ')); }; t.after(() => { console.log = log; });
+  const started = Date.now();
+  const result = await post(note('zl-1', 'Gate code 4471', 'n1'));
+  const elapsed = Date.now() - started;
+  lock.exec('ROLLBACK');
+  const tries = writeTries(warn, N, 'zl-1');
+  assert.equal(tries.length, 1); assert.match(tries[0], /try=1 error=database_is_locked$/);
+  // The server's own time for the request (its tool-call log line): one 5 s wait, no retry.
+  const ms = Number(logs.find(l => l.startsWith(`tool-call name=${N} call=zl-1 `)).match(/ms=(\d+)$/)[1]);
+  assert.ok(ms >= 5000 && ms < 6000, `one busy_timeout wait, no retry: ${ms} ms`);
+  // Wall time may add one more 5 s freeze: a sweep timer (e.g. the digest) also hits the held lock, as on the base build.
+  assert.ok(elapsed < 11000, `${elapsed} ms`);
+  notSaved(result, N, 'Unable to add note');
+  assert.deepEqual(saved('zl-1'), before); assert.equal(sent.length, sentBefore);
+});
+
+test('a concurrent copy of the same tool call (a Vapi re-send while the first waits to retry) joins it: one non-duplicate result, one note, row and alert', async t => {
+  const { post, dir, saved, sms, emails } = await fixture(t);
+  const N = 'add_request_note';
+  await post(toolCall('zc-2', 'submit_service_request', intake, 'tc-submit'));
+  const smsBefore = sms().length;
+  const clear = failInsertOnce(join(dir, 'requests.sqlite'));
+  const warn = captureWarn(t);
+  const first = post(note('zc-2', 'Gate code 4471', 'n1'));
+  // The copy arrives while the first sleeps before its retry; the fault clears before that retry.
+  await settleLater(30);
+  const copy = post(note('zc-2', 'Gate code 4471', 'n1'));
+  setTimeout(clear, 30);
+  const [a, b] = await Promise.all([first, copy]);
+  assert.equal(writeTries(warn, N, 'zc-2').length, 1, 'only the first ran tries');
+  assert.equal(a.note_added, true); assert.equal(a.duplicate, undefined);
+  assert.deepEqual(b, { ...a, duplicate: true });
+  assert.deepEqual(saved('zc-2').notes, ['Gate code 4471']);
+  assert.equal(sms().length - smsBefore, 1); assert.equal(noteAlerts(emails).length, 1);
+  assert.deepEqual(toolRows(dir, 'zc-2', N), { tools: 1, outbox: 0 });
+});
+
+test('A, B, A on one reused toolCall id is two notes: the third repeats a text that id saved, so it is taken as a Vapi re-send', async t => {
+  const { post, saved } = await fixture(t);
+  await post(toolCall('zr-2', 'submit_service_request', intake, 'tc-submit'));
+  const a = await post(note('zr-2', 'Gate 1', 'same'));
+  assert.equal((await post(note('zr-2', 'Gate 2', 'same'))).note_added, true);
+  assert.deepEqual(await post(note('zr-2', 'Gate 1', 'same')), { ...a, duplicate: true });
+  assert.deepEqual(saved('zr-2').notes, ['Gate 1', 'Gate 2']);
 });
 
 test('a note write that throws on every try: three tries in one request, then the not-saved line; no note, row, outbox or alert. Bad arguments are never retried', async t => {

@@ -1162,8 +1162,10 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     WHERE call_id = ? AND name = ? AND tool_call_id = ? AND args_key = ?`).get(callId, name, toolCallId, argsKey);
   // add_request_note and add_customer_email are keyed by toolCall id AND arguments (args_key: the note, or the email in any
   // case), so a toolCall id the model reuses for another note or email is a new change with its own row, outbox ref and
-  // alert key; the old build refused it and asked for a model retry, which gpt-4.1 does not make. A Vapi retry repeats the
-  // same body, so it still finds its own row. submit keeps main's one-request-per-call rule: a repeat with other arguments
+  // alert key, unless it repeats a text that id already saved: that is taken as a Vapi re-send and deduped, so A, B, A on
+  // one toolCall id is two notes (X, Y, X leaves Y as the email). A late Vapi re-send of A looks the same, and is far more
+  // likely than a model reusing an id. The old build refused a reused id and asked for a model retry, which gpt-4.1 does
+  // not make. A Vapi retry repeats the same body, so it still finds its own row. submit keeps main's one-request-per-call rule: a repeat with other arguments
   // gets the stored result, marked duplicate.
   const argsKeyOf = (name, args) => sha(name === 'add_request_note' ? String(args?.note).trim() : String(args?.email).trim().toLowerCase());
   function deliverTool(name, callId, toolCallId, argsKey) {
@@ -1241,18 +1243,31 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       { saved: true, request_id: row.id, email_added: true, caller_email: details.is_test ? 'suppressed_test' : 'pending' });
   }
   // add_request_note / add_customer_email with the server's own retry. gpt-4.1 does not retry a failed note in the same reply
-  // (see NOT_SAVED_SAY), so a write that throws (SQLite busy after busy_timeout, a full disk, a failed bookkeeping write
-  // after the sends) is tried again here, in the same request, after 100 ms and then 400 ms. No new try starts once 10 s
-  // have gone, so a slow first try (busy_timeout is 5 s, each send is cut off at 8 s) gets at most one more, to stay inside
-  // Vapi's 40 s server timeout (templates/emma-assistant.json). A try never makes a second note, row or alert: it has the
-  // same toolCall id and arguments, so it finds the row an earlier try committed (toolRow) and only finishes that row's
-  // sends, through the ledger (sendOnce) under the same alert key; a try after one that committed nothing is a first save
-  // (the last-note check, repeatOfLast, matches only a note an earlier tool call saved). A row found on a later try is this
-  // request's own, so its result is not marked duplicate. Results (saved or not) are never retried: only the model can fix
-  // its arguments. If every try throws, a committed row still means saved (its outbox row finishes the sends), as submit
-  // does; otherwise the not-saved line, honestly.
-  const WRITE_RETRY_MS = [100, 400], WRITE_RETRY_WITHIN_MS = 10000;
+  // (see NOT_SAVED_SAY), so a write that throws fast (a full disk, an I/O error, a failed bookkeeping write after the
+  // sends) is tried again here, in the same request, after 100 ms and then 400 ms. No new try starts once 1 s has gone: a
+  // write that waited out busy_timeout (5 s, during which node:sqlite blocks the whole process) is not tried again, so the
+  // caller's silence is no longer than before the retry was added. The bound is tries x busy_timeout: up to 3 tries start
+  // inside that 1 s and each could wait out busy_timeout, but the first such wait ends the window, so only one try waits
+  // (as before), plus at most 0.5 s of backoff and the sends.
+  // A try never makes a second note, row or alert: it has the same toolCall id and arguments, so it finds the row an
+  // earlier try committed (toolRow) and only finishes that row's sends, through the ledger (sendOnce) under the same alert
+  // key; a try after one that committed nothing is a first save (the last-note check, repeatOfLast, matches only a note an
+  // earlier tool call saved). A concurrent copy of the same tool call (same id and arguments, e.g. a Vapi re-send while
+  // this one waits to retry) joins this one (adding) and gets its result marked duplicate, so a row found on a later try
+  // was committed by this request's earlier try and is not marked duplicate: one copy reports a non-duplicate save. (Two
+  // server processes on one database would not share adding, so there both copies could report non-duplicate.) Results (saved or not) are never
+  // retried: only the model can fix its arguments. If every try throws, a committed row still means saved (its outbox row
+  // finishes the sends), as submit does; otherwise the not-saved line, honestly.
+  const WRITE_RETRY_MS = [100, 400], WRITE_RETRY_WITHIN_MS = 1000;
+  const adding = new Map();
   async function addTool(name, callId, args, assistantId, toolCallId) {
+    const ref = toolRef(name, callId, toolCallId, argsKeyOf(name, args));
+    if (adding.has(ref)) { const result = await adding.get(ref); return result.saved === true ? { ...result, duplicate: true } : result; }
+    const task = addToolTries(name, callId, args, assistantId, toolCallId).finally(() => adding.delete(ref));
+    adding.set(ref, task);
+    return task;
+  }
+  async function addToolTries(name, callId, args, assistantId, toolCallId) {
     const add = name === 'add_request_note' ? addNote : addEmail, started = Date.now();
     const committed = () => { try { return toolRow(name, callId, toolCallId, argsKeyOf(name, args)); } catch { return null; } };
     for (let tries = 0; ; tries++) {
