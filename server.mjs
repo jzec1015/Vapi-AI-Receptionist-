@@ -35,9 +35,10 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
 // add_request_note and add_customer_email results that saved nothing carry the exact words to speak. Without them gpt-4.1
 // sometimes improvises a false promise ("I'll note that you prefer...", "I'll let the team know..."). Every existing field is
 // kept. note: an unconfirmed email waits for the caller's yes (never a retry before they speak; item 6's re-spell steps if
-// they say it's wrong). Otherwise the server counts this call's failures of this tool (tool_failures): the first follows THE
-// ONE RULE in templates/emma-prompt.txt (trouble line, one retry in the same reply, then the say line); a second or later
-// failure, or a body with no call id (nothing to count by, and a retry cannot fix it), gets "do not call it again".
+// they say it's wrong). Otherwise the server counts this call's CONSECUTIVE failures of this tool (tool_failures): the first
+// follows THE ONE RULE in templates/emma-prompt.txt (trouble line, one retry in the same reply, then the say line); the
+// failure right after it gets "do not call it again". A save of that tool, or the first save of the request, starts the
+// count again. A body with no call id (nothing to count by, and a retry cannot fix it) gets "NOT saved. Do not call it again".
 export const NOT_SAVED_SAY = 'Mention that when the team calls you, so they have it.';
 const NOT_SAVED_TOOLS = ['add_request_note', 'add_customer_email'];
 const UNCONFIRMED_EMAIL = 'Not added: spell the email back letter by letter and get a clear yes first.';
@@ -51,7 +52,7 @@ export const notSavedNote = (name, result = {}, failures = 1) => result.error ==
     ? 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what the error says if it ' +
       `tells you, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
       `If it still isn't saved, say only the say line. ${NO_PROMISE}`
-    : `NOT saved again. Do not call it again. Say only the say line. ${NO_PROMISE}`;
+    : `${failures === Infinity ? 'NOT saved.' : 'NOT saved again.'} Do not call it again. Say only the say line. ${NO_PROMISE}`;
 const withNotSavedLine = (name, result, failures) => ({ ...result, say: NOT_SAVED_SAY, note: notSavedNote(name, result, failures) });
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 
@@ -434,6 +435,20 @@ export function transferDestination(route, details) {
 // date so an old table never breaks a save: outbox gained created_at (when the work was saved; the 1 h cut-off) and
 // gave_up; tool_calls gained arg and assistant_id with a new primary key, which SQLite cannot add in place, so an old
 // tool_calls table is kept aside as tool_calls_v0 (it only held dedupe claims) and a new one is made. One transaction.
+// An unreleased build of this branch (6d7a92b) made tool_failures with one row per call and tool and no tool_call_id. That
+// build was never deployed and its rows are only short-lived loop-guard counts, so that shape is replaced, not migrated.
+// Never throws: if this fails, the in-memory count is used.
+export function upgradeToolFailures(db) {
+  try {
+    const columns = db.prepare('PRAGMA table_info(tool_failures)').all().map(c => c.name);
+    if (columns.length && !columns.includes('tool_call_id')) db.exec(`DROP TABLE tool_failures;
+      CREATE TABLE tool_failures (
+        call_id TEXT NOT NULL, name TEXT NOT NULL, tool_call_id TEXT NOT NULL, failures INTEGER NOT NULL,
+        cleared INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (call_id, name, tool_call_id)
+      );`);
+  } catch (error) { console.warn(`tool_failures upgrade failed, in-memory count only: ${error?.message || 'error'}`); }
+}
+
 export function upgradeRetryTables(db) {
   const columns = table => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name));
   const outbox = columns('outbox'), tools = columns('tool_calls');
@@ -528,12 +543,15 @@ export function createApp(env = process.env, send = fetch) {
         ref TEXT PRIMARY KEY, kind TEXT NOT NULL, call_id TEXT NOT NULL, tool_call_id TEXT, args_key TEXT, created_at INTEGER NOT NULL,
         due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, gave_up TEXT
       );
-      -- note-fail-line (new table only; older builds ignore it): saved:false results of add_request_note /
-      -- add_customer_email per call and tool, so the second failure in a call tells Emma not to call it again.
+      -- note-fail-line (new table only; older builds ignore it): one row per failed add_request_note / add_customer_email
+      -- tool call (Vapi toolCall id), with its place in the run of consecutive failures (failures). cleared = 1 once that
+      -- tool saved (or the request was first saved) after it, so the next failure starts a new run.
       CREATE TABLE IF NOT EXISTS tool_failures (
-        call_id TEXT NOT NULL, name TEXT NOT NULL, failures INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (call_id, name)
+        call_id TEXT NOT NULL, name TEXT NOT NULL, tool_call_id TEXT NOT NULL, failures INTEGER NOT NULL,
+        cleared INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (call_id, name, tool_call_id)
       );`);
     upgradeRetryTables(db);
+    upgradeToolFailures(db);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
     // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
     // A failed trial migration switches trials off (healthz trials_enabled: false) but never stops the server.
@@ -620,24 +638,56 @@ export function createApp(env = process.env, send = fetch) {
     return expected.length >= 32 && supplied.length === expected.length && timingSafeEqual(supplied, expected);
   };
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
-  // How many saved:false results this call has had from this tool, this one included (unconfirmed emails are not counted:
-  // the fix for those waits for the caller). Stored in tool_failures so a restart keeps the count; the in-memory map
-  // covers a database that cannot be written (a storage error), and the larger of the two counts is used.
-  const failCounts = new Map();
-  function countFailure(callId, name) {
-    const slot = `${callId}\n${name}`, mem = (failCounts.get(slot) || 0) + 1;
-    failCounts.delete(slot); failCounts.set(slot, mem);
-    if (failCounts.size > 5000) failCounts.delete(failCounts.keys().next().value);
-    let stored = 0;
+  // Consecutive saved:false results of this tool in this call, this one included (unconfirmed emails are not counted: the
+  // fix for those waits for the caller). A non-duplicate saved:true of the same tool clears the run, and so does the first
+  // save of the request (submit_service_request): "No saved request yet" before it is fixed by it (run 4: a note before
+  // the save failed, the save worked, then the note was tried again). A duplicate save changes nothing, so it clears
+  // nothing; a real loop never has a new save in it. A repeat of a toolCall id that was already counted (a lost response
+  // re-sent) is not counted again and gets the number it got the first time. Stored in tool_failures so a restart keeps
+  // the run; the in-memory copy is used when the database cannot be read or written.
+  const failRuns = new Map();
+  const runOf = slot => {
+    const run = failRuns.get(slot) || { length: 0, ids: new Map() };
+    failRuns.delete(slot); failRuns.set(slot, run);
+    if (failRuns.size > 5000) failRuns.delete(failRuns.keys().next().value);
+    return run;
+  };
+  function countFailure(callId, name, toolCallId) {
+    const run = runOf(`${callId}\n${name}`), id = String(toolCallId); // the webhook refuses a tool call with no id
+    let failures;
     try {
-      stored = db.prepare(`INSERT INTO tool_failures (call_id, name, failures, updated_at) VALUES (?, ?, 1, ?)
-        ON CONFLICT (call_id, name) DO UPDATE SET failures = failures + 1, updated_at = excluded.updated_at RETURNING failures`)
-        .get(callId, name, new Date().toISOString()).failures;
-    } catch { /* no database, or it cannot be written: the in-memory count stands */ }
-    return Math.max(mem, stored);
+      const seen = db.prepare('SELECT failures FROM tool_failures WHERE call_id = ? AND name = ? AND tool_call_id = ?').get(callId, name, id);
+      if (seen) failures = seen.failures;
+      else {
+        failures = db.prepare('SELECT COUNT(*) AS n FROM tool_failures WHERE call_id = ? AND name = ? AND cleared = 0').get(callId, name).n + 1;
+        db.prepare('INSERT INTO tool_failures (call_id, name, tool_call_id, failures, updated_at) VALUES (?, ?, ?, ?, ?)')
+          .run(callId, name, id, failures, new Date().toISOString());
+        run.length = failures;
+      }
+    } catch {
+      // No database, or it cannot be written: the in-memory run stands.
+      failures = run.ids.get(id) ?? ++run.length;
+    }
+    if (!run.ids.has(id)) { run.ids.set(id, failures); if (run.ids.size > 50) run.ids.delete(run.ids.keys().next().value); }
+    return failures;
   }
-  const notSavedLine = (name, callId, result) => !NOT_SAVED_TOOLS.includes(name) || result?.saved !== false ? result
-    : withNotSavedLine(name, result, result.error === UNCONFIRMED_EMAIL ? 1 : callId ? countFailure(callId, name) : Infinity);
+  function clearFailures(callId, names) {
+    for (const name of names) {
+      runOf(`${callId}\n${name}`).length = 0;
+      try {
+        db.prepare('UPDATE tool_failures SET cleared = 1, updated_at = ? WHERE call_id = ? AND name = ? AND cleared = 0')
+          .run(new Date().toISOString(), callId, name);
+      } catch { /* the in-memory run is cleared; see Known limits in NOTES.md */ }
+    }
+  }
+  function notSavedLine(name, callId, toolCallId, result) {
+    if (callId && result?.saved === true && !result.duplicate) {
+      if (NOT_SAVED_TOOLS.includes(name)) clearFailures(callId, [name]);
+      else if (name === 'submit_service_request') clearFailures(callId, NOT_SAVED_TOOLS);
+    }
+    if (!NOT_SAVED_TOOLS.includes(name) || result?.saved !== false) return result;
+    return withNotSavedLine(name, result, result.error === UNCONFIRMED_EMAIL ? 1 : callId ? countFailure(callId, name, toolCallId) : Infinity);
+  }
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   // Delivery ledger: a channel that went out is never sent again; one that failed, or was cut off by a restart (still
@@ -1537,7 +1587,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
             result = saved ? JSON.parse(saved.result) : failure('Unable to process request');
           }
         }
-        result = notSavedLine(name, callId, result);
+        result = notSavedLine(name, callId, tool.id, result);
         results.push({ toolCallId: tool.id, result: JSON.stringify(result) });
         // Operational log only: tool, IDs, outcome and time, never arguments or caller details.
         console.log(`tool-call name=${logSafe(name)} call=${logSafe(callId)} tool_call=${logSafe(tool.id)} outcome=${toolOutcome(result)} ms=${Date.now() - started}`);

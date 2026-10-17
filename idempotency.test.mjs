@@ -721,22 +721,24 @@ test('a 7am digest send that hangs never delays a held urgent ring: it goes on t
 
 // Every saved:false result of add_request_note / add_customer_email carries the line to speak (say) and a note that it was
 // not saved, so gpt-4.1 does not improvise "I'll note that..." or "I'll let the team know...". The fields already there stay.
-// The server counts failures per call and tool: the first gets one retry (THE ONE RULE), later ones "do not call it again".
+// The server counts consecutive failures per call and tool: the first gets one retry (THE ONE RULE), the next "do not call it
+// again". A save of that tool, or the first save of the request, starts the count again.
 const UNCONFIRMED = 'Not added: spell the email back letter by letter and get a clear yes first.';
 const NEVER = `Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`;
 const retryNote = name => 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what the error ' +
   `says if it tells you, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
   `If it still isn't saved, say only the say line. ${NEVER}`;
 const stopNote = `NOT saved again. Do not call it again. Say only the say line. ${NEVER}`;
+const noIdNote = `NOT saved. Do not call it again. Say only the say line. ${NEVER}`;
 const confirmNote = 'NOT saved: the email is not confirmed yet. Spell the email back letter by letter, then stop and wait for the caller\'s clear yes. ' +
   'Only after they say yes, call add_customer_email again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ' +
   'again before the caller speaks. If they say it\'s wrong, ask them to spell just that part again, nice and slow, and read it back again, as you did ' +
   `before. Only if they won't or can't confirm it, say only the say line. ${NEVER}`;
-// kind: 'first' (retry note), 'again' (no-retry note), or 'confirm' (unconfirmed email).
+// kind: 'first' (retry note), 'again' (no-retry note), 'noid' (no call id: no retry, and not "again"), or 'confirm' (unconfirmed email).
 const notSaved = (result, name, error, kind = 'first') => {
   assert.equal(result.saved, false); assert.equal(result.retryable, false); assert.equal(result.error, error);
   assert.equal(result.say, NOT_SAVED_SAY); assert.equal(result.say, 'Mention that when the team calls you, so they have it.');
-  assert.equal(result.note, { first: retryNote(name), again: stopNote, confirm: confirmNote }[kind]);
+  assert.equal(result.note, { first: retryNote(name), again: stopNote, noid: noIdNote, confirm: confirmNote }[kind]);
   assert.deepEqual(Object.keys(result), ['saved', 'retryable', 'error', 'say', 'note']);
 };
 const noCall = (name, args) => ({ message: { type: 'tool-calls', toolCallList: [{ id: 'tc-x', function: { name, arguments: args } }] } });
@@ -748,7 +750,7 @@ test('every saved:false add_request_note path gets the say line and, as its firs
   const N = 'add_request_note';
   const fresh = async id => { await post(toolCall(id, 'submit_service_request', intake, 'tc-submit')); return id; };
   // No call id: nothing to count by and a retry cannot fix it, so straight to the say line.
-  notSaved(await post(noCall(N, { note: 'Gate code 1' })), N, 'Missing Vapi call, chat or session ID', 'again');
+  notSaved(await post(noCall(N, { note: 'Gate code 1' })), N, 'Missing Vapi call, chat or session ID', 'noid');
   notSaved(await post(note('zn-1', 'Gate code 1', 'tc-1')), N, 'No saved request yet; save the request first');
   notSaved(await post(note(await fresh('zn-2'), '   ', 'tc-2')), N, 'Missing or invalid note');
   notSaved(await post(note(await fresh('zn-3'), 'x'.repeat(1001), 'tc-3')), N, 'Missing or invalid note');
@@ -766,7 +768,7 @@ test('every saved:false add_customer_email path gets the say line and, as its fi
   const { post, dir, saved, emails } = await fixture(t);
   const E = 'add_customer_email';
   const fresh = async id => { await post(toolCall(id, 'submit_service_request', intake, 'tc-submit')); return id; };
-  notSaved(await post(noCall(E, { email: 'a@example.org', confirmed_after_spelling_back: true })), E, 'Missing Vapi call, chat or session ID', 'again');
+  notSaved(await post(noCall(E, { email: 'a@example.org', confirmed_after_spelling_back: true })), E, 'Missing Vapi call, chat or session ID', 'noid');
   notSaved(await post(email('ze-1', 'a@example.org', 'tc-1')), E, 'No saved request yet; save the request first');
   notSaved(await post(email(await fresh('ze-2'), 'not-an-email', 'tc-2')), E, 'Invalid email');
   notSaved(await post(email(await fresh('ze-3'), `${'a'.repeat(250)}@example.org`, 'tc-3')), E, 'Invalid email');
@@ -799,31 +801,103 @@ test('the server counts failures per call and tool: first gets the retry note, l
   const N = 'add_request_note', E = 'add_customer_email';
   const first = await fixture(t, { dir });
   notSaved(await first.post(note('zk-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
-  notSaved(await first.post(note('zk-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'again');
+  notSaved(await first.post(note('zk-1', 'Gate 1', 'tc-1b')), N, 'No saved request yet; save the request first', 'again');
   notSaved(await first.post(note('zk-1', 'Gate 1', 'tc-2')), N, 'No saved request yet; save the request first', 'again');
   // Another tool in the same call, and the same tool in another call, have their own counts.
   notSaved(await first.post(email('zk-1', 'a@example.org', 'tc-3')), E, 'No saved request yet; save the request first', 'first');
   notSaved(await first.post(note('zk-2', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
   await first.stop();
   const second = await fixture(t, { dir });
-  notSaved(await second.post(email('zk-1', 'a@example.org', 'tc-3')), E, 'No saved request yet; save the request first', 'again');
-  notSaved(await second.post(note('zk-2', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'again');
+  notSaved(await second.post(email('zk-1', 'a@example.org', 'tc-4')), E, 'No saved request yet; save the request first', 'again');
+  notSaved(await second.post(note('zk-2', 'Gate 1', 'tc-1b')), N, 'No saved request yet; save the request first', 'again');
   notSaved(await second.post(note('zk-3', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
-  // A success in between does not reset the count, and saved:true results are never touched.
-  await second.post(toolCall('zk-2', 'submit_service_request', intake, 'tc-submit'));
-  assert.equal((await second.post(note('zk-2', 'Gate 1', 'tc-9'))).note_added, true);
-  notSaved(await second.post(note('zk-2', '', 'tc-10')), N, 'Missing or invalid note', 'again');
-  // Chat sessions are counted too.
-  const chat = { message: { type: 'tool-calls', chat: { id: 'c-1' }, toolCallList: [{ id: 't', function: { name: N, arguments: { note: 'x' } } }] } };
-  notSaved(await second.post(chat), N, 'No saved request yet; save the request first', 'first');
-  notSaved(await second.post(chat), N, 'No saved request yet; save the request first', 'again');
+  // A save starts the count again, and saved:true results are never touched: a brand-new failure after a saved note gets
+  // the retry note (THE ONE RULE), and only the failure right after it gets "do not call it again".
+  await second.post(toolCall('zk-3', 'submit_service_request', intake, 'tc-submit'));
+  notSaved(await second.post(note('zk-3', '', 'tc-8')), N, 'Missing or invalid note', 'first');
+  const added = await second.post(note('zk-3', 'Gate 1', 'tc-9'));
+  assert.deepEqual(Object.keys(added), ['saved', 'request_id', 'note_added', 'office_alert']);
+  notSaved(await second.post(note('zk-3', 'x'.repeat(1001), 'tc-10')), N, 'Missing or invalid note', 'first');
+  notSaved(await second.post(note('zk-3', '', 'tc-11')), N, 'Missing or invalid note', 'again');
+  // Chat sessions are counted too, with a new toolCall id for each try.
+  const chat = id => ({ message: { type: 'tool-calls', chat: { id: 'c-1' }, toolCallList: [{ id, function: { name: N, arguments: { note: 'x' } } }] } });
+  notSaved(await second.post(chat('t1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await second.post(chat('t2')), N, 'No saved request yet; save the request first', 'again');
 });
 
-test('when the database cannot record a failure, the in-memory count still stops the second retry', async t => {
+test('a save of the tool clears only its own count; a duplicate save clears nothing; the count is kept across a restart', async t => {
+  const dir = tempDir(t);
+  const N = 'add_request_note', E = 'add_customer_email';
+  const first = await fixture(t, { dir });
+  await first.post(toolCall('zr-1', 'submit_service_request', intake, 'tc-submit'));
+  notSaved(await first.post(note('zr-1', '', 'n1')), N, 'Missing or invalid note', 'first');
+  notSaved(await first.post(email('zr-1', 'bad', 'e1')), E, 'Invalid email', 'first');
+  // A saved email clears the email count, not the note count.
+  assert.equal((await first.post(email('zr-1', 'a@example.org', 'e2'))).email_added, true);
+  notSaved(await first.post(note('zr-1', '', 'n2')), N, 'Missing or invalid note', 'again');
+  notSaved(await first.post(email('zr-1', 'bad', 'e3')), E, 'Invalid email', 'first');
+  // A saved note clears the note count; a re-sent saved note (duplicate) and a re-sent submit (duplicate) clear nothing.
+  assert.equal((await first.post(note('zr-1', 'Gate 1', 'n3'))).note_added, true);
+  notSaved(await first.post(note('zr-1', '', 'n4')), N, 'Missing or invalid note', 'first');
+  assert.equal((await first.post(note('zr-1', 'Gate 1', 'n3'))).duplicate, true);
+  assert.equal((await first.post(toolCall('zr-1', 'submit_service_request', intake, 'tc-submit'))).duplicate, true);
+  notSaved(await first.post(note('zr-1', '', 'n5')), N, 'Missing or invalid note', 'again');
+  notSaved(await first.post(email('zr-1', 'bad', 'e4')), E, 'Invalid email', 'again');
+  await first.stop();
+  // After a restart the run goes on, and a save still clears it.
+  const second = await fixture(t, { dir });
+  notSaved(await second.post(note('zr-1', '', 'n6')), N, 'Missing or invalid note', 'again');
+  assert.equal((await second.post(note('zr-1', 'Gate 2', 'n7'))).note_added, true);
+  notSaved(await second.post(note('zr-1', '', 'n8')), N, 'Missing or invalid note', 'first');
+});
+
+test('run 4: a note and an email that failed before the request was saved get a fresh retry once the request is saved', async t => {
+  const { post } = await fixture(t);
+  const N = 'add_request_note', E = 'add_customer_email';
+  notSaved(await post(note('zs-1', 'Gate 1', 'n1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await post(note('zs-1', 'Gate 1', 'n2')), N, 'No saved request yet; save the request first', 'again');
+  notSaved(await post(email('zs-1', 'a@example.org', 'e1')), E, 'No saved request yet; save the request first', 'first');
+  // A refused submit (saved:false) clears nothing.
+  const refused = await post(toolCall('zs-1', 'submit_service_request', { ...intake, email_confirmed: true, email: 'bad', email_status: 'confirmed' }, 's0'));
+  assert.equal(refused.saved, false);
+  notSaved(await post(note('zs-1', 'Gate 1', 'n3')), N, 'No saved request yet; save the request first', 'again');
+  // The first save of the request clears both counts: the next failure of either is a new one and gets the retry note.
+  assert.equal((await post(toolCall('zs-1', 'submit_service_request', intake, 's1'))).saved, true);
+  notSaved(await post(note('zs-1', '', 'n4')), N, 'Missing or invalid note', 'first');
+  notSaved(await post(email('zs-1', 'bad', 'e2')), E, 'Invalid email', 'first');
+  assert.equal((await post(note('zs-1', 'Gate 1', 'n5'))).note_added, true);
+});
+
+test('a re-sent toolCall id (lost response) is not counted again and gets the note it got the first time', async t => {
+  const dir = tempDir(t);
+  const N = 'add_request_note', E = 'add_customer_email';
+  const first = await fixture(t, { dir });
+  notSaved(await first.post(note('zd-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await first.post(note('zd-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await first.post(note('zd-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await first.post(note('zd-1', 'Gate 1', 'tc-2')), N, 'No saved request yet; save the request first', 'again');
+  notSaved(await first.post(note('zd-1', 'Gate 1', 'tc-2')), N, 'No saved request yet; save the request first', 'again');
+  notSaved(await first.post(note('zd-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  // The same id for the other tool is its own count.
+  notSaved(await first.post(email('zd-1', 'a@example.org', 'tc-1')), E, 'No saved request yet; save the request first', 'first');
+  await first.stop();
+  const second = await fixture(t, { dir });
+  notSaved(await second.post(note('zd-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await second.post(note('zd-1', 'Gate 1', 'tc-2')), N, 'No saved request yet; save the request first', 'again');
+});
+
+test('when the database cannot record a failure, the in-memory count still stops the second retry and is cleared by a save', async t => {
   const { post, dir } = await fixture(t);
+  const N = 'add_request_note';
   failTrigger(dir, 'tool_failures');
-  notSaved(await post(note('zm-1', 'Gate 1', 'tc-1')), 'add_request_note', 'No saved request yet; save the request first', 'first');
-  notSaved(await post(note('zm-1', 'Gate 1', 'tc-1')), 'add_request_note', 'No saved request yet; save the request first', 'again');
+  notSaved(await post(note('zm-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await post(note('zm-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await post(note('zm-1', 'Gate 1', 'tc-2')), N, 'No saved request yet; save the request first', 'again');
+  await post(toolCall('zm-1', 'submit_service_request', intake, 'tc-submit'));
+  notSaved(await post(note('zm-1', '', 'tc-3')), N, 'Missing or invalid note', 'first');
+  assert.equal((await post(note('zm-1', 'Gate 1', 'tc-4'))).note_added, true);
+  notSaved(await post(note('zm-1', '', 'tc-5')), N, 'Missing or invalid note', 'first');
+  notSaved(await post(note('zm-1', '', 'tc-6')), N, 'Missing or invalid note', 'again');
 });
 
 test('saved:true note and email results, and their duplicates, are unchanged: no say or note fields', async t => {
@@ -854,7 +928,7 @@ test('the not-saved note text: retryable is never consulted; the count picks ret
   for (const name of ['add_request_note', 'add_customer_email'])
     for (const result of [{ saved: false, retryable: true, error: 'Unable to add note' }, { saved: false, retryable: false, error: 'Unable to add note' }, { saved: false, error: 'x' }]) {
       assert.equal(notSavedNote(name, result), retryNote(name)); assert.equal(notSavedNote(name, result, 1), retryNote(name));
-      assert.equal(notSavedNote(name, result, 2), stopNote); assert.equal(notSavedNote(name, result, Infinity), stopNote);
+      assert.equal(notSavedNote(name, result, 2), stopNote); assert.equal(notSavedNote(name, result, Infinity), noIdNote);
     }
   assert.equal(notSavedNote('add_customer_email', { saved: false, retryable: false, error: UNCONFIRMED }, 5), confirmNote);
   assert.doesNotMatch(retryNote('x'), /what error says/);
