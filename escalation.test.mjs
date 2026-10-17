@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
-import { createApp, alertSubject, answeredCall, digestWindow, alertCall } from './server.mjs';
+import { createApp, alertSubject, answeredCall, digestWindow, alertCall, digestEmail } from './server.mjs';
 
 const key = 'synthetic-test-key-not-used-in-production';
 const route = { business: 'Gold Star Plumbing', email: ['office@example.com'], sms: [], call: ['+15550000999'], backup: '+15550000888' };
@@ -45,6 +45,10 @@ test('lock-screen subjects: what, where, who to call, never over 90 characters',
   assert.equal(alertSubject({ ...intake, notes: [] }, 'unanswered'), 'UNANSWERED URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142');
   assert.equal(alertSubject({ ...intake, issue: 'Faucet', notes: ['Gate code 4471'] }, 'note'), 'Update – Gate code 4471 – 1412 Dickerson Pike – (615) 555-0142');
   assert.equal(alertSubject({ issue: 'x', caller_id: '+16155550100', greeting_hangup: true }, 'hangup'), 'Caller hung up during greeting – (615) 555-0100 – call them back');
+  assert.equal(alertSubject({ ...intake, issue: 'Water heater is 15 years old', job_type: 'Water heater replacement', notes: [] }),
+    'New job – Water heater is 15 years old – 1412 Dickerson Pike – (615) 555-0142', 'high-value subjects stay "New job"');
+  assert.equal(alertSubject({ ...intake, job_size: 'Big job (half day+)', notes: [] }), 'URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142', 'urgent subject unchanged');
+  assert.ok(alertSubject({ ...intake, issue: 'repipe ' + 'the whole downstairs bathroom and kitchen '.repeat(4), notes: [] }).length <= 90);
   const long = alertSubject({ ...intake, issue: 'URGENT - ' + 'water pouring through the ceiling of the downstairs bathroom '.repeat(4),
     address: '98765 Old Hickory Boulevard Apartment 1204 Building C', callback_phone: '', caller_id: '+16155550100', notes: [] });
   assert.ok(long.length <= 90, long);
@@ -240,7 +244,7 @@ test('the 7am digest counts yesterday once per route, and opts out with digest: 
   assert.equal(digest.length, 1);
   assert.deepEqual(digest[0].body.to, ['office@example.com', 'owner@example.com']);
   assert.equal(digest[0].body.subject, 'Emma yesterday – 3 calls, 2 jobs saved, 1 urgent, 1 hang-up');
-  assert.match(digest[0].body.text, /Calls Emma answered: 3\nJobs saved: 2\nUrgent jobs: 1\n- Linda Harper – 1412 Dickerson Pike – no alert call placed\nHang-ups: 1\n- \(615\) 555-0111 \(hung up during greeting\) – call them back/);
+  assert.match(digest[0].body.text, /Calls Emma answered: 3\nJobs saved: 2\nUrgent jobs: 1\n- Urgent – Linda Harper – 1412 Dickerson Pike – no alert call placed\nHigh-value jobs: 0\nRoutine jobs: 1\n- Routine – Linda Harper – 1412 Dickerson Pike – Water heater quote\nHang-ups: 1\n- \(615\) 555-0111 \(hung up during greeting\) – call them back/);
   assert.deepEqual(await app.sendDigests(hour7 + 60 * MIN), [], 'once per route per day');
 });
 
@@ -249,7 +253,7 @@ test('a zero-call day still gets a digest, once, across a restart', async t => {
   assert.deepEqual(await first.app.sendDigests(sevenAm), ['client-a:accepted']);
   const zero = first.emails()[0].body;
   assert.equal(zero.subject, 'Emma answered 0 forwarded calls yesterday — she\'s on and working');
-  assert.match(zero.text, /^Gold Star Plumbing – Thursday, October 15\n\nCalls Emma answered: 0\nJobs saved: 0\nUrgent jobs: 0\nHang-ups: 0\n/);
+  assert.match(zero.text, /^Gold Star Plumbing – Thursday, October 15\n\nCalls Emma answered: 0\nJobs saved: 0\nUrgent jobs: 0\nHigh-value jobs: 0\nRoutine jobs: 0\nHang-ups: 0\n/);
   first.app.closeAllConnections(); await new Promise(resolve => first.app.close(resolve));
   const second = await fixture(t, { routes: { 'client-a': route }, dir: first.dir });
   assert.deepEqual(await second.app.sendDigests(sevenAm + 60 * MIN), []);
@@ -270,4 +274,24 @@ test('a failed digest is retried 15 minutes later with the same idempotency key'
   assert.deepEqual(await app.sendDigests(sevenAm + 16 * MIN), ['client-a:accepted']);
   assert.deepEqual(await app.sendDigests(sevenAm + 40 * MIN), []);
   assert.deepEqual(sent, ['digest-client-a-2026-10-15', 'digest-client-a-2026-10-15']);
+});
+
+test('the digest lists jobs by priority tier: urgent, high-value, routine, save order kept within a tier', () => {
+  const job = (name, issue, extra = {}) => ({ details: { name, address: `${name.length} Main St, Nashville`, issue, job_type: '', job_size: '', job_details: '', ...extra } });
+  const jobs = [job('Ann Routine', 'Leaky faucet', { job_type: 'Replace a faucet' }), job('Bo Big', 'Whole bathroom', { job_type: 'Bathroom remodel' }),
+    { ...job('Cy Urgent', 'URGENT - burst pipe'), ring: 'alert call answered' }, job('Di Routine', 'Toilet runs'),
+    job('Ed Big', 'Water heater leaking', { job_size: 'Big job (half day+)' }), { ...job('Flo Urgent', 'URGENT - sewage backing up'), ring: 'put through to you live' }];
+  const { subject, text } = digestEmail({ business: 'Gold Star Plumbing' }, 'Thursday, October 15', { calls: 7, jobs, hangups: [] });
+  assert.equal(subject, 'Emma yesterday – 7 calls, 6 jobs saved, 2 urgent, 2 high-value');
+  assert.match(text, new RegExp(['Jobs saved: 6', 'Urgent jobs: 2', '- Urgent – Cy Urgent – 9 Main St – alert call answered', '- Urgent – Flo Urgent – 10 Main St – put through to you live',
+    'High-value jobs: 2', '- High-value – Bo Big – 6 Main St – Bathroom remodel', '- High-value – Ed Big – 6 Main St – Water heater leaking',
+    'Routine jobs: 2', '- Routine – Ann Routine – 11 Main St – Replace a faucet', '- Routine – Di Routine – 10 Main St – Toilet runs', 'Hang-ups: 0'].join('\n')));
+});
+
+test('a single-tier digest lists only that tier\'s jobs, in save order', () => {
+  const job = (name, issue) => ({ details: { name, address: '9 Oak St, Nashville', issue, job_type: '', job_size: '', job_details: '' } });
+  const { subject, text } = digestEmail({ business: 'Gold Star Plumbing' }, 'Thursday, October 15',
+    { calls: 2, jobs: [job('Ann Cole', 'Leaky faucet'), job('Bo Diaz', 'Toilet runs')], hangups: [] });
+  assert.equal(subject, 'Emma yesterday – 2 calls, 2 jobs saved');
+  assert.match(text, /Jobs saved: 2\nUrgent jobs: 0\nHigh-value jobs: 0\nRoutine jobs: 2\n- Routine – Ann Cole – 9 Oak St – Leaky faucet\n- Routine – Bo Diaz – 9 Oak St – Toilet runs\nHang-ups: 0\n/);
 });

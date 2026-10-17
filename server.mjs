@@ -104,6 +104,65 @@ export function transcriptExcerpt(message, max = 1500) {
   const start = tail.indexOf('\n') >= 0 && tail.indexOf('\n') < max / 3 ? tail.indexOf('\n') + 1 : tail.search(/\s/) + 1;
   return `\u2026${tail.slice(start).trim()}`;
 }
+// The one urgent test: Emma saves an urgent job with an issue starting "URGENT - ".
+export const isUrgent = issue => /^\s*URGENT\b/i.test(issue);
+// Priority tier of a saved request, worked out when a job card or digest is written (never stored):
+//   urgent      the issue starts with "URGENT"
+//   high-value  not urgent, and job_size is "Big job (half day+)" (Emma's prompt files water heater replacement, main line
+//               or sewer, repiping, multiple fixtures and water damage there), or Emma's job_type label names a big-ticket
+//               job (HIGH_VALUE below). Only when job_type is empty are the issue and job_details read instead.
+//   routine     everything else, including requests with no job details (hang-ups keep their own section)
+// Big-ticket families (whole words, any case):
+//   water heater  replace/install/new + water heater, or water heater ... replace/install/new one later in the sentence
+//                 (not "water heater repair", "pilot light", "replace the faucet by the water heater"); also tankless
+//   repipe        repipe, re-pipe, repiping
+//   main/sewer    main/sewer line with replace, repair, backup, dig, excavate, collapsed, broken or cracked about the line
+//                 and any sewer or sewage backup (not "sewer smell")
+//                 (not "replace the shutoff valve on the main water line", not "sewer line camera inspection")
+//   other         slab leak, remodel, new construction, whole-house re-plumb/repipe/filter/softener ("whole house" alone
+//                 is how callers describe low pressure, so it does not count)
+// One guard for every family: a match does not count when its clause (the comma-separated part of the sentence where the
+// match ends, i.e. where the deciding word is) is NEGATED ("do not need", "not looking to", "isn't") or FINISHED work ("already", "last year", "had ... put in",
+// "was replaced", a clause that starts "Replaced ...").
+const HEATER = String.raw`(?:(?:the|a|an|my|our|their|his|her|old|existing|broken|leaking|leaky|gas|electric|\d+[- ]?gal(?:lon)?)\s+){0,4}water\s+heaters?\b`;
+const LINE = String.raw`(?:main(?:\s+(?:water|sewer|drain))?|sewer)\s+(?:lines?|mains?|laterals?|pipes?)\b`;
+const LINE_WORK = String.raw`(?:replace\w*|repair\w*|dig(?:s|ging)?|excavat\w*)`;
+const BACKUP = String.raw`(?:back(?:ed|ing)?[\s-]?ups?|dig(?:s|ging)?|excavat\w*)`;
+const HIGH_VALUE = [
+  String.raw`\b(?:new|replace|replacing|replacement|install|installing)\s+${HEATER}`,
+  String.raw`\bwater\s+heaters?\b.*?\b(?:replace|replaced|replacing|replacement|install|installed|installing|installation|new\s+(?:one|unit|tank|heater))\b`,
+  String.raw`\btankless\b`,
+  String.raw`\bre-?pip(?:e|es|ed|ing)\b`,
+  String.raw`\b${LINE}.*?\b(?:${LINE_WORK}|${BACKUP}|collaps\w*|broken|cracked)\b`,
+  String.raw`\b${LINE_WORK}\s+(?:(?:the|a|our|my|their|old|broken|cracked|whole)\s+){0,3}${LINE}`,
+  String.raw`\b${BACKUP}\b.*?\b${LINE}`,
+  String.raw`\bsewer\s+(?:replacement|repair)\b`,
+  String.raw`\bsew(?:er|age)\s+back(?:ed|ing)?[\s-]?ups?\b`,
+  String.raw`\bslab\s+leaks?\b`,
+  String.raw`\bremodel(?:s|ed|ing)?\b`,
+  String.raw`\bnew\s+construction\b`,
+  String.raw`\bwhole[\s-]+(?:house|home)\s+(?:re-?plumb\w*|re-?pip\w*|plumbing|water\s+(?:filter|filtration|softener)\w*|filt\w*|softener\w*)`,
+].map(source => new RegExp(source, 'gi'));
+const NEGATED = /\b(?:not|never|without|don'?t|doesn'?t|didn'?t|isn'?t|aren'?t|wasn'?t|won'?t|no\s+(?:need|longer))\b|\bno\b(?!\s+(?:hot\s+)?(?:water|heat|pressure)\b)/i;
+const FINISHED = /\b(?:already|last\s+(?:year|month|week|spring|summer|fall|winter)|(?:years?|months?|weeks?)\s+ago|(?:was|were|been|got|had)\s+(?:[\w'-]+\s+){0,4}?(?:replaced|installed|put\s+in|redone|repiped|remodeled))\b|^\s*(?:just\s+|recently\s+)?(?:replaced|installed|remodeled|repiped|redid)\b/i;
+function namesBigJob(text) {
+  for (const sentence of String(text || '').replace(/[‘’]/g, "'").split(/[.;!?\n]+/)) for (const pattern of HIGH_VALUE) {
+    for (const m of sentence.matchAll(pattern)) {
+      const end = m.index + m[0].length, next = sentence.indexOf(',', end);
+      const clause = sentence.slice(sentence.lastIndexOf(',', end - 1) + 1, next < 0 ? undefined : next);
+      if (!NEGATED.test(clause) && !FINISHED.test(clause)) return true;
+    }
+  }
+  return false;
+}
+export function priorityTier(details = {}) {
+  if (isUrgent(details.issue)) return 'urgent';
+  if (/^\s*big job\b/i.test(details.job_size || '')) return 'high-value';
+  const label = String(details.job_type || '').trim();
+  return namesBigJob(label || [details.issue, details.job_details].filter(Boolean).join('\n')) ? 'high-value' : 'routine';
+}
+const TIER_LABEL = { urgent: 'Urgent', 'high-value': 'High-value job', routine: 'Routine' };
+const TIER_ORDER = ['urgent', 'high-value', 'routine'];
 
 // Lock-screen email subjects: what, where, who to call, e.g. "URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142".
 // At most 90 characters; the phone number is never cut, the address keeps its first part (street), the issue gets the rest.
@@ -125,7 +184,7 @@ export function subjectLine(head, topic, address, phone, max = 90) {
   return [head, what, place, phone].filter(Boolean).join(SEP).slice(0, max);
 }
 export function alertSubject(details, kind = 'new') {
-  const urgent = /^\s*URGENT\b/i.test(details.issue);
+  const urgent = isUrgent(details.issue);
   const phone = formatPhone(details.callback_phone || details.caller_id) || 'no number given';
   if (kind === 'hangup') return `Caller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${SEP}call them back`;
   if (kind === 'unanswered') return subjectLine('UNANSWERED URGENT', details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
@@ -168,7 +227,7 @@ const gsm = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036
   .replace(/[\u2013\u2014\u00B7\u2022]/g, '-').replace(/\u2026/g, '...').replace(/[^\n\x20-\x7E]/g, '');
 // channel 'email': same lines, but no SMS opt-out footer, no 280-character cut and no GSM-7 stripping.
 export function alertText(route, details, kind = 'new', channel = 'sms') {
-  const urgent = /^\s*URGENT\b/i.test(details.issue);
+  const urgent = isUrgent(details.issue);
   const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
   // A hang-up lead's callback number came from Emma's read-back; the caller ID is shown too when it differs.
@@ -183,8 +242,31 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
   // Email only: the call recording (from Vapi's end-of-call report) near the top, when the server has it.
   if (channel === 'email' && details.recording_url) lines.splice(1, 0, `Recording: ${details.recording_url}`);
+  // Email only: the priority tier right under the heading on every new job card (the SMS keeps all 280 characters for the job).
+  if (channel === 'email' && kind === 'new') lines.splice(1, 0, `Priority: ${TIER_LABEL[priorityTier(details)]}`);
   if (channel === 'email') return lines.join('\n');
   return `${gsm(lines.join('\n')).slice(0, 280)}\nReply STOP to opt out`;
+}
+
+// The 7am digest email. stats: { calls, jobs: [{ details, ring? }] in save order, hangups: [{ details }] }. Jobs are listed
+// by priority tier (urgent, high-value, routine), in save order within a tier; urgent jobs say how the alert call went.
+const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+export function digestEmail(route, label, stats) {
+  const { calls, jobs, hangups } = stats;
+  const byTier = Object.fromEntries(TIER_ORDER.map(tier => [tier, jobs.filter(j => priorityTier(j.details) === tier)]));
+  const { urgent, 'high-value': high, routine } = byTier;
+  const street = d => String(d.address || 'no address').split(',')[0];
+  const what = d => clip(d.job_type || d.issue, 60);
+  const subject = calls ? `Emma yesterday${SEP}${count(calls, 'call')}, ${count(jobs.length, 'job')} saved${urgent.length ? `, ${urgent.length} urgent` : ''}` +
+    `${high.length ? `, ${high.length} high-value` : ''}${hangups.length ? `, ${count(hangups.length, 'hang-up')}` : ''}` : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working';
+  const lines = [`${route.business || 'Your line'}${SEP}${label}`, '', `Calls Emma answered: ${calls}`, `Jobs saved: ${jobs.length}`, `Urgent jobs: ${urgent.length}`,
+    ...urgent.map(u => `- Urgent${SEP}${u.details.name}${SEP}${street(u.details)}${SEP}${u.ring}`),
+    `High-value jobs: ${high.length}`, ...high.map(h => `- High-value${SEP}${h.details.name}${SEP}${street(h.details)}${SEP}${what(h.details)}`),
+    `Routine jobs: ${routine.length}`, ...routine.map(r => `- Routine${SEP}${r.details.name}${SEP}${street(r.details)}${SEP}${what(r.details)}`),
+    `Hang-ups: ${hangups.length}`, ...hangups.map(h => `- ${formatPhone(h.details.callback_phone || h.details.caller_id)}${h.details.greeting_hangup ? ' (hung up during greeting)' : ''}${SEP}call them back`), '',
+    calls ? 'Every job was emailed to you as it came in.' : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working. ' +
+      'If you expected calls, check that your shop line still forwards to Emma.', '', 'Anchorline AI'];
+  return { subject, text: lines.join('\n') };
 }
 
 // Customer confirmation: what we received, never a promised appointment time.
@@ -289,7 +371,7 @@ export function createApp(env = process.env, send = fetch) {
   const CHECK_MS = 150000, RECHECK_MS = 30000, RETRY_MS = 300000, GIVE_UP_MS = 600000;
   const OFFICE_RETRY_MS = 60000, OFFICE_RETRIES = 5;
   const fallbackMs = Math.max(0, Number(env.TRANSFER_FALLBACK_SECONDS ?? 75) || 0) * 1000;
-  const canTransfer = (route, details) => !!route && isE164(route.transfer) && /^\s*URGENT\b/i.test(details.issue) && (!details.is_test || !!route.alertTests);
+  const canTransfer = (route, details) => !!route && isE164(route.transfer) && isUrgent(details.issue) && (!details.is_test || !!route.alertTests);
   let db;
   let trialsEnabled = false;
   if (dataDir) {
@@ -526,7 +608,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         .then(r => { if (!r.ok) console.warn(`alert email failed: HTTP ${r.status} request=${id}`); return r; },
           error => { console.warn(`alert email failed: no response request=${id}`); throw error; }));
     }
-    const urgent = /^\s*URGENT\b/i.test(details.issue);
+    const urgent = isUrgent(details.issue);
     if (kind === 'new' && urgent && !holdCall && callId) jobs.push(...ring(callId, route, details));
     return settleOutcome(jobs);
   }
@@ -772,21 +854,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const rows = db.prepare(`SELECT call_id, details, result FROM requests r WHERE assistant_id = ? AND is_test = 0 AND created_at >= ? AND created_at < ?
       AND NOT EXISTS (SELECT 1 FROM call_log c WHERE c.call_id = r.call_id AND c.is_test = 1) ORDER BY created_at`).all(assistantId, start, end)
       .map(r => ({ call_id: r.call_id, details: JSON.parse(r.details), hangup: JSON.parse(r.result).source === 'hangup' }));
-    const jobs = rows.filter(r => !r.hangup);
-    const urgent = jobs.filter(r => /^\s*URGENT\b/i.test(r.details.issue)).map(r => ({ ...r, ring: ringSummary(r.call_id) }));
-    return { calls, jobs: jobs.length, urgent, hangups: rows.filter(r => r.hangup) };
-  }
-  const count = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-  function digestEmail(route, label, stats) {
-    const { calls, jobs, urgent, hangups } = stats;
-    const subject = calls ? `Emma yesterday${SEP}${count(calls, 'call')}, ${count(jobs, 'job')} saved${urgent.length ? `, ${urgent.length} urgent` : ''}` +
-      `${hangups.length ? `, ${count(hangups.length, 'hang-up')}` : ''}` : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working';
-    const lines = [`${route.business || 'Your line'}${SEP}${label}`, '', `Calls Emma answered: ${calls}`, `Jobs saved: ${jobs}`, `Urgent jobs: ${urgent.length}`,
-      ...urgent.map(u => `- ${u.details.name}${SEP}${String(u.details.address || 'no address').split(',')[0]}${SEP}${u.ring}`),
-      `Hang-ups: ${hangups.length}`, ...hangups.map(h => `- ${formatPhone(h.details.callback_phone || h.details.caller_id)}${h.details.greeting_hangup ? ' (hung up during greeting)' : ''}${SEP}call them back`), '',
-      calls ? 'Every job was emailed to you as it came in.' : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working. ' +
-        'If you expected calls, check that your shop line still forwards to Emma.', '', 'Anchorline AI'];
-    return { subject, text: lines.join('\n') };
+    const jobs = rows.filter(r => !r.hangup).map(r => isUrgent(r.details.issue) ? { ...r, ring: ringSummary(r.call_id) } : r);
+    return { calls, jobs, hangups: rows.filter(r => r.hangup) };
   }
   // 7am America/Chicago: yesterday's digest for each route (ALERT_ROUTES and trial clients in service), also on a zero-call
   // day. Once per route per day: claimed in SQLite (digests), up to 5 tries 15 minutes apart, same Idempotency-Key each try.
@@ -938,7 +1007,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       details[field] = (args[field] || '').trim();
     }
     // Skipping the email question is only allowed for emergencies.
-    if (args.email_status === 'skipped_emergency' && !/^\s*URGENT\b/i.test(details.issue))
+    if (args.email_status === 'skipped_emergency' && !isUrgent(details.issue))
       return failure('Not saved: this is not an urgent job, so ask the caller for their email first, then save again.');
     details.caller_id = callerNumberOf(message);
     details.notes = [];
