@@ -243,7 +243,8 @@ export function digestWindow(now = Date.now()) {
 const gsm = value => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[\u2018\u2019\u02BC]/g, "'").replace(/[\u201C\u201D]/g, '"')
   .replace(/[\u2013\u2014\u00B7\u2022]/g, '-').replace(/\u2026/g, '...').replace(/[^\n\x20-\x7E]/g, '');
 // channel 'email': same lines, but no SMS opt-out footer, no 280-character cut and no GSM-7 stripping.
-export function alertText(route, details, kind = 'new', channel = 'sms') {
+// delayedMin (an office retry of a job saved over an hour ago): "(delayed N min) " leads the first line, inside the cut.
+export function alertText(route, details, kind = 'new', channel = 'sms', { delayedMin = 0 } = {}) {
   const urgent = isUrgent(details.issue);
   const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
@@ -251,7 +252,7 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   const callerIdToo = details.caller_id && digitsOf(details.caller_id) !== digitsOf(details.callback_phone) ? `; caller ID ${formatPhone(details.caller_id)}` : '';
   const also = kind === 'hangup' && details.callback_phone ? ` (${hangupCallbackLabel(details)}${callerIdToo})` : '';
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
-  const lines = [`Anchorline AI: ${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} - ${phone}${also}`];
+  const lines = [`Anchorline AI: ${delayedMin ? `(delayed ${delayedMin} min) ` : ''}${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} - ${phone}${also}`];
   if (details.address) lines.push(details.address);
   lines.push(kind === 'note' ? `Note: ${details.notes.at(-1)}` : issue);
   if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' - ')}`);
@@ -676,7 +677,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   // its first payload: Resend refuses a reused Idempotency-Key with a new body, and the first try may have landed.
   async function alertOutcome(route, details, id, kind, holdCall = false, callId = '', emailKey = `${id}-alert-${kind}-0`, delayedMin = 0) {
     if (!route || (details.is_test && !route.alertTests)) return { status: details.is_test ? 'suppressed_test' : 'not_configured', delivered: false };
-    const text = delayedMin ? alertText(route, details, kind).replace(/^Anchorline AI: /, `Anchorline AI: (delayed ${delayedMin} min) `) : alertText(route, details, kind);
+    const text = alertText(route, details, kind, 'sms', { delayedMin });
     const jobs = [];
     if (env.TELNYX_API_KEY && env.TELNYX_FROM) {
       for (const to of route.sms || []) jobs.push(sendOnce(emailKey, `sms:${to}`, () => send('https://api.telnyx.com/v2/messages', {
@@ -873,6 +874,15 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       if (details.is_test) { set({ done: 'suppressed_test' }); return 'suppressed_test'; }
       const route = routeOf(request.assistant_id);
       let why = `Every alert channel failed ${Math.min(row.attempts + 1, OFFICE_RETRIES + 1)} times`;
+      // A channel of this alert already went out (a crash after the send, before the first try was settled): the office
+      // was reached. Close the row without sending; office_alert says 'sent' if it was still unfinished, else stays.
+      if (db.prepare("SELECT 1 FROM deliveries WHERE ref = ? AND status = 'sent'").get(row.email_key)) {
+        set({ attempts, done: 'sent' });
+        db.prepare(`UPDATE requests SET result = json_set(result, '$.office_alert', 'sent') WHERE call_id = ? AND json_valid(result)
+          AND json_extract(result, '$.office_alert') IN ('pending', 'needs_review')`).run(row.call_id);
+        console.log(`office-alert retry call=${row.call_id} request=${request.id} attempt=${attempts} outcome=already_sent`);
+        return 'already_sent';
+      }
       if (route && row.attempts < OFFICE_RETRIES) {
         // A job saved over an hour ago still goes to the shop (nothing is lost), once, marked as delayed.
         const age = Math.floor((now - Date.parse(request.created_at)) / 60000);

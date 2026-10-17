@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
-import { createApp } from './server.mjs';
+import { createApp, alertText } from './server.mjs';
 
 // Vapi retries a tool call (server.backoffPlan) with the same body: same toolCall id, same arguments. A retry must never
 // double-send, must re-send what failed, and must finish sends cut off by a restart.
@@ -387,6 +387,30 @@ test('a stale submit row: the outbox sends nothing late, unsent receipts end as 
   assert.equal(second.emails().filter(e => e.body.to[0] !== 'office@example.com').length, 0, 'no late receipts');
   assert.ok(lines.some(l => /^office-alert delayed call=k-5 request=\S+ age_min=\d+$/.test(l)));
   assert.equal(stored().office_alert, 'sent_after_retry');
+});
+
+test('a long delayed SMS keeps the 302-character limit and the STOP footer; other alerts are unchanged', () => {
+  const long = { name: 'Linda Harper', address: '48 Birch Road', issue: 'Slow drain '.repeat(60), callback_phone: '6155550142', notes: [] };
+  const routeA = { business: 'Maple Plumbing' };
+  const delayed = alertText(routeA, long, 'new', 'sms', { delayedMin: 125 });
+  assert.ok(delayed.length <= 302, `${delayed.length} characters`);
+  assert.match(delayed, /^Anchorline AI: \(delayed 125 min\) New call - Maple Plumbing/); assert.match(delayed, /\nReply STOP to opt out$/);
+  assert.equal(alertText(routeA, long, 'new', 'sms', {}), alertText(routeA, long, 'new', 'sms'));
+  assert.equal(alertText(routeA, long, 'new', 'email', { delayedMin: 0 }), alertText(routeA, long, 'new', 'email'));
+});
+
+test('office retry after a crash that came after a channel was sent: closes the row, sends nothing, no sent_after_retry', async t => {
+  const dir = tempDir(t);
+  const first = await fixture(t, { dir, extra: twoNumbers, behave: (url, body) => body.to === '+15550000001' ? 200 : never() });
+  first.post(toolCall('a-1', 'submit_service_request', intake)).catch(() => {});
+  await settleLater(150);
+  await first.stop();
+  const second = await fixture(t, { dir, extra: twoNumbers });
+  assert.deepEqual(await second.app.sweepOfficeRetries(Date.now() + MIN + 1000), ['already_sent']);
+  assert.equal(second.sent.length, 0, 'the office was already reached: nothing is re-sent by the office retry');
+  assert.equal(retryRow(dir, 'a-1').done, 'sent');
+  const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+  try { assert.equal(JSON.parse(db.prepare('SELECT result FROM requests').get().result).office_alert, 'sent'); } finally { db.close(); }
 });
 
 test('email X fails, the caller corrects it to Y, then submit is retried: Y gets exactly one confirmation', async t => {
