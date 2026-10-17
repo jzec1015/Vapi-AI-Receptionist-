@@ -834,3 +834,29 @@ test('social round 3: honest no-number failure line, notes allowed in job_detail
   assert.doesNotMatch(prompt, /calling from\."/);
   assert.equal(prompt.split('if it shows on our end').length - 1, 3);
 });
+
+test('read-back fixes: phone read-back before any follow-up, only a plain yes counts, address read back after the save', () => {
+  const shop = { id: 'client-9', business: 'Riverbend Plumbing', owner_name: 'Dana Whitfield', shop_number: '+16155550100', city: 'Nashville', state: 'TN', services: 'Drains' };
+  const prompt = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key }).model.messages[0].content;
+  const once = text => assert.equal(prompt.split(text).length - 1, 1, `"${text}" appears exactly once`);
+  const section = (name, next) => prompt.slice(prompt.indexOf(name), prompt.indexOf(next, prompt.indexOf(name)));
+  // H1: the follow-up rule itself points to the read-back, and the phone rule says the read-back beats any follow-up.
+  const curious = section('BE CURIOUS', 'WHAT TO GET');
+  assert.match(curious, /ask ONE short follow-up that fits it, and a second only if the job is still unclear, unless they've just given a callback number: read it back first, see THE PHONE NUMBER RULE\./);
+  const phone = section('THE PHONE NUMBER RULE (', 'SHOP DETAILS');
+  assert.match(phone, /then stop talking and wait for their answer\. The read-back comes before any follow-up or sizing question\./);
+  once("unless they've just given a callback number");
+  once('before any follow-up or sizing question');
+  // H2: only a plain yes to the read-back itself sets callback_read_back; anything else gets one more read-back, then the fallback.
+  assert.match(phone, /Set callback_read_back true only if you actually read it back in this call and they said yes\. Only a plain yes to the read-back itself counts; another topic, a question, a no or silence is not a yes, so answer briefly if needed, then read the whole number back once more\. If that still gets no yes, use the fallback below, noting "couldn't confirm a callback number"\./);
+  once('Only a plain yes to the read-back itself counts');
+  // H3: WRAPPING UP reads an unread address back on its own after the save, before the close and "Anything else?".
+  const wrapping = section('WRAPPING UP', 'ENDING THE CALL');
+  assert.match(wrapping, /After the save, if they gave an address you haven't read back yet, your next reply is only that read-back question \(item 3\)\. If they ask something, add a detail or correct one AFTER it's saved, call add_request_note/);
+  assert.match(wrapping, /Only after it is saved and any address read back, close warmly and honestly: "Alright, I've got all that over to the team\./);
+  assert.ok(wrapping.indexOf('if they gave an address you haven') < wrapping.indexOf('Anything else you'), 'the address read-back comes before "Anything else?"');
+  once("if they gave an address you haven't read back yet");
+  // Still consistent: item 3 keeps C5 (save first for item 6 callers) and the phone rule stays last.
+  assert.match(prompt, /unless item 6 says to save right away; then save first, read the address back after, and add any correction with add_request_note\./);
+  assert.ok(prompt.indexOf('THE PHONE NUMBER RULE (') > prompt.indexOf('HOW YOU ACTUALLY TALK') && prompt.indexOf('THE PHONE NUMBER RULE (') < prompt.indexOf('<<<SHOP DETAILS'));
+});
