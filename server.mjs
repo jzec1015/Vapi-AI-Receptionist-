@@ -50,6 +50,61 @@ export function formatPhone(value) {
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : String(value || '');
 }
 
+// Phone numbers in one turn of speech: 10-digit US numbers written as numerals ("615-555-0142") or read out
+// ("six one five, five five five, oh one four two"). A run of digits ends at any other word or at ? or !; a run that is
+// not exactly one number (an address glued to it, a missing digit) yields nothing rather than a guess.
+const DIGIT_WORDS = { zero: '0', oh: '0', o: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
+export function phoneNumbersIn(text) {
+  const found = [];
+  let run = '';
+  const flush = () => { const d = run.replace(/^0+/, '').replace(/^1(?=\d{10}$)/, ''); if (/^[2-9]\d{9}$/.test(d)) found.push(d); run = ''; };
+  for (const token of String(text || '').toLowerCase().split(/([?!\n])|[\s,.;:()+\-\u2013\u2014]+/)) {
+    if (!token) continue;
+    if (/^\d+$/.test(token)) run += token;
+    else if (Object.hasOwn(DIGIT_WORDS, token)) run += DIGIT_WORDS[token];
+    else flush();
+  }
+  flush();
+  return found;
+}
+// The spoken turns of a call from Vapi's end-of-call report: artifact.messages (role bot/user, text in message; or
+// OpenAI-style assistant/user with content), else the artifact.transcript lines ("AI: ..." / "User: ...").
+export function callTurns(message) {
+  const list = message.artifact?.messages || message.messages;
+  if (Array.isArray(list) && list.length) return list.filter(m => ['bot', 'assistant', 'user'].includes(m?.role))
+    .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', text: String(m.message ?? m.content ?? '') }));
+  const turns = [];
+  for (const line of String(message.artifact?.transcript || message.transcript || '').split('\n')) {
+    const tag = line.match(/^\s*(AI|Assistant|Bot|User|Customer):\s*(.*)$/i);
+    if (tag) turns.push({ role: /^(user|customer)$/i.test(tag[1]) ? 'user' : 'assistant', text: tag[2] });
+    else if (turns.length && line.trim()) turns.at(-1).text += ` ${line.trim()}`;
+  }
+  return turns;
+}
+// The last number Emma read back that the caller confirmed in their next turn ("yes", "yeah", "that's right", ...), as
+// 10 digits; '' when none was confirmed. A caller who says "no, it's ..." does not confirm it.
+const CONFIRMED = /^\W*(?:(?:uh|um|mm)\W+)?(?:yes|yeah|yep|yup|correct|that'?s right|that is right|right)\b/i;
+export function confirmedCallback(message) {
+  const turns = callTurns(message);
+  let number = '';
+  turns.forEach((turn, i) => {
+    if (turn.role !== 'assistant') return;
+    const read = phoneNumbersIn(turn.text).at(-1);
+    const reply = turns.slice(i + 1).find(t => t.role === 'user');
+    if (read && reply && CONFIRMED.test(reply.text.replace(/\u2019/g, "'"))) number = read;
+  });
+  return number;
+}
+// The end of the call's transcript (at most max characters, cut at a line or word), so the office sees what the caller said.
+export function transcriptExcerpt(message, max = 1500) {
+  const text = (String(message.artifact?.transcript || message.transcript || '').trim() ||
+    callTurns(message).map(t => `${t.role === 'user' ? 'User' : 'AI'}: ${t.text}`).join('\n')).trim();
+  if (text.length <= max) return text;
+  const tail = text.slice(-(max - 1));
+  const start = tail.indexOf('\n') >= 0 && tail.indexOf('\n') < max / 3 ? tail.indexOf('\n') + 1 : tail.search(/\s/) + 1;
+  return `\u2026${tail.slice(start).trim()}`;
+}
+
 // Lock-screen email subjects: what, where, who to call, e.g. "URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142".
 // At most 90 characters; the phone number is never cut, the address keeps its first part (street), the issue gets the rest.
 const SEP = ' \u2013 ';
@@ -116,8 +171,11 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   const urgent = /^\s*URGENT\b/i.test(details.issue);
   const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : kind === 'hangup' ? 'Caller hung up' : urgent ? 'URGENT call' : 'New call';
   const phone = details.callback_phone ? formatPhone(details.callback_phone) : (details.caller_id ? `${formatPhone(details.caller_id)} (caller ID)` : 'no number given');
+  // A hang-up lead's callback number came from Emma's read-back; the caller ID is shown too when it differs.
+  const also = kind === 'hangup' && details.callback_phone && details.caller_id && digitsOf(details.caller_id) !== digitsOf(details.callback_phone)
+    ? ` (confirmed on the call; caller ID ${formatPhone(details.caller_id)})` : '';
   const issue = details.issue.replace(/^\s*URGENT\s*-\s*/i, '');
-  const lines = [`Anchorline AI: ${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} - ${phone}`];
+  const lines = [`Anchorline AI: ${head}${route.business ? ` - ${route.business}` : ''}`, `${details.name} - ${phone}${also}`];
   if (details.address) lines.push(details.address);
   lines.push(kind === 'note' ? `Note: ${details.notes.at(-1)}` : issue);
   if (kind === 'new' && (details.job_type || details.job_size)) lines.push(`Job: ${[details.job_type, details.job_size].filter(Boolean).join(' - ')}`);
@@ -725,7 +783,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       `${hangups.length ? `, ${count(hangups.length, 'hang-up')}` : ''}` : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working';
     const lines = [`${route.business || 'Your line'}${SEP}${label}`, '', `Calls Emma answered: ${calls}`, `Jobs saved: ${jobs}`, `Urgent jobs: ${urgent.length}`,
       ...urgent.map(u => `- ${u.details.name}${SEP}${String(u.details.address || 'no address').split(',')[0]}${SEP}${u.ring}`),
-      `Hang-ups: ${hangups.length}`, ...hangups.map(h => `- ${formatPhone(h.details.caller_id)}${h.details.greeting_hangup ? ' (hung up during greeting)' : ''}${SEP}call them back`), '',
+      `Hang-ups: ${hangups.length}`, ...hangups.map(h => `- ${formatPhone(h.details.callback_phone || h.details.caller_id)}${h.details.greeting_hangup ? ' (hung up during greeting)' : ''}${SEP}call them back`), '',
       calls ? 'Every job was emailed to you as it came in.' : 'Emma answered 0 forwarded calls yesterday \u2014 she\'s on and working. ' +
         'If you expected calls, check that your shop line still forwards to Emma.', '', 'Anchorline AI'];
     return { subject, text: lines.join('\n') };
@@ -821,8 +879,14 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     const summary = String(message.analysis?.summary || message.summary || '').trim().slice(0, 1000);
     // A caller who said "test call" is a test; never alert a client about it.
     const said = `${message.artifact?.transcript || message.transcript || ''} ${summary}`;
-    const issue = greeting ? 'Hung up during the greeting, before giving any details' : summary ? `Hung up before finishing. Summary: ${summary}` : 'Hung up before giving details';
-    const details = { name: 'Unknown caller', address: '', issue, is_test: /test call/i.test(said), callback_phone: '', caller_id: callerId, email: '', notes: [],
+    // What the caller said and the number Emma read back and they confirmed (e.g. a save that failed mid-deploy), from the
+    // report's own transcript: no extra Vapi call. Never a number the caller did not confirm.
+    const excerpt = greeting ? '' : transcriptExcerpt(message);
+    const callback = greeting ? '' : confirmedCallback(message);
+    const issue = greeting ? 'Hung up during the greeting, before giving any details' :
+      `${summary ? `Hung up before finishing. Summary: ${summary}` : excerpt ? 'Hung up before finishing' : 'Hung up before giving details'}` +
+      `${excerpt ? `\nTranscript (end of call):\n${excerpt}` : ''}`;
+    const details = { name: 'Unknown caller', address: '', issue, is_test: /test call/i.test(said), callback_phone: callback, caller_id: callerId, email: '', notes: [],
       ...(greeting ? { greeting_hangup: true } : {}), ...(recordingOf(message) ? { recording_url: recordingOf(message) } : {}) };
     const id = randomUUID();
     const result = { saved: true, retryable: false, request_id: id, source: 'hangup', caller_email: 'not_requested', anchorline_email: 'not_requested' };
