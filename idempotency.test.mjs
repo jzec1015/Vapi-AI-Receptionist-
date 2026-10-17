@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
-import { createApp, alertText, NOT_SAVED_SAY, notSavedNote } from './server.mjs';
+import { createApp, alertText, NOT_SAVED_SAY, NO_REQUEST_SAY, UNCONFIRMED_SAY, TROUBLE_SAY, notSavedNote, notSavedSay } from './server.mjs';
 
 // Vapi retries a tool call (server.backoffPlan) with the same body: same toolCall id, same arguments. A retry must never
 // double-send, must re-send what failed, and must finish sends cut off by a restart.
@@ -719,47 +719,48 @@ test('a 7am digest send that hangs never delays a held urgent ring: it goes on t
   assert.equal(hung, control, `with the digest send hanging the ring went at ${hung} ms instead of ${control} ms`);
 });
 
-// Every saved:false result of add_request_note / add_customer_email carries a note that it was not saved, and all but "No
-// saved request yet" carry the line to speak (say), so gpt-4.1 does not improvise "I'll note that..." or "I'll let the team
-// know...". The fields already there stay.
-// The server counts consecutive failures per call and tool: the first gets one retry (THE ONE RULE), the next "do not call it
-// again". A save of that tool, or the first save of the request, starts the count again. "No saved request yet" is never
-// counted and has no say line (no job is saved, so no team call is set up): it always gets the save-the-job-first note.
+// Every saved:false result of add_request_note / add_customer_email carries ONE exact line to speak (say) and a note that
+// begins "Say exactly the say line and nothing else about this.", so gpt-4.1 does not improvise "I'll note that...", "The
+// team will see...", or speak a line the note forbids. The fields already there stay.
+// The server counts consecutive failures per call and tool: the first gets the trouble line and one retry (THE ONE RULE),
+// the next the not-saved line and "do not call it again". A save of that tool, or the first save of the request, starts the
+// count again. "No saved request yet" is never counted and always gets its own line and the save-the-job-first note.
 const UNCONFIRMED = 'Not added: spell the email back letter by letter and get a clear yes first.';
-const NEVER = `Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`;
-const retryNote = name => 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what the error ' +
-  `says if it tells you, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
-  `If it still isn't saved, say only the say line. ${NEVER}`;
+const SAY_ONLY = 'Say exactly the say line and nothing else about this.';
+const NEVER = `Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar. ` +
+  'Other than the exact lines given here, never say the team will see, have, know or get this detail.';
+const retryNote = name => `${SAY_ONLY} NOT saved: nothing was noted, added or passed on. Then fix what the error says if it tells you, and call ` +
+  `${name} once more in that same reply, before the caller speaks; never stop after the say line. If that call is not saved either, its ` +
+  `result gives the next line to say. ${NEVER}`;
 const NO_REQUEST = 'No saved request yet; save the request first';
-const nojobNote = name => 'NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: never say the ' +
-  `team will call or call back about this, or that they will have it. Do not call ${name} again before the job is saved. ` +
+const nojobNote = name => `${SAY_ONLY} NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: ` +
+  `never say the team will call or call back about this. Do not call ${name} again before the job is saved. ` +
   'Carry on with the call and save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP ' +
   `say to. Only after that returns saved true, call ${name} again with the same detail, unless it is already in what you ` +
   `saved. ${NEVER}`;
-const stopNote = `NOT saved again. Do not call it again. Say only the say line. ${NEVER}`;
-const noIdNote = `NOT saved. Do not call it again. Say only the say line. ${NEVER}`;
-const confirmNote = 'NOT saved: the email is not confirmed yet. Spell the email back letter by letter, then stop and wait for the caller\'s clear yes. ' +
+const stopNote = `${SAY_ONLY} NOT saved again. Do not call it again. ${NEVER}`;
+const noIdNote = `${SAY_ONLY} NOT saved. Do not call it again. ${NEVER}`;
+const confirmNote = `${SAY_ONLY} NOT saved: the email is not confirmed yet. Then spell the email back letter by letter, and stop and wait for the caller's clear yes. ` +
   'Only after they say yes, call add_customer_email again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ' +
   'again before the caller speaks. If they say it\'s wrong, ask them to spell just that part again, nice and slow, and read it back again, as you did ' +
-  `before. Only if they won't or can't confirm it, say only the say line. ${NEVER}`;
-// kind: 'first' (retry note), 'again' (no-retry note), 'noid' (no call id: no retry, and not "again"), 'confirm' (unconfirmed
-// email) or 'nojob' (no saved request yet: no say line, the save-the-job-first note).
+  `before. Only if they won't or can't confirm it, say only "Mention that when the team calls you, so they have it." ${NEVER}`;
+// The exact line each kind speaks. kind: 'first' (retry note), 'again' (no-retry note), 'noid' (no call id: no retry, and
+// not "again"), 'confirm' (unconfirmed email) or 'nojob' (no saved request yet: the save-the-job-first note).
+const SAYS = { first: "I'm having trouble saving that, one moment.", again: 'Mention that when the team calls you, so they have it.',
+  noid: 'Mention that when the team calls you, so they have it.', confirm: 'Let me spell that back to make sure I have it.',
+  nojob: "Okay, let's get the rest of your details first." };
 const notSaved = (result, name, error, kind = 'first') => {
   assert.equal(result.saved, false); assert.equal(result.retryable, false); assert.equal(result.error, error);
-  if (kind === 'nojob') {
-    assert.equal(result.error, NO_REQUEST); assert.equal('say' in result, false); assert.equal(result.note, nojobNote(name));
-    assert.deepEqual(Object.keys(result), ['saved', 'retryable', 'error', 'note']);
-    return;
-  }
-  assert.equal(result.say, NOT_SAVED_SAY); assert.equal(result.say, 'Mention that when the team calls you, so they have it.');
-  assert.equal(result.note, { first: retryNote(name), again: stopNote, noid: noIdNote, confirm: confirmNote }[kind]);
+  if (kind === 'nojob') assert.equal(result.error, NO_REQUEST);
+  assert.equal(result.say, SAYS[kind]);
+  assert.equal(result.note, { first: retryNote(name), again: stopNote, noid: noIdNote, confirm: confirmNote, nojob: nojobNote(name) }[kind]);
   assert.deepEqual(Object.keys(result), ['saved', 'retryable', 'error', 'say', 'note']);
 };
 const noCall = (name, args) => ({ message: { type: 'tool-calls', toolCallList: [{ id: 'tc-x', function: { name, arguments: args } }] } });
 const failTrigger = (dir, table) => { const db = new DatabaseSync(join(dir, 'requests.sqlite'));
   try { db.exec(`CREATE TRIGGER fail_${table} BEFORE INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'disk full'); END`); } finally { db.close(); } };
 
-test('every saved:false add_request_note path gets its note: no job yet the no-job note with no say line, any other the say line and, as its first failure in the call, the retry note', async t => {
+test('every saved:false add_request_note path gets its say line and note: no job yet the no-job pair, any other, as its first failure in the call, the trouble line and the retry note', async t => {
   const { post, dir, saved, sms } = await fixture(t);
   const N = 'add_request_note';
   const fresh = async id => { await post(toolCall(id, 'submit_service_request', intake, 'tc-submit')); return id; };
@@ -778,7 +779,7 @@ test('every saved:false add_request_note path gets its note: no job yet the no-j
   assert.deepEqual(saved('zn-6').notes, ['Gate 1']); assert.deepEqual(saved('zn-7'), before); assert.equal(sms().length, smsBefore);
 });
 
-test('every saved:false add_customer_email path gets its note: no job yet the no-job note with no say line, any other the say line and, as its first failure in the call, the retry note', async t => {
+test('every saved:false add_customer_email path gets its say line and note: no job yet the no-job pair, any other, as its first failure in the call, the trouble line and the retry note', async t => {
   const { post, dir, saved, emails } = await fixture(t);
   const E = 'add_customer_email';
   const fresh = async id => { await post(toolCall(id, 'submit_service_request', intake, 'tc-submit')); return id; };
@@ -898,7 +899,7 @@ test('"No saved request yet" is never counted: three in a row all get the save-t
   for (const id of ['n1', 'n2', 'n3']) {
     const result = await post(note('zj-1', 'Gate 1', id));
     notSaved(result, N, NO_REQUEST, 'nojob');
-    assert.equal(result.say, undefined); assert.doesNotMatch(result.note, /when the team calls|Do not call it again|trouble saving/);
+    assert.doesNotMatch(result.say + result.note, /when the team calls|Do not call it again|trouble saving/);
   }
   for (const id of ['e1', 'e2', 'e3']) notSaved(await post(email('zj-1', 'a@example.org', id)), E, NO_REQUEST, 'nojob');
   const db = new DatabaseSync(join(dir, 'requests.sqlite'));
@@ -980,10 +981,122 @@ test('the not-saved note text: retryable is never consulted; the count picks ret
   assert.equal(notSavedNote('add_customer_email', { saved: false, retryable: false, error: UNCONFIRMED }, 5), confirmNote);
   for (const name of ['add_request_note', 'add_customer_email'])
     for (const failures of [1, 2, Infinity]) assert.equal(notSavedNote(name, { saved: false, retryable: false, error: NO_REQUEST }, failures), nojobNote(name));
-  assert.doesNotMatch(nojobNote('x'), /when the team calls|so they have it|Do not call it again/);
+  assert.doesNotMatch(nojobNote('x'), /when the team calls|so they have it|Do not call it again|that they will have it/);
   // It points to the prompt's rules for when to save and never restates them (main and emma-social-1017 differ: the
   // social fallback for a number that can't be confirmed, the address read-back), and never says to save right away.
   assert.match(nojobNote('x'), /save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP say to\./);
   assert.doesNotMatch(nojobNote('x'), /read-back|read back|save the job first|right away|callback number/i);
   assert.doesNotMatch(retryNote('x'), /what error says/);
+});
+
+// note-say-dedupe: gpt-4.1 broke free-text notes in real runs (Oct 17), so every failure type carries one exact line.
+test('each not-saved failure type speaks its one exact line, and every note says to speak only it and claims nothing for the team', () => {
+  assert.equal(NO_REQUEST_SAY, "Okay, let's get the rest of your details first.");
+  assert.equal(UNCONFIRMED_SAY, 'Let me spell that back to make sure I have it.');
+  assert.equal(TROUBLE_SAY, "I'm having trouble saving that, one moment.");
+  assert.equal(NOT_SAVED_SAY, 'Mention that when the team calls you, so they have it.');
+  for (const name of ['add_request_note', 'add_customer_email']) {
+    for (const failures of [1, 2, Infinity]) assert.equal(notSavedSay({ error: NO_REQUEST }, failures), NO_REQUEST_SAY);
+    assert.equal(notSavedSay({ error: UNCONFIRMED }, 3), UNCONFIRMED_SAY);
+    assert.equal(notSavedSay({ error: 'Invalid email' }, 1), TROUBLE_SAY);
+    assert.equal(notSavedSay({ error: 'Invalid email' }, 2), NOT_SAVED_SAY);
+    assert.equal(notSavedSay({ error: 'Invalid email' }, Infinity), NOT_SAVED_SAY);
+    for (const [error, failures] of [[NO_REQUEST, 1], [UNCONFIRMED, 1], ['x', 1], ['x', 2], ['x', Infinity]]) {
+      const text = notSavedNote(name, { error }, failures);
+      assert.ok(text.startsWith(`${SAY_ONLY} NOT saved`), text); assert.ok(text.endsWith(NEVER), text);
+    }
+  }
+  // The no-job note never contradicts its line: no team call, no "they will have it", no not-saved line.
+  assert.doesNotMatch(nojobNote('x'), /team calls you|so they have it|that they will have it/);
+  // Only a counted failure after the first, and no call id, say "do not call it again"; the retry note never does.
+  assert.doesNotMatch(retryNote('x'), /Do not call/); assert.match(stopNote, /Do not call it again/); assert.match(noIdNote, /Do not call it again/);
+});
+
+test('live: the say line per failure type, and a duplicate note neither clears nor bumps the failure count', async t => {
+  const { post } = await fixture(t);
+  const N = 'add_request_note', E = 'add_customer_email';
+  assert.equal((await post(note('zy-1', 'Gate 1', 'n0'))).say, NO_REQUEST_SAY);
+  await post(toolCall('zy-1', 'submit_service_request', intake, 'tc-submit'));
+  assert.equal((await post(toolCall('zy-1', E, { email: 'a@example.org' }, 'e0'))).say, UNCONFIRMED_SAY);
+  assert.equal((await post(note('zy-1', 'Gate 1', 'n1'))).note_added, true);
+  const first = await post(note('zy-1', '', 'n2'));
+  assert.equal(first.say, TROUBLE_SAY); notSaved(first, N, 'Missing or invalid note', 'first');
+  // The model re-sends the saved note on a new id: a duplicate, which leaves the run alone, so the next failure is "again".
+  assert.equal((await post(note('zy-1', 'Gate 1', 'n3'))).duplicate, true);
+  const again = await post(note('zy-1', '', 'n4'));
+  assert.equal(again.say, NOT_SAVED_SAY); notSaved(again, N, 'Missing or invalid note', 'again');
+});
+
+const toolRows = (dir, callId, name) => { const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+  try { return { tools: db.prepare('SELECT COUNT(*) AS n FROM tool_calls WHERE call_id = ? AND name = ?').get(callId, name).n,
+    outbox: db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE call_id = ? AND kind = ?').get(callId, name).n }; } finally { db.close(); } };
+const noteAlerts = emails => emails().filter(e => /-alert-note-/.test(e.key));
+
+test('a note that repeats the last saved note on a new toolCall id (case and spacing ignored) is a duplicate: one note, one alert, no new row', async t => {
+  const { post, dir, saved, sms, emails } = await fixture(t);
+  await post(toolCall('zz-1', 'submit_service_request', intake, 'tc-submit'));
+  const smsBefore = sms().length;
+  const first = await post(note('zz-1', 'Gate code 4471', 'n1'));
+  assert.equal(first.note_added, true); assert.equal(first.office_alert, 'sent'); assert.equal(first.duplicate, undefined);
+  const smsAfter = sms().length;
+  for (const [text, id] of [['Gate code 4471', 'n2'], ['  gate   CODE 4471 ', 'n3'], ['Gate code\n4471', 'n4']])
+    assert.deepEqual(await post(note('zz-1', text, id)), { ...first, duplicate: true });
+  assert.deepEqual(saved('zz-1').notes, ['Gate code 4471']);
+  assert.equal(noteAlerts(emails).length, 1); assert.equal(sms().length, smsAfter); assert.ok(smsAfter > smsBefore);
+  assert.deepEqual(toolRows(dir, 'zz-1', 'add_request_note'), { tools: 1, outbox: 0 });
+  // A different text is a new note.
+  assert.equal((await post(note('zz-1', 'Gate code 4472', 'n5'))).note_added, true);
+  assert.equal(noteAlerts(emails).length, 2);
+});
+
+test('A, then B, then A again is three notes and three alerts (only the LAST saved note is deduped)', async t => {
+  const { post, saved, emails } = await fixture(t);
+  await post(toolCall('zz-2', 'submit_service_request', intake, 'tc-submit'));
+  for (const [text, id] of [['Gate code 4471', 'n1'], ['Dog in the yard', 'n2'], ['Gate code 4471', 'n3']]) {
+    const result = await post(note('zz-2', text, id));
+    assert.equal(result.note_added, true); assert.equal(result.duplicate, undefined);
+  }
+  assert.deepEqual(saved('zz-2').notes, ['Gate code 4471', 'Dog in the yard', 'Gate code 4471']);
+  assert.equal(noteAlerts(emails).length, 3);
+  // And now A again is a repeat of the last one.
+  assert.equal((await post(note('zz-2', 'gate code 4471', 'n4'))).duplicate, true);
+  assert.equal(noteAlerts(emails).length, 3);
+});
+
+test('the last-note dedupe reads the database, so it holds after a restart', async t => {
+  const dir = tempDir(t);
+  const first = await fixture(t, { dir });
+  await first.post(toolCall('zz-3', 'submit_service_request', intake, 'tc-submit'));
+  const added = await first.post(note('zz-3', 'Back door code 9', 'n1'));
+  assert.equal(added.note_added, true);
+  await first.stop();
+  const second = await fixture(t, { dir });
+  assert.deepEqual(await second.post(note('zz-3', 'back door code 9', 'n2')), { ...added, duplicate: true });
+  assert.equal(noteAlerts(second.emails).length, 0); assert.equal(second.sms().length, 0);
+  assert.deepEqual(second.saved('zz-3').notes, ['Back door code 9']);
+  assert.deepEqual(toolRows(dir, 'zz-3', 'add_request_note'), { tools: 1, outbox: 0 });
+});
+
+test('a note the request does not end with (e.g. written by a rolled-back build, no tool_calls row) is never deduped against an older row', async t => {
+  const { post, dir, saved, emails } = await fixture(t);
+  await post(toolCall('zz-4', 'submit_service_request', intake, 'tc-submit'));
+  assert.equal((await post(note('zz-4', 'Gate 1', 'n1'))).note_added, true);
+  const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+  try { db.prepare("UPDATE requests SET details = json_set(details, '$.notes', json('[\"Gate 1\",\"Dog\"]')) WHERE call_id = 'zz-4'").run(); } finally { db.close(); }
+  assert.equal((await post(note('zz-4', 'Gate 1', 'n2'))).note_added, true);
+  assert.deepEqual(saved('zz-4').notes, ['Gate 1', 'Dog', 'Gate 1']);
+  assert.equal(noteAlerts(emails).length, 2);
+});
+
+test('the same email as the last one add_customer_email saved (any case) is a duplicate: no second confirmation or row; a new address is not', async t => {
+  const { post, dir, saved, emails } = await fixture(t);
+  await post(toolCall('zz-5', 'submit_service_request', intake, 'tc-submit'));
+  const mail = await post(email('zz-5', 'linda@example.org', 'e1'));
+  assert.equal(mail.caller_email, 'accepted');
+  const count = emails().length;
+  assert.deepEqual(await post(email('zz-5', ' Linda@Example.org ', 'e2')), { ...mail, duplicate: true });
+  assert.equal(emails().length, count); assert.equal(saved('zz-5').email, 'linda@example.org');
+  assert.deepEqual(toolRows(dir, 'zz-5', 'add_customer_email'), { tools: 1, outbox: 0 });
+  assert.equal((await post(email('zz-5', 'other@example.org', 'e3'))).email_added, true);
+  assert.equal(saved('zz-5').email, 'other@example.org');
 });
