@@ -148,6 +148,12 @@ test('read-back parsing: spoken and written numbers, confirmations, excerpt leng
   for (const reply of ['Yes, but it ends in 43.', 'Yeah no, that is my old number.', 'Yes... wait.', 'Yes?', 'Right, but the last digit is 3.',
     "Correct me if I'm wrong but I said 0143."]) assert.equal(confirmedCallback(msg([ask, ['user', reply]])), '', reply);
   assert.equal(confirmedCallback(msg([ask, ['user', 'Mhm.']])), N);
+  for (const reply of ['Yes, oh one four three.', 'Yeah, ending in four three.', "Yeah, last digit's three."])
+    assert.equal(confirmedCallback(msg([ask, ['user', reply]])), '', reply);
+  for (const later of ['That phone number is wrong, it should be oh one four three.', 'The last four are oh one four three.', "No, that's not it, it's oh one four three."])
+    assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'Thanks. Anything else?'], ['user', later]])), '', later);
+  assert.equal(confirmedCallback(msg([ask, ['user', 'Yes.'], ['bot', 'Sorry, so 615 555 0143, and what is the address?'], ['user', 'Yes, 12 Elm.']])), '');
+  for (const reply of ["Yes ma'am.", "Yeah that's correct, thank you.", 'Oh yes.']) assert.equal(confirmedCallback(msg([ask, ['user', reply]])), N, reply);
   assert.equal(confirmedCallback(msg([['bot', 'Okay, 615 555 0142. Is that right?'], ['user', "Yep, that's it."]])), N);
   assert.equal(confirmedCallback(msg([['bot', 'I have 615 555 0142. Is this urgent?'], ['user', 'Yeah, water everywhere']])), '');
   assert.equal(confirmedCallback(msg([['bot', 'Got it, 615 555 0142.'], ['bot', 'Is this an emergency?'], ['user', 'Yes!']])), '');

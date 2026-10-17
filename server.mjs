@@ -54,18 +54,21 @@ export function formatPhone(value) {
 // ("six one five, five five five, oh one four two"). A run of digits ends at any other word or at ? or !; a run that is
 // not exactly one number (an address glued to it, a missing digit) yields nothing rather than a guess.
 const DIGIT_WORDS = { zero: '0', oh: '0', o: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
-export function phoneNumbersIn(text) {
-  const found = [];
+// Runs of digits in one turn of speech, numerals or digit words, each as a digit string ("oh one four three" -> "0143").
+export function digitRuns(text) {
+  const runs = [];
   let run = '';
-  const flush = () => { const d = run.replace(/^0+/, '').replace(/^1(?=\d{10}$)/, ''); if (/^[2-9]\d{9}$/.test(d)) found.push(d); run = ''; };
   for (const token of String(text || '').toLowerCase().split(/([?!\n])|[\s,.;:()+\-\u2013\u2014]+/)) {
     if (!token) continue;
     if (/^\d+$/.test(token)) run += token;
     else if (Object.hasOwn(DIGIT_WORDS, token)) run += DIGIT_WORDS[token];
-    else flush();
+    else { if (run) runs.push(run); run = ''; }
   }
-  flush();
-  return found;
+  if (run) runs.push(run);
+  return runs;
+}
+export function phoneNumbersIn(text) {
+  return digitRuns(text).map(run => run.replace(/^0+/, '').replace(/^1(?=\d{10}$)/, '')).filter(d => /^[2-9]\d{9}$/.test(d));
 }
 // The spoken turns of a call from Vapi's end-of-call report: artifact.messages (role bot/user, text in message; or
 // OpenAI-style assistant/user with content), else the artifact.transcript lines ("AI: ..." / "User: ...").
@@ -83,12 +86,14 @@ export function callTurns(message) {
 }
 // The callback number to trust from a call that ended before a save, as 10 digits; '' when there is no clean confirmation.
 // A number counts only when Emma ASKED it back (the number is in her question, or her question right after it is just
-// "is that right?") and the caller's very next turn is a plain yes ("yes", "yeah", "that's right", "mhm") with no "no",
-// "but", "wait", "?" or digits in it. A later read-back that is not confirmed, or a caller who later gives a different
-// number or says it "ends in" something else, clears it: a wrong number marked confirmed is worse than none.
+// "is that right?") and the caller's very next turn is a plain yes ("yes", "yeah", "that's right", "mhm") with nothing
+// after it that could be a correction: no digits (numerals or words), no "no", "but", "wait", "ending", "last" or "?".
+// Anything later that could change it clears it: another number Emma says, a caller turn with three or more digits that
+// are not part of the number, or words like "wrong", "should be", "ends in". A wrong number marked confirmed is worse
+// than none: with none, the office calls the caller ID.
 const CONFIRMED = /^\W*(?:(?:uh|um|mm|oh|okay|ok)\W+)?(?:yes|yeah|yep|yup|ya|correct|that'?s (?:right|correct|it)|that is (?:right|correct)|right|exactly|you got it|uh[- ]?huh|mhm+|mm[- ]?hmm)\b/i;
-const DOUBT = /\?|\d|\b(?:no|nope|nah|not|but|actually|wait|hold on|except|wrong|old|ends?|change|different|sorry)\b/i;
-const CORRECTION = /\b(?:ends? (?:in|with)|wrong number|not (?:my|the right) (?:number|cell|phone)|old number|different number)\b/i;
+const DOUBT = /\?|\d|\b(?:no|nope|nah|not|but|actually|wait|hold on|except|wrong|old|ends?|ending|last|digits?|should|instead|meant|change|different|sorry|zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/i;
+const CORRECTION = /\b(?:ends? (?:in|with)|ending (?:in|with)|wrong|should be|last (?:four|three|two|digits?|number)|not (?:my|the right|it|right)|old number|different number|meant)\b/i;
 const CHECK_QUESTION = /^\W*(?:(?:is|was|did i get|have i got)\s+)?(?:that|it|this|those|i)?\s*(?:right|correct|all right)?\W*(?:right|correct)?\?\s*$/i;
 function readBackIn(text) {
   const number = phoneNumbersIn(text).at(-1);
@@ -99,9 +104,13 @@ function readBackIn(text) {
   if (k < 0) return '';
   const after = sentences.slice(k + 1).join(' ').trim();
   if (!after) return /\?\s*$/.test(sentences[k]) ? number : '';
-  return /\?/.test(after) && CHECK_QUESTION.test(after) && !/[a-z]{3,}.*\?.*[a-z]{3,}.*\?/i.test(after) ? number : '';
+  return CHECK_QUESTION.test(after) ? number : '';
 }
-const plainYes = text => { const t = String(text).replace(/\u2019/g, "'").trim(); return CONFIRMED.test(t) && !DOUBT.test(t) && t.split(/\s+/).length <= 8; };
+const plainYes = text => {
+  const t = String(text).replace(/\u2019/g, "'").trim();
+  const yes = t.match(CONFIRMED);
+  return !!yes && !DOUBT.test(t.slice(yes[0].length)) && !/\?|\d/.test(t) && t.split(/\s+/).length <= 8;
+};
 export function confirmedCallback(message) {
   const turns = [];
   for (const turn of callTurns(message)) {
@@ -111,11 +120,11 @@ export function confirmedCallback(message) {
   let number = '';
   turns.forEach((turn, i) => {
     if (turn.role === 'user') {
-      if (CORRECTION.test(turn.text) || phoneNumbersIn(turn.text).some(n => n !== number)) number = '';
+      if (CORRECTION.test(turn.text) || digitRuns(turn.text).some(run => run.length >= 3 && !number.includes(run.replace(/^1(?=\d{10}$)/, '')))) number = '';
       return;
     }
     const read = readBackIn(turn.text);
-    if (!read) return;
+    if (!read) { if (phoneNumbersIn(turn.text).some(n => n !== number)) number = ''; return; }
     const reply = turns[i + 1];
     number = reply?.role === 'user' && plainYes(reply.text) ? read : '';
   });
