@@ -1,15 +1,32 @@
 {
   "name": "{{BUSINESS}} - Emma (trial)",
   "voice": {
-    "model": "eleven_turbo_v2_5",
-    "speed": 0.95,
-    "style": 0,
-    "voiceId": "EXAVITQu4vr4xnSDxMaL",
     "provider": "11labs",
-    "stability": 0.55,
-    "similarityBoost": 0.8,
+    "voiceId": "EXAVITQu4vr4xnSDxMaL",
+    "model": "eleven_v4_turbo",
+    "stability": 0.4,
+    "similarityBoost": 0.75,
     "useSpeakerBoost": true,
-    "optimizeStreamingLatency": 2
+    "optimizeStreamingLatency": 3,
+    "chunkPlan": {
+      "enabled": true,
+      "minCharacters": 30,
+      "formatPlan": {
+        "enabled": true,
+        "replacements": [
+          {
+            "type": "exact",
+            "key": "—",
+            "value": ", "
+          },
+          {
+            "type": "exact",
+            "key": "–",
+            "value": ", "
+          }
+        ]
+      }
+    }
   },
   "model": {
     "model": "gpt-4.1",
@@ -41,7 +58,7 @@
     "end-of-call-report"
   ],
   "maxDurationSeconds": 600,
-  "backgroundSound": "office",
+  "backgroundSound": "off",
   "firstMessageMode": "assistant-speaks-first",
   "analysisPlan": {
     "summaryPlan": {
@@ -53,17 +70,37 @@
   },
   "backgroundDenoisingEnabled": true,
   "startSpeakingPlan": {
-    "waitSeconds": 0.2,
+    "waitSeconds": 0.3,
+    "smartEndpointingPlan": {
+      "provider": "livekit"
+    },
     "transcriptionEndpointingPlan": {
-      "onPunctuationSeconds": 0.4,
+      "onPunctuationSeconds": 0.1,
       "onNoPunctuationSeconds": 1.5,
       "onNumberSeconds": 1
-    }
+    },
+    "customEndpointingRules": [
+      {
+        "type": "assistant",
+        "regex": "(number to reach|phone number|callback number|best number|good number)",
+        "timeoutSeconds": 1.5
+      }
+    ]
   },
   "stopSpeakingPlan": {
-    "numWords": 1,
-    "voiceSeconds": 0.2,
-    "backoffSeconds": 1
+    "numWords": 2,
+    "voiceSeconds": 0.3,
+    "backoffSeconds": 0.7,
+    "acknowledgementPhrases": [
+      "okay",
+      "yeah",
+      "uh-huh",
+      "mm-hmm",
+      "right",
+      "got it",
+      "sure",
+      "yep"
+    ]
   },
   "server": {
     "url": "{{SERVER_URL}}",
