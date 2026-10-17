@@ -739,12 +739,9 @@ const nojobNote = name => `${SAY_ONLY} ${REPLACES} NOT saved: nothing was noted,
   `never say the team will call or call back about this. Do not call ${name} again before the job is saved. ` +
   'Carry on with the call and save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP ' +
   `say to. Only after that returns saved true, call ${name} again with the same detail, unless it is already in what you ` +
-  `saved. ${NEVER}`;
+  'saved. If earlier in this call you already told the caller "I\'m sorry, I couldn\'t save that", do not say the say line and do ' +
+  `not call submit_service_request again; say only "Mention that when the team calls you, so they have it." ${NEVER}`;
 const stopNote = `${SAY_ONLY} NOT saved again. Do not call it again. ${NEVER}`;
-// No saved request yet after submit_service_request failed twice: the callback line was said, so no save tool again.
-const gaveUpNote = `${SAY_ONLY} ${REPLACES} NOT saved: nothing was noted, added or passed on. submit_service_request already failed twice in ` +
-  'this call and you have told the caller the team will call them back, so do not call submit_service_request, add_request_note or ' +
-  `add_customer_email again. ${NEVER}`;
 const noIdNote = `${SAY_ONLY} NOT saved. Do not call it again. ${NEVER}`;
 const confirmNote = `${SAY_ONLY} ${REPLACES} NOT saved: the email is not confirmed yet. Then spell the email back letter by letter, and stop and wait for the caller's clear yes. ` +
   'Only after they say yes, call add_customer_email again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ' +
@@ -905,7 +902,8 @@ test('"No saved request yet" is never counted: three in a row all get the save-t
   for (const id of ['n1', 'n2', 'n3']) {
     const result = await post(note('zj-1', 'Gate 1', id));
     notSaved(result, N, NO_REQUEST, 'nojob');
-    assert.doesNotMatch(result.say + result.note, /when the team calls|Do not call it again|trouble saving/);
+    // Only the exception (she already said the submit could not be saved) names the not-saved line.
+    assert.doesNotMatch(result.say + result.note.split('If earlier in this call')[0], /when the team calls|Do not call it again|trouble saving/);
   }
   for (const id of ['e1', 'e2', 'e3']) notSaved(await post(email('zj-1', 'a@example.org', id)), E, NO_REQUEST, 'nojob');
   const db = new DatabaseSync(join(dir, 'requests.sqlite'));
@@ -987,7 +985,7 @@ test('the not-saved note text: retryable is never consulted; the count picks ret
   assert.equal(notSavedNote('add_customer_email', { saved: false, retryable: false, error: UNCONFIRMED }, 5), confirmNote);
   for (const name of ['add_request_note', 'add_customer_email'])
     for (const failures of [1, 2, Infinity]) assert.equal(notSavedNote(name, { saved: false, retryable: false, error: NO_REQUEST }, failures), nojobNote(name));
-  assert.doesNotMatch(nojobNote('x'), /when the team calls|so they have it|Do not call it again|that they will have it/);
+  assert.doesNotMatch(nojobNote('x').split('If earlier in this call')[0], /when the team calls|so they have it|Do not call it again|that they will have it/);
   // It points to the prompt's rules for when to save and never restates them (main and emma-social-1017 differ: the
   // social fallback for a number that can't be confirmed, the address read-back), and never says to save right away.
   assert.match(nojobNote('x'), /save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP say to\./);
@@ -1011,13 +1009,13 @@ test('each not-saved failure type speaks its one exact line, and every note says
       const text = notSavedNote(name, { error }, failures), uncounted = error !== 'x';
       assert.ok(text.startsWith(uncounted ? `${SAY_ONLY} ${REPLACES} NOT saved` : `${SAY_ONLY} NOT saved`), text); assert.ok(text.endsWith(NEVER), text);
     }
-    assert.equal(notSavedSay({ error: NO_REQUEST }, 1, true), NOT_SAVED_SAY);
-    assert.equal(notSavedNote(name, { error: NO_REQUEST }, 1, true), gaveUpNote);
-    // submitFailed is only read for "No saved request yet".
-    assert.equal(notSavedSay({ error: 'x' }, 1, true), TROUBLE_SAY); assert.equal(notSavedSay({ error: UNCONFIRMED }, 1, true), UNCONFIRMED_SAY);
+
   }
-  // The no-job note never contradicts its line: no team call, no "they will have it", no not-saved line.
-  assert.doesNotMatch(nojobNote('x'), /team calls you|so they have it|that they will have it/);
+  // The no-job note never contradicts its line: no team call and no "they will have it". The not-saved line appears only
+  // in the one exception, once she has already said the submit could not be saved (the team is calling back then).
+  const [normal, exception] = nojobNote('x').split('If earlier in this call you already told the caller');
+  assert.doesNotMatch(normal, /team calls you|so they have it|that they will have it/);
+  assert.match(exception, /^ "I'm sorry, I couldn't save that", do not say the say line and do not call submit_service_request again; say only "Mention that when the team calls you, so they have it\." /);
   // Only a counted failure after the first, and no call id, say "do not call it again"; the retry note never does.
   assert.doesNotMatch(retryNote('x'), /Do not call/); assert.match(stopNote, /Do not call it again/); assert.match(noIdNote, /Do not call it again/);
 });
@@ -1163,26 +1161,18 @@ test('emails A, B, A are three saves; only a repeat of the last one (any case) i
   assert.equal(saved('zz-9').email, 'a@example.org');
 });
 
-test('after submit_service_request failed twice (callback line said), "No saved request yet" gets the not-saved line and no save tool again, even after a restart', async t => {
-  const dir = tempDir(t);
-  const N = 'add_request_note', E = 'add_customer_email';
-  const bad = { ...intake, email_confirmed: true, email: 'bad', email_status: 'confirmed' };
-  const first = await fixture(t, { dir });
-  assert.equal((await first.post(toolCall('zg-1', 'submit_service_request', bad, 's1'))).saved, false);
-  // One failed submit: the retry is still to come, so the save-the-job-first pair stands.
-  notSaved(await first.post(note('zg-1', 'Gate 1', 'n1')), N, NO_REQUEST, 'nojob');
-  // The same toolCall id re-sent is not a second failure.
-  assert.equal((await first.post(toolCall('zg-1', 'submit_service_request', bad, 's1'))).saved, false);
-  notSaved(await first.post(note('zg-1', 'Gate 1', 'n2')), N, NO_REQUEST, 'nojob');
-  assert.equal((await first.post(toolCall('zg-1', 'submit_service_request', bad, 's2'))).saved, false);
-  for (const [result, name] of [[await first.post(note('zg-1', 'Gate 1', 'n3')), N], [await first.post(email('zg-1', 'a@example.org', 'e1')), E]]) {
-    assert.equal(result.error, NO_REQUEST); assert.equal(result.say, NOT_SAVED_SAY); assert.equal(result.note, gaveUpNote);
-    assert.deepEqual(Object.keys(result), ['saved', 'retryable', 'error', 'say', 'note']);
+test('the server keeps no failed-submit count: two "email first" refusals, then a note, give the normal no-job result, and a valid submit still saves', async t => {
+  const { post, dir } = await fixture(t);
+  const N = 'add_request_note';
+  // A refusal the model fixes by asking the caller (not THE ONE RULE's give-up), twice in a row.
+  const skipped = { ...intake, email_status: 'skipped_emergency' };
+  for (const id of ['s1', 's2']) {
+    const refused = await post(toolCall('zg-1', 'submit_service_request', skipped, id));
+    assert.equal(refused.saved, false); assert.match(refused.error, /ask the caller for their email first/);
   }
-  await first.stop();
-  const second = await fixture(t, { dir });
-  const later = await second.post(note('zg-1', 'Gate 1', 'n4'));
-  assert.equal(later.say, NOT_SAVED_SAY); assert.equal(later.note, gaveUpNote);
-  // A different call is not affected.
-  notSaved(await second.post(note('zg-2', 'Gate 1', 'n1')), N, NO_REQUEST, 'nojob');
+  notSaved(await post(note('zg-1', 'Gate 1', 'n1')), N, NO_REQUEST, 'nojob');
+  const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+  try { assert.equal(db.prepare("SELECT COUNT(*) AS n FROM tool_failures WHERE call_id = 'zg-1'").get().n, 0); } finally { db.close(); }
+  assert.equal((await post(toolCall('zg-1', 'submit_service_request', intake, 's3'))).saved, true);
+  assert.equal((await post(note('zg-1', 'Gate 1', 'n2'))).note_added, true);
 });
