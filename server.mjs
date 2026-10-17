@@ -963,7 +963,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     // From the report itself (no extra Vapi call): the end of the transcript, and the callback number from Emma's own
     // submit_service_request call with callback_read_back true, e.g. a save that failed or a call that dropped mid-save
     // (confirmedCallback; callback_source 'tool'). Without one, callback_phone and callback_source stay '' and the office
-    // uses the caller ID; any number said on the call is only in the transcript excerpt.
+    // uses the caller ID. Any other number said on the call can appear, never labelled confirmed, in the transcript excerpt
+    // and in Vapi's own call summary, both of which go into the issue text below.
     const excerpt = greeting ? '' : transcriptExcerpt(message);
     const callback = greeting ? '' : confirmedCallback(message);
     const issue = greeting ? 'Hung up during the greeting, before giving any details' :
