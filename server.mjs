@@ -1459,17 +1459,25 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   });
   server.requestTimeout = 30000;
   server.headersTimeout = 15000;
-  // Held urgent alerts, urgent escalations and the 7am digest are checked every few seconds, and again after a restart
-  // (all state lives in SQLite). One pass at a time, so a slow Vapi or Resend never stacks passes.
+  // Held urgent alerts and urgent escalations are checked every few seconds, and again after a restart (all state lives
+  // in SQLite). One pass at a time, so a slow Vapi never stacks passes.
   let sweeping = false;
   const sweepAll = async () => {
     if (sweeping) return;
     sweeping = true;
-    try { await sweepTransfers().catch(() => {}); await sweepEscalations().catch(() => {}); await sendDigests().catch(() => console.warn('digest failed')); }
+    try { await sweepTransfers().catch(() => {}); await sweepEscalations().catch(() => {}); }
     finally { sweeping = false; }
   };
   const sweeper = db ? setInterval(sweepAll, 5000) : null;
   sweeper?.unref();
+  // The 7am digest has its own timer: a hanging Resend send never holds up the urgent rings above.
+  let digesting = false;
+  const digestSweeper = db ? setInterval(async () => {
+    if (digesting) return;
+    digesting = true;
+    try { await sendDigests().catch(() => console.warn('digest failed')); } finally { digesting = false; }
+  }, 5000) : null;
+  digestSweeper?.unref();
   let retrying = false;
   const officeSweeper = db ? setInterval(async () => {
     if (retrying) return;
@@ -1497,7 +1505,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   server.sweepOfficeRetries = sweepOfficeRetries;
   server.sendDigests = sendDigests;
   server.trials = trials;
-  server.on('close', () => { clearInterval(sweeper); clearInterval(officeSweeper); clearInterval(outboxSweeper); clearInterval(trialSweeper); clearTimeout(trialStart); db?.close(); });
+  server.on('close', () => { clearInterval(sweeper); clearInterval(digestSweeper); clearInterval(officeSweeper); clearInterval(outboxSweeper); clearInterval(trialSweeper); clearTimeout(trialStart); db?.close(); });
   return server;
 }
 

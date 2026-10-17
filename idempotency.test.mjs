@@ -677,3 +677,44 @@ test('outbox rows retrying while Telnyx and Resend hang never delay a held urgen
   assert.equal(control, 10000, 'with no hang the ring goes on the first 5 s tick after it is due');
   assert.equal(hung, control, `with providers hanging the ring went at ${hung} ms instead of ${control} ms`);
 });
+
+test('a 7am digest send that hangs never delays a held urgent ring: it goes on the same sweep tick as with no hang', async t => {
+  t.mock.method(console, 'warn', () => {}); t.mock.method(console, 'log', () => {}); t.mock.method(console, 'error', () => {});
+  const env = { ALERT_ROUTES: JSON.stringify({ 'client-a': { business: 'Gold Star Plumbing', sms: ['+15550000001'], email: ['office@example.com'], call: ['+15550000009'] } }),
+    VAPI_API_KEY: 'fixture-only', ALERT_CALL_FROM_ID: 'from-line' };
+  const base = Date.parse('2026-10-16T12:05:00Z'); // 7:05am in Chicago: the digest is due
+  // Returns when (ms after the restart, on the mocked clock) the held ring was placed, or null if not within 40 s.
+  async function ringTime(hang) {
+    const dir = tempDir(t);
+    const first = await fixture(t, { dir, extra: env });
+    await first.post(toolCall('d-1', 'submit_service_request', intake, 'tc-s'));
+    await first.stop();
+    const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+    try { db.prepare("INSERT INTO transfers VALUES ('d-1', 'client-a', 'pending', ?, ?)").run(base + 7000, new Date(base).toISOString()); }
+    finally { db.close(); }
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: base });
+    try {
+      const rings = [];
+      const digests = [];
+      const send = (url, init) => {
+        if (url === 'https://api.vapi.ai/call') { rings.push(Date.now() - base); return Promise.resolve(Response.json({ id: 'v1' })); }
+        if (url.startsWith('https://api.vapi.ai/')) return Promise.resolve(new Response('{}', { status: 404 }));
+        const digest = String(init.headers?.['Idempotency-Key'] || '').startsWith('digest-');
+        if (digest) digests.push(url);
+        if (!hang || !digest) return Promise.resolve(new Response('{}', { status: 200 }));
+        // The digest send hangs (until its abort, which never comes on this clock)
+        return new Promise((_, reject) => init.signal?.addEventListener('abort', () => reject(new Error('timeout'))));
+      };
+      const app = createApp({ DATA_DIR: dir, VAPI_WEBHOOK_SECRET: key, ...alertEnv, ...env }, send);
+      try {
+        for (let tick = 1; tick <= 8 && !rings.length; tick++) { t.mock.timers.tick(5000); await settleLater(60); }
+        assert.ok(digests.length > 0, 'the 7am digest went out during the test');
+        return rings[0] ?? null;
+      } finally { app.close(); }
+    } finally { t.mock.timers.reset(); }
+  }
+  const control = await ringTime(false);
+  const hung = await ringTime(true);
+  assert.equal(control, 10000, 'with no hang the ring goes on the first 5 s tick after it is due');
+  assert.equal(hung, control, `with the digest send hanging the ring went at ${hung} ms instead of ${control} ms`);
+});
