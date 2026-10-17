@@ -74,14 +74,18 @@ const spoken = s => s.url === 'https://api.vapi.ai/call' ? JSON.parse(JSON.strin
 // v1.8.1 keys a note alert's email by its tool call (<id>-alert-note-<hash>) instead of the note count, so a Vapi retry is one email.
 const noteKey = headers => headers?.['Idempotency-Key']?.includes('-alert-note-')
   ? { ...headers, 'Idempotency-Key': headers['Idempotency-Key'].replace(/-alert-note-(\d+|[0-9a-f]{32})$/, '-alert-note-<key>') } : headers;
-// The note-fail-line change adds say and note to every saved:false add_request_note / add_customer_email result (every other field unchanged).
+// The note-fail-line change adds a note to every saved:false add_request_note / add_customer_email result, and a say line to
+// all but "No saved request yet" (every other field unchanged).
 const NOTE_TOOLS = new Set(['add_request_note', 'add_customer_email']);
 const withoutSayLine = (steps, replies) => replies.map((reply, i) => {
   const name = steps[i].message?.toolCallList?.[0]?.function?.name;
   if (!NOTE_TOOLS.has(name) || !reply.json.map) return reply;
   return { ...reply, json: reply.json.map(r => {
     if (r.saved !== false) return r;
-    assert.equal(r.say, 'Mention that when the team calls you, so they have it.'); assert.match(r.note, /^NOT saved/);
+    // "No saved request yet" has no say line (no job is saved, so no team call is set up); every other failure has it.
+    if (r.error === 'No saved request yet; save the request first') assert.equal('say' in r, false);
+    else assert.equal(r.say, 'Mention that when the team calls you, so they have it.');
+    assert.match(r.note, /^NOT saved/);
     const { say, note, ...rest } = r; return rest;
   }) };
 });
