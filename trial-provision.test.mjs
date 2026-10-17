@@ -867,7 +867,7 @@ test('read-back fixes: phone then address read-back before any follow-up, only a
   // Edit 3: no "I'll let the team know" after a failed note or email; the failed-note line is used instead.
   const rule = section('THE ONE RULE YOU NEVER BREAK', 'WRAPPING UP');
   assert.match(rule, /If add_customer_email or add_request_note still isn't saved, say "Mention that when the team calls you, so they have it\."/);
-  once("nothing was saved, even if an earlier save worked: never say \"I'll let the team know\", never say it was sent or added");
+  once("nothing was saved, even after an earlier save: no \"I'll let the team know\" or similar, never say it was sent or added");
   assert.doesNotMatch(rule, /"I'll pass that on" or anything similar unless/);
   // Still consistent: item 3 keeps C5 (save first for item 6 callers) and the phone rule stays last.
   assert.match(prompt, /unless item 6 says to save right away; then save first, read the address back after, and add any correction with add_request_note\./);
