@@ -130,52 +130,60 @@ test('rolling back to v1.5.0 after v1.6 ran still saves requests and hang-ups', 
   assert.deepEqual(rows(dir).filter(r => r[0].startsWith('after')), [['after-rollback', null, 0], ['after-rollback-hangup', null, 0]]);
 });
 
-// note-fail-line: tool_failures (the loop guard for failed add_request_note / add_customer_email calls) is a new table only.
+// note-fail-line made tool_failures (a loop guard counting failed add_request_note / add_customer_email calls). The server
+// now retries those writes itself and every failure gets the same not-saved line, so the table is no longer made, read or
+// written. A table an earlier build made is left exactly as it was, so a rollback to that build finds it.
 const noteCall = (id, toolId, text) => ({ message: { type: 'tool-calls', call: { id, assistantId: emma },
   toolCallList: [{ id: toolId, function: { name: 'add_request_note', arguments: { note: text } } }] } });
-const failureColumns = dir => { const db = new DatabaseSync(join(dir, 'requests.sqlite'), { readOnly: true });
-  try { return db.prepare('PRAGMA table_info(tool_failures)').all().map(c => c.name); } finally { db.close(); } };
-const kindOf = r => !r.note ? `saved=${r.saved}` : r.note.includes('Do not call') ? 'STOP' : 'RETRY';
+const failureTable = dir => { const db = new DatabaseSync(join(dir, 'requests.sqlite'), { readOnly: true });
+  try { const columns = db.prepare('PRAGMA table_info(tool_failures)').all().map(c => c.name);
+    return { columns, rows: columns.length ? db.prepare('SELECT * FROM tool_failures').all().map(r => ({ ...r })) : [] }; } finally { db.close(); } };
+const kindOf = r => !r.note ? `saved=${r.saved}` : r.note.includes('Do not call it again') ? 'STOP' : r.note.includes('once more') ? 'RETRY' : 'OTHER';
 
-test('a v1.5.0 database without tool_failures gets the table, and rollback to v1.5.0 and forward again stay safe', async t => {
+test('a v1.5.0 database gets no tool_failures table, every failure is STOP, and rollback to v1.5.0 and forward again stay safe', async t => {
   const dir = await v150Database(t);
-  assert.deepEqual(failureColumns(dir), []);
   const app = await start(t, createApp, dir);
   assert.equal((await (await fetch(app.base + '/healthz')).json()).ready, true);
-  assert.deepEqual(failureColumns(dir), ['call_id', 'name', 'tool_call_id', 'failures', 'cleared', 'updated_at']);
-  // Old rows still work, and the guard counts on the upgraded file.
-  assert.equal(kindOf(await result(await app.post(noteCall('old-live', 'n1', '')))), 'RETRY');
+  assert.deepEqual(failureTable(dir), { columns: [], rows: [] });
+  // Old rows still work; the first failure and the next are both STOP.
+  assert.equal(kindOf(await result(await app.post(noteCall('old-live', 'n1', '')))), 'STOP');
   assert.equal(kindOf(await result(await app.post(noteCall('old-live', 'n2', '')))), 'STOP');
   await app.close();
-  // Rollback: v1.5.0 ignores the table, saves requests and notes, and returns its own saved:false results.
+  // Rollback: v1.5.0 saves requests and notes, and returns its own saved:false results.
   const old = await start(t, createV150, dir);
   assert.equal((await result(await old.post(toolCall('after-rollback', 'submit_service_request', intake)))).saved, true);
   assert.equal((await result(await old.post(noteCall('after-rollback', 'o1', 'Gate 5')))).saved, true);
   const oldFail = await result(await old.post(noteCall('after-rollback', 'o2', '')));
   assert.equal(oldFail.saved, false); assert.equal(oldFail.note, undefined);
   await old.close();
-  // Forward again: the table and its counts are as they were; rows v1.5.0 wrote are usable.
+  // Forward again: rows v1.5.0 wrote are usable.
   const again = await start(t, createApp, dir);
-  assert.deepEqual(failureColumns(dir), ['call_id', 'name', 'tool_call_id', 'failures', 'cleared', 'updated_at']);
-  assert.equal(kindOf(await result(await again.post(noteCall('old-live', 'n3', '')))), 'STOP');
-  assert.equal(kindOf(await result(await again.post(noteCall('old-live', 'n4', 'Gate 6')))), 'saved=true');
-  assert.equal(kindOf(await result(await again.post(noteCall('old-live', 'n5', '')))), 'RETRY');
-  assert.equal(kindOf(await result(await again.post(noteCall('after-rollback', 'n1', '')))), 'RETRY');
+  assert.equal(kindOf(await result(await again.post(noteCall('old-live', 'n3', 'Gate 6')))), 'saved=true');
+  assert.equal(kindOf(await result(await again.post(noteCall('after-rollback', 'n1', '')))), 'STOP');
+  assert.equal(kindOf(await result(await again.post(noteCall('after-rollback', 'n2', 'Gate 7')))), 'saved=true');
+  assert.deepEqual(failureTable(dir), { columns: [], rows: [] });
   assert.deepEqual(rows(dir).filter(r => r[0].startsWith('after')), [['after-rollback', null, 0]]);
 });
 
-test('the unreleased one-row-per-tool tool_failures (6d7a92b) is replaced on startup', async t => {
-  const dir = await v150Database(t);
-  const db = new DatabaseSync(join(dir, 'requests.sqlite'));
-  db.exec(`CREATE TABLE tool_failures (call_id TEXT NOT NULL, name TEXT NOT NULL, failures INTEGER NOT NULL, updated_at TEXT NOT NULL,
-    PRIMARY KEY (call_id, name)); INSERT INTO tool_failures VALUES ('old-live', 'add_request_note', 7, '2026-10-17T00:00:00Z');`);
-  db.close();
-  const app = await start(t, createApp, dir);
-  assert.equal((await (await fetch(app.base + '/healthz')).json()).ready, true);
-  assert.deepEqual(failureColumns(dir), ['call_id', 'name', 'tool_call_id', 'failures', 'cleared', 'updated_at']);
-  assert.equal(kindOf(await result(await app.post(noteCall('old-live', 'n1', '')))), 'RETRY');
-  await app.close();
-  // A second start on the new shape changes nothing.
-  const again = await start(t, createApp, dir);
-  assert.equal(kindOf(await result(await again.post(noteCall('old-live', 'n2', '')))), 'STOP');
-});
+for (const [label, shape, row] of [
+  ['the deployed note-fail-line shape (28c026a)', `CREATE TABLE tool_failures (call_id TEXT NOT NULL, name TEXT NOT NULL, tool_call_id TEXT NOT NULL, failures INTEGER NOT NULL,
+    cleared INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (call_id, name, tool_call_id))`,
+    "INSERT INTO tool_failures VALUES ('old-live', 'add_request_note', 'tc-0', 1, 0, '2026-10-17T00:00:00Z')"],
+  ['the unreleased one-row-per-tool shape (6d7a92b)', `CREATE TABLE tool_failures (call_id TEXT NOT NULL, name TEXT NOT NULL, failures INTEGER NOT NULL,
+    updated_at TEXT NOT NULL, PRIMARY KEY (call_id, name))`, "INSERT INTO tool_failures VALUES ('old-live', 'add_request_note', 7, '2026-10-17T00:00:00Z')"]]) {
+  test(`a tool_failures table in ${label} is left exactly as it was, and its counts change nothing`, async t => {
+    const dir = await v150Database(t);
+    const db = new DatabaseSync(join(dir, 'requests.sqlite'));
+    db.exec(`${shape}; ${row};`);
+    db.close();
+    const before = failureTable(dir);
+    for (let i = 0; i < 2; i++) {
+      const app = await start(t, createApp, dir);
+      assert.equal((await (await fetch(app.base + '/healthz')).json()).ready, true);
+      assert.equal(kindOf(await result(await app.post(noteCall('old-live', `n${i}`, '')))), 'STOP');
+      assert.equal(kindOf(await result(await app.post(noteCall('old-live', `g${i}`, `Gate ${i}`)))), 'saved=true');
+      await app.close();
+      assert.deepEqual(failureTable(dir), before);
+    }
+  });
+}

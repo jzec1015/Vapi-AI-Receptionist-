@@ -37,28 +37,29 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
 // runs (Oct 17) free text alone was not obeyed: after "No saved request yet" it claimed "The team will see you prefer...",
 // and it spoke the prompt's not-saved line where the note forbade it, so the server now picks the line for every failure.
 // Every existing field is kept, and every note forbids the false promise (NO_PROMISE) and any other claim that the team will
-// see, have, know or get the detail (NO_CLAIM). The line per failure:
+// see, have, know or get the detail (NO_CLAIM), and says to follow it instead of THE ONE RULE's failed-save steps
+// (REPLACES; she obeyed the prompt over the note on Oct 17). The line per failure:
 //   "No saved request yet" (NO_REQUEST)  NO_REQUEST_SAY. No job is saved, so no team call is set up (run 4); the note points
 //       to the prompt's own rules for when to save (THE PHONE NUMBER RULE, item 6, WRAPPING UP; it never restates them) and
-//       says to call the tool again only after the save, unless the detail went into the save. Never counted. The
-//       server cannot tell whether a submit already failed for good (a refusal such as "ask for the email first" is not
-//       one, and a Vapi timeout never reaches it), so the note leaves that to what she said: if she already told the caller
-//       "I'm sorry, I couldn't save that" (THE ONE RULE after a second failed submit), she skips the say line, never calls
+//       says to call the tool again only after the save, unless the detail went into the save. The server cannot tell
+//       whether a submit already failed for good (a refusal such as "ask for the email first" is not one, and a Vapi
+//       timeout never reaches it), so the note leaves that to what she said: if she already told the caller "I'm sorry, I
+//       couldn't save that" (THE ONE RULE after a second failed submit), she skips the say line, never calls
 //       submit_service_request or the tool again, and says only NOT_SAVED_SAY (the team is already calling back). That
 //       exception opens the note, and the normal steps follow under "Otherwise:".
 //   an unconfirmed email                  UNCONFIRMED_SAY, then item 6's spell-back steps and a wait for the caller's yes
-//       (never a retry before they speak). Never counted.
-//   any other failure                     counted: the server counts this call's CONSECUTIVE counted failures of this tool
-//       (tool_failures). The first gets TROUBLE_SAY and one retry in the same reply (THE ONE RULE in
-//       templates/emma-prompt.txt); the failure right after it gets NOT_SAVED_SAY and "do not call it again". A save of that
-//       tool, or the first save of the request, starts the count again. A body with no call id (nothing to count by, and a
-//       retry cannot fix it) gets NOT_SAVED_SAY and "Do not call it again" at once.
-// The prompt's THE ONE RULE gives every note failure the trouble line, a retry and NOT_SAVED_SAY; she obeyed that over the
-// note (Oct 17), so the two uncounted notes say to follow them instead and speak only the lines they give (REPLACES).
+//       (never a retry before they speak).
+//   any other failure                     NOT_SAVED_SAY and "Do not call it again", the first time and every time. In real
+//       gpt-4.1 runs (Oct 18, grader-verdict-r5) every say line was spoken word for word (10 of 10), but the same-reply retry
+//       the old first-failure note asked for was made 0 of 2 times: it said the trouble line and stopped, and the detail was
+//       lost. So the server retries the write itself (addTool: a write that throws, e.g. SQLite busy, is tried again in the
+//       same request) and only a write that still fails, or arguments only the model could fix (a bad note or email,
+//       unreadable JSON, no call id), come back here. Nothing was saved, so the line is honest. A model that calls again
+//       anyway gets the same pair again, or a save if the new call can be saved.
+// THE ONE RULE's trouble line and retry stay for what never reaches the server (a Vapi timeout, "No result returned").
 export const NOT_SAVED_SAY = 'Mention that when the team calls you, so they have it.';
 export const NO_REQUEST_SAY = 'Okay, let\'s get the rest of your details first.';
 export const UNCONFIRMED_SAY = 'Let me spell that back to make sure I have it.';
-export const TROUBLE_SAY = 'I\'m having trouble saving that, one moment.';
 const NOT_SAVED_TOOLS = ['add_request_note', 'add_customer_email'];
 const UNCONFIRMED_EMAIL = 'Not added: spell the email back letter by letter and get a clear yes first.';
 const NO_REQUEST = 'No saved request yet; save the request first';
@@ -66,9 +67,9 @@ const SAY_ONLY = 'Say exactly the say line and nothing else about this.';
 const NO_PROMISE = 'Never say "I\'ll note that", "I\'ll let the team know", "I\'ll pass that on", "I\'ve added that" or anything similar.';
 const NO_CLAIM = 'Other than the exact lines given here, never say the team will see, have, know or get this detail.';
 const REPLACES = 'For this result, follow this note instead of THE ONE RULE\'s failed-save steps (trouble line, retry, closing line), and speak only the lines it gives.';
-export const notSavedSay = (result = {}, failures = 1) => result.error === NO_REQUEST ? NO_REQUEST_SAY
-  : result.error === UNCONFIRMED_EMAIL ? UNCONFIRMED_SAY : failures === 1 ? TROUBLE_SAY : NOT_SAVED_SAY;
-export const notSavedNote = (name, result = {}, failures = 1) => `${SAY_ONLY} ` + (result.error === NO_REQUEST
+export const notSavedSay = (result = {}) => result.error === NO_REQUEST ? NO_REQUEST_SAY
+  : result.error === UNCONFIRMED_EMAIL ? UNCONFIRMED_SAY : NOT_SAVED_SAY;
+export const notSavedNote = (name, result = {}) => `${SAY_ONLY} ` + (result.error === NO_REQUEST
   // The exception comes first and the rest is "Otherwise:", so no sentence of the normal steps contradicts it.
   ? 'If earlier in this call you already told the caller "I\'m sorry, I couldn\'t save that", do not say the say line and do not ' +
     `call submit_service_request or ${name} again; say only "${NOT_SAVED_SAY}" Otherwise: ${REPLACES} NOT saved: nothing was ` +
@@ -81,12 +82,8 @@ export const notSavedNote = (name, result = {}, failures = 1) => `${SAY_ONLY} ` 
     `Only after they say yes, call ${name} again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ` +
     'again before the caller speaks. If they say it\'s wrong, ask them to spell just that part again, nice and slow, and read it back ' +
     `again, as you did before. Only if they won't or can't confirm it, say only "${NOT_SAVED_SAY}"`
-  : failures === 1
-    ? 'NOT saved: nothing was noted, added or passed on. Then fix what the error says if it tells you, and call ' +
-      `${name} once more in that same reply, before the caller speaks; never stop after the say line. If that call is not ` +
-      'saved either, its result gives the next line to say.'
-    : `${failures === Infinity ? 'NOT saved.' : 'NOT saved again.'} Do not call it again.`) + ` ${NO_PROMISE} ${NO_CLAIM}`;
-const withNotSavedLine = (name, result, failures) => ({ ...result, say: notSavedSay(result, failures), note: notSavedNote(name, result, failures) });
+  : `${REPLACES} NOT saved: nothing was noted, added or passed on. Do not call it again.`) + ` ${NO_PROMISE} ${NO_CLAIM}`;
+const withNotSavedLine = (name, result) => ({ ...result, say: notSavedSay(result), note: notSavedNote(name, result) });
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Why a request is test traffic, or null for a live request. Test requests are stored but
@@ -468,20 +465,6 @@ export function transferDestination(route, details) {
 // date so an old table never breaks a save: outbox gained created_at (when the work was saved; the 1 h cut-off) and
 // gave_up; tool_calls gained arg and assistant_id with a new primary key, which SQLite cannot add in place, so an old
 // tool_calls table is kept aside as tool_calls_v0 (it only held dedupe claims) and a new one is made. One transaction.
-// An unreleased build of this branch (6d7a92b) made tool_failures with one row per call and tool and no tool_call_id. That
-// build was never deployed and its rows are only short-lived loop-guard counts, so that shape is replaced, not migrated.
-// Never throws: if this fails, the in-memory count is used.
-export function upgradeToolFailures(db) {
-  try {
-    const columns = db.prepare('PRAGMA table_info(tool_failures)').all().map(c => c.name);
-    if (columns.length && !columns.includes('tool_call_id')) db.exec(`DROP TABLE tool_failures;
-      CREATE TABLE tool_failures (
-        call_id TEXT NOT NULL, name TEXT NOT NULL, tool_call_id TEXT NOT NULL, failures INTEGER NOT NULL,
-        cleared INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (call_id, name, tool_call_id)
-      );`);
-  } catch (error) { console.warn(`tool_failures upgrade failed, in-memory count only: ${error?.message || 'error'}`); }
-}
-
 export function upgradeRetryTables(db) {
   const columns = table => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name));
   const outbox = columns('outbox'), tools = columns('tool_calls');
@@ -576,15 +559,9 @@ export function createApp(env = process.env, send = fetch) {
         ref TEXT PRIMARY KEY, kind TEXT NOT NULL, call_id TEXT NOT NULL, tool_call_id TEXT, args_key TEXT, created_at INTEGER NOT NULL,
         due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, gave_up TEXT
       );
-      -- note-fail-line (new table only; older builds ignore it): one row per failed add_request_note / add_customer_email
-      -- tool call (Vapi toolCall id), with its place in the run of consecutive failures (failures). cleared = 1 once that
-      -- tool saved (or the request was first saved) after it, so the next failure starts a new run.
-      CREATE TABLE IF NOT EXISTS tool_failures (
-        call_id TEXT NOT NULL, name TEXT NOT NULL, tool_call_id TEXT NOT NULL, failures INTEGER NOT NULL,
-        cleared INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (call_id, name, tool_call_id)
-      );`);
+      -- note-fail-line's tool_failures (a count of failed note/email calls) is no longer made, read or written: the server
+      -- retries those writes itself now (addTool). A table an earlier build made is left as it was, so a rollback finds it.`);
     upgradeRetryTables(db);
-    upgradeToolFailures(db);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
     // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
     // A failed trial migration switches trials off (healthz trials_enabled: false) but never stops the server.
@@ -671,57 +648,8 @@ export function createApp(env = process.env, send = fetch) {
     return expected.length >= 32 && supplied.length === expected.length && timingSafeEqual(supplied, expected);
   };
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
-  // Consecutive saved:false results of this tool in this call, this one included (unconfirmed emails and "No saved request
-  // yet" are not counted: the fix for those waits for the caller or for the save). A non-duplicate saved:true of the same
-  // tool clears the run, and so does the first save of the request (submit_service_request), so a failure after it is a
-  // new one. A duplicate save changes nothing, so it clears nothing; a real loop never has a new save in it. A repeat of a
-  // toolCall id that was already counted (a lost response re-sent) is not counted again and gets the number it got the
-  // first time. Stored in tool_failures so a restart keeps the run; the in-memory copy is used when the database cannot be
-  // read or written.
-  const failRuns = new Map();
-  const runOf = slot => {
-    const run = failRuns.get(slot) || { length: 0, ids: new Map() };
-    failRuns.delete(slot); failRuns.set(slot, run);
-    if (failRuns.size > 5000) failRuns.delete(failRuns.keys().next().value);
-    return run;
-  };
-  function countFailure(callId, name, toolCallId) {
-    const run = runOf(`${callId}\n${name}`), id = String(toolCallId); // the webhook refuses a tool call with no id
-    let failures;
-    try {
-      const seen = db.prepare('SELECT failures FROM tool_failures WHERE call_id = ? AND name = ? AND tool_call_id = ?').get(callId, name, id);
-      if (seen) failures = seen.failures;
-      else {
-        failures = db.prepare('SELECT COUNT(*) AS n FROM tool_failures WHERE call_id = ? AND name = ? AND cleared = 0').get(callId, name).n + 1;
-        db.prepare('INSERT INTO tool_failures (call_id, name, tool_call_id, failures, updated_at) VALUES (?, ?, ?, ?, ?)')
-          .run(callId, name, id, failures, new Date().toISOString());
-        run.length = failures;
-      }
-    } catch {
-      // No database, or it cannot be written: the in-memory run stands.
-      failures = run.ids.get(id) ?? ++run.length;
-    }
-    if (!run.ids.has(id)) { run.ids.set(id, failures); if (run.ids.size > 50) run.ids.delete(run.ids.keys().next().value); }
-    return failures;
-  }
-  function clearFailures(callId, names) {
-    for (const name of names) {
-      runOf(`${callId}\n${name}`).length = 0;
-      try {
-        db.prepare('UPDATE tool_failures SET cleared = 1, updated_at = ? WHERE call_id = ? AND name = ? AND cleared = 0')
-          .run(new Date().toISOString(), callId, name);
-      } catch { /* the in-memory run is cleared; see Known limits in NOTES.md */ }
-    }
-  }
-  function notSavedLine(name, callId, toolCallId, result) {
-    if (callId && result?.saved === true && !result.duplicate) {
-      if (NOT_SAVED_TOOLS.includes(name)) clearFailures(callId, [name]);
-      else if (name === 'submit_service_request') clearFailures(callId, NOT_SAVED_TOOLS);
-    }
-    if (!NOT_SAVED_TOOLS.includes(name) || result?.saved !== false) return result;
-    const uncounted = result.error === UNCONFIRMED_EMAIL || result.error === NO_REQUEST;
-    return withNotSavedLine(name, result, uncounted ? 1 : callId ? countFailure(callId, name, toolCallId) : Infinity);
-  }
+  // Only add_request_note and add_customer_email results that saved nothing get the say line and note (see NOT_SAVED_SAY).
+  const notSavedLine = (name, result) => NOT_SAVED_TOOLS.includes(name) && result?.saved === false ? withNotSavedLine(name, result) : result;
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   // Delivery ledger: a channel that went out is never sent again; one that failed, or was cut off by a restart (still
@@ -1232,10 +1160,12 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   const toolRef = (name, callId, toolCallId, argsKey) => `${name}\n${callId}\n${toolCallId}\n${argsKey}`;
   const toolRow = (name, callId, toolCallId, argsKey) => db.prepare(`SELECT arg, assistant_id, result FROM tool_calls
     WHERE call_id = ? AND name = ? AND tool_call_id = ? AND args_key = ?`).get(callId, name, toolCallId, argsKey);
-  // add_request_note and add_customer_email: a toolCall id already stored with other arguments is refused as a conflict (a
-  // Vapi retry repeats the same body), never a new change. submit keeps main's one-request-per-call rule: a repeat with
-  // other arguments gets the stored result, marked duplicate.
-  const reused = (name, callId, toolCallId) => !!db.prepare('SELECT 1 FROM tool_calls WHERE call_id = ? AND name = ? AND tool_call_id = ?').get(callId, name, toolCallId);
+  // add_request_note and add_customer_email are keyed by toolCall id AND arguments (args_key: the note, or the email in any
+  // case), so a toolCall id the model reuses for another note or email is a new change with its own row, outbox ref and
+  // alert key; the old build refused it and asked for a model retry, which gpt-4.1 does not make. A Vapi retry repeats the
+  // same body, so it still finds its own row. submit keeps main's one-request-per-call rule: a repeat with other arguments
+  // gets the stored result, marked duplicate.
+  const argsKeyOf = (name, args) => sha(name === 'add_request_note' ? String(args?.note).trim() : String(args?.email).trim().toLowerCase());
   function deliverTool(name, callId, toolCallId, argsKey) {
     const ref = toolRef(name, callId, toolCallId, argsKey);
     return run(ref, async () => {
@@ -1287,8 +1217,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (!row) return failure(NO_REQUEST);
     const note = typeof args?.note === 'string' ? args.note.trim() : '';
     if (!note || note.length > 1000) return failure('Missing or invalid note');
-    const name = 'add_request_note', argsKey = sha(note), stored = toolRow(name, callId, toolCallId, argsKey);
-    if (!stored && reused(name, callId, toolCallId)) return failure('Not added: this tool call was already used for a different note. Call add_request_note again.');
+    const name = 'add_request_note', argsKey = argsKeyOf(name, args), stored = toolRow(name, callId, toolCallId, argsKey);
     if (stored) return repeat(toolRef(name, callId, toolCallId, argsKey), JSON.parse(stored.result), () => deliverTool(name, callId, toolCallId, argsKey));
     const details = JSON.parse(row.details), last = await repeatOfLast(name, callId, (details.notes || []).at(-1), note);
     if (last) return last;
@@ -1303,14 +1232,47 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (args?.confirmed_after_spelling_back !== true) return failure(UNCONFIRMED_EMAIL);
     const email = typeof args?.email === 'string' ? args.email.trim() : '';
     if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return failure('Invalid email');
-    const name = 'add_customer_email', argsKey = sha(email.toLowerCase()), stored = toolRow(name, callId, toolCallId, argsKey);
-    if (!stored && reused(name, callId, toolCallId)) return failure('Not added: this tool call was already used for a different email. Call add_customer_email again.');
+    const name = 'add_customer_email', argsKey = argsKeyOf(name, args), stored = toolRow(name, callId, toolCallId, argsKey);
     if (stored) return repeat(toolRef(name, callId, toolCallId, argsKey), JSON.parse(stored.result), () => deliverTool(name, callId, toolCallId, argsKey));
     const details = JSON.parse(row.details), last = await repeatOfLast(name, callId, details.email, email);
     if (last) return last;
     details.email = email;
     return saveTool(name, callId, toolCallId, argsKey, email, assistantId, details,
       { saved: true, request_id: row.id, email_added: true, caller_email: details.is_test ? 'suppressed_test' : 'pending' });
+  }
+  // add_request_note / add_customer_email with the server's own retry. gpt-4.1 does not retry a failed note in the same reply
+  // (see NOT_SAVED_SAY), so a write that throws (SQLite busy after busy_timeout, a full disk, a failed bookkeeping write
+  // after the sends) is tried again here, in the same request, after 100 ms and then 400 ms. No new try starts once 10 s
+  // have gone, so a slow first try (busy_timeout is 5 s, each send is cut off at 8 s) gets at most one more, to stay inside
+  // Vapi's 40 s server timeout (templates/emma-assistant.json). A try never makes a second note, row or alert: it has the
+  // same toolCall id and arguments, so it finds the row an earlier try committed (toolRow) and only finishes that row's
+  // sends, through the ledger (sendOnce) under the same alert key; a try after one that committed nothing is a first save
+  // (the last-note check, repeatOfLast, matches only a note an earlier tool call saved). A row found on a later try is this
+  // request's own, so its result is not marked duplicate. Results (saved or not) are never retried: only the model can fix
+  // its arguments. If every try throws, a committed row still means saved (its outbox row finishes the sends), as submit
+  // does; otherwise the not-saved line, honestly.
+  const WRITE_RETRY_MS = [100, 400], WRITE_RETRY_WITHIN_MS = 10000;
+  async function addTool(name, callId, args, assistantId, toolCallId) {
+    const add = name === 'add_request_note' ? addNote : addEmail, started = Date.now();
+    const committed = () => { try { return toolRow(name, callId, toolCallId, argsKeyOf(name, args)); } catch { return null; } };
+    for (let tries = 0; ; tries++) {
+      const own = tries > 0 && !!committed();
+      try {
+        const result = await add(callId, args, assistantId, toolCallId);
+        if (!own || !result.duplicate) return result;
+        const { duplicate, ...ownResult } = result;
+        return ownResult;
+      } catch (error) {
+        // A ROLLBACK that threw would leave the connection inside the transaction, and every later write would fail. Every
+        // transaction here is synchronous, so none can be open now except one a failure left behind.
+        if (db.isTransaction) try { db.exec('ROLLBACK'); } catch {}
+        // IDs and the SQLite error name only, never the note or email.
+        console.warn(`tool-write name=${name} call=${logSafe(callId)} tool_call=${logSafe(toolCallId)} try=${tries + 1} error=${logSafe(error?.errstr || error?.code)}`);
+        if (tries < WRITE_RETRY_MS.length && Date.now() - started < WRITE_RETRY_WITHIN_MS) { await new Promise(resolve => setTimeout(resolve, WRITE_RETRY_MS[tries])); continue; }
+        const stored = committed();
+        return stored ? JSON.parse(stored.result) : failure(name === 'add_request_note' ? 'Unable to add note' : 'Unable to add email');
+      }
+    }
   }
   // The outbox gave up on a note alert that reached no channel (5 passes failed, or the row went stale after a crash loop
   // of over an hour): Anchorline (OFFICE_EMAIL) is told once, in the office_retries style, retried every minute until
@@ -1603,19 +1565,12 @@ This records a request only. It does not confirm an appointment, dispatch, trans
         const callId = conversationKey(message);
         const name = tool.function?.name || tool.name;
         if (!callId) result = failure('Missing Vapi call, chat or session ID');
-        else if (name === 'add_request_note') {
-          try {
-            let args = tool.function?.arguments ?? tool.parameters;
-            if (typeof args === 'string') args = JSON.parse(args);
-            result = await addNote(callId, args, assistantIdOf(message), tool.id);
-          } catch { result = failure('Unable to add note'); }
-        }
-        else if (name === 'add_customer_email') {
-          try {
-            let args = tool.function?.arguments ?? tool.parameters;
-            if (typeof args === 'string') args = JSON.parse(args);
-            result = await addEmail(callId, args, assistantIdOf(message), tool.id);
-          } catch { result = failure('Unable to add email'); }
+        else if (NOT_SAVED_TOOLS.includes(name)) {
+          // Arguments that are not JSON are the model's to fix, never retried (addTool retries only the write).
+          let args = tool.function?.arguments ?? tool.parameters, readable = true;
+          if (typeof args === 'string') try { args = JSON.parse(args); } catch { readable = false; }
+          result = readable ? await addTool(name, callId, args, assistantIdOf(message), tool.id)
+            : failure(name === 'add_request_note' ? 'Unable to add note' : 'Unable to add email');
         }
         else if (name === 'transfer_no_answer') {
           try { result = await noAnswer(callId); } catch { result = failure('Unable to alert the owner'); }
@@ -1639,7 +1594,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
             result = saved ? JSON.parse(saved.result) : failure('Unable to process request');
           }
         }
-        result = notSavedLine(name, callId, tool.id, result);
+        result = notSavedLine(name, result);
         results.push({ toolCallId: tool.id, result: JSON.stringify(result) });
         // Operational log only: tool, IDs, outcome and time, never arguments or caller details.
         console.log(`tool-call name=${logSafe(name)} call=${logSafe(callId)} tool_call=${logSafe(tool.id)} outcome=${toolOutcome(result)} ms=${Date.now() - started}`);
