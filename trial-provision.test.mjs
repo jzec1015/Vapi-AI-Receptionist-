@@ -759,3 +759,41 @@ test('the voice upgrade adds its spoken style and address read-back once, withou
   once('Alright, I\'ve got all that over to the team.');
   assert.match(prompt, /"Alright, I've got all that over to the team\. Someone will be in touch with you soon\." Then ask, "Anything else you'd like me to pass along\?"/);
 });
+
+test('social pass: Emma yields to interruptions, re-reads only a correction, caps re-asks, and never hangs up first', () => {
+  const shop = { id: 'client-6', business: 'Riverbend Plumbing', owner_name: 'Dana Whitfield', shop_number: '+16155550100', city: 'Nashville', state: 'TN', services: 'Drains' };
+  const prompt = assistantConfig(shop, { serverUrl: 'https://receptionist.example/vapi/webhook', secret: key }).model.messages[0].content;
+  const once = text => assert.equal(prompt.split(text).length - 1, 1, `"${text}" appears exactly once`);
+  const section = (name, next) => prompt.slice(prompt.indexOf(name), prompt.indexOf(next, prompt.indexOf(name)));
+  // c: interrupted mid-sentence, she stops, uses what they said, and never restarts.
+  const sound = section('HOW YOU SOUND', 'BE CURIOUS');
+  assert.match(sound, /If the caller starts talking while you're speaking, stop\. Use what they just said; if it answers your question, go straight to the next thing\. Never repeat or restart the sentence you were cut off in\./);
+  assert.match(sound, /Use your own words, except the read-backs and the exact lines quoted in this prompt\./);
+  // f: a correction is said back alone; the phone number keeps its whole read-back.
+  assert.match(prompt, /If they correct something, take it once and say back only the corrected part \("Got it, two-forty Elm\." or "Kowalski with a K, got it\."\), then carry on without re-asking the rest\. The phone number is the exception: it always gets the whole read-back\./);
+  assert.doesNotMatch(prompt, /Got it, thanks/);
+  // a: a quiet caller is asked once, early; background voices are not the caller.
+  const natural = section('STAYING NATURAL', 'HOW YOU ACTUALLY TALK');
+  assert.match(natural, /If the caller sounds quiet or far away, ask once, early, like "I'm having a little trouble hearing you, could you move a bit closer to the phone\?" Never ask again later\./);
+  assert.match(natural, /Background voices or TV aren't the caller; don't answer them\./);
+  // b: re-asks vary and are capped at two; the phone number then falls back to the calling number, said aloud.
+  assert.match(natural, /Never use the same wording twice in a row, and never ask for the same detail more than twice; then move on with what you have/);
+  assert.match(prompt, /Asks to repeat follow STAYING NATURAL instead\./);
+  const phone = section('THE PHONE NUMBER RULE (', 'SHOP DETAILS');
+  assert.match(phone, /If you have no number they've said yes to after asking twice, stop asking, say "No problem, the team will have the number you're calling from," and from then on treat it as no number given\. The only exceptions are that case and a caller who refuses to give a number \(see NEVER LOSE A CALLER\): then save with callback_phone empty\./);
+  assert.doesNotMatch(prompt, /Sorry, I only caught part of that|Sorry about that, could you spell just that part again|Sorry, I want to get that right/);
+  once('the team will have the number you');
+  // Safety flag: a goodbye then waiting for theirs; "nothing else" is no longer a reason to end the call.
+  const ending = section('ENDING THE CALL', 'THINGS YOU DON\'T DO');
+  assert.match(ending, /Never hang up first\. When they say there's nothing else, say one short goodbye \("Take care, Dorothy\."\) and wait for theirs\./);
+  assert.match(ending, /Only end the call in a later reply, after the caller has said goodbye, or stays silent after you've asked once whether they're still there\./);
+  assert.doesNotMatch(prompt, /says there's nothing else, or stays silent|and then end the call/);
+  // e: one question per playbook line, a shorter price line, and every quoted line at most 25 words (the save-failure line is the exception).
+  assert.doesNotMatch(prompt, /gas or electric, and roughly how old|Do you already have the new part\?"|Which drain is it, and/);
+  assert.match(ending, /"Dana will go over that with you on the callback\. I'll note that you asked\."/);
+  assert.doesNotMatch(prompt, /Pricing depends on what|DO NOT ALWAYS USE/);
+  for (const [, line] of prompt.slice(0, prompt.indexOf('<<<SHOP DETAILS')).matchAll(/"([^"]*)"/g))
+    assert.ok(line.split(/\s+/).length <= 25, `quoted line over 25 words: ${line}`);
+  // d: shorter than the voice-upgrade text (3,098 template words), with each rule still stated once.
+  assert.ok(prompt.split(/\s+/).length < 2900, `prompt has ${prompt.split(/\s+/).length} words`);
+});
