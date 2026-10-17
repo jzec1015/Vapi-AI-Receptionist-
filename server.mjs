@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { timingSafeEqual, randomUUID } from 'node:crypto';
+import { timingSafeEqual, randomUUID, createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -27,6 +27,10 @@ export function callerNumberOf(message) {
 
 const digitsOf = value => String(value || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
 const jsonList = value => { try { const list = JSON.parse(value || '[]'); return Array.isArray(list) ? list.filter(v => typeof v === 'string' && v) : []; } catch { return []; } };
+// Log fields come from the webhook body: keep them to one short token.
+const logSafe = value => String(value ?? 'none').replace(/[^\w.:-]/g, '_').slice(0, 120) || 'none';
+const toolOutcome = r => r?.duplicate ? 'duplicate' : r?.saved === false ? (r.retryable ? 'retryable_error' : 'refused')
+  : r?.booked === false ? `not_booked_${logSafe(r.status)}` : r?.error ? 'refused' : 'ok';
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Why a request is test traffic, or null for a live request. Test requests are stored but
@@ -260,6 +264,13 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS digests (
         assistant_id TEXT NOT NULL, day TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, sent_at TEXT,
         PRIMARY KEY (assistant_id, day)
+      );
+      -- v1.8.1: one row per add_request_note / add_customer_email that changed a saved request, committed with the change
+      -- and before any network call, so a Vapi retry returns the stored result instead of appending or alerting twice.
+      -- New table only: v1.8.0 ignores it.
+      CREATE TABLE IF NOT EXISTS tool_calls (
+        call_id TEXT NOT NULL, name TEXT NOT NULL, args_key TEXT NOT NULL, tool_call_id TEXT NOT NULL, created_at TEXT NOT NULL, result TEXT NOT NULL,
+        PRIMARY KEY (call_id, name, args_key)
       );`);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
     // v1.6.0 and v1.5.0 never read them, so a rollback ignores them and a later roll-forward finds them as they were.
@@ -350,7 +361,7 @@ export function createApp(env = process.env, send = fetch) {
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   const inflight = new Map();
-  async function receipt(to, details, id, recipient, route = null) {
+  async function receipt(to, details, id, recipient, route = null, idempotencyKey = `${id}-${recipient}`) {
     if (!to) return 'not_requested';
     if (!env.RESEND_API_KEY || !env.EMAIL_FROM) return 'needs_review';
     const branded = recipient === 'caller' && route?.business;
@@ -366,7 +377,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     try {
       const response = await send('https://api.resend.com/emails', {
         method: 'POST', signal: AbortSignal.timeout(8000),
-        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': `${id}-${recipient}` },
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
         body: JSON.stringify({ from: branded ? `${route.business} <${env.EMAIL_FROM}>` : env.EMAIL_FROM, to: [to], ...message,
           ...(branded && route.email?.length ? { reply_to: route.email } : {}) })
       });
@@ -432,7 +443,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   }
   // Office alerts for one client route. Returns a status string; never throws.
   // holdCall: a live transfer will be tried first, so the spoken alert call waits for its outcome.
-  async function alert(route, details, id, kind, holdCall = false, callId = '') {
+  async function alert(route, details, id, kind, holdCall = false, callId = '', emailKey = `${id}-alert-${kind}-${details.notes.length}`) {
     if (!route || (details.is_test && !route.alertTests)) return details.is_test ? 'suppressed_test' : 'not_configured';
     const text = alertText(route, details, kind);
     const jobs = [];
@@ -451,7 +462,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       const emailText = alertText(route, details, kind, 'email');
       jobs.push(send('https://api.resend.com/emails', {
         method: 'POST', signal: AbortSignal.timeout(8000),
-        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': `${id}-alert-${kind}-${details.notes.length}` },
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': emailKey },
         body: JSON.stringify({ from: env.EMAIL_FROM, to: route.email, subject: alertSubject(details, kind), text: `${emailText}\n\nRequest reference: ${id}` }) }));
     }
     const urgent = /^\s*URGENT\b/i.test(details.issue);
@@ -675,28 +686,79 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     db.prepare('UPDATE transfers SET due_at = ? WHERE call_id = ?').run(Date.now() + fallbackMs, callId);
     return { destination: transferDestination(route, details) };
   }
-  async function addNote(callId, args, route) {
+  // add_request_note and add_customer_email are retry-safe, in the same style as submit: a repeat with the same arguments on
+  // the same call (a Vapi retry carries the same toolCall id and arguments) returns the stored result with duplicate: true.
+  // The change and its tool_calls row commit together before any network call; an overlapping repeat shares the in-flight
+  // promise. Failures are never stored, so a corrected retry still works. Resend keys come from the toolCall id.
+  const sha = value => createHash('sha256').update(String(value)).digest('hex');
+  const toolFlights = new Map();
+  const storedTool = (callId, name, argsKey) => {
+    const row = db.prepare('SELECT result FROM tool_calls WHERE call_id = ? AND name = ? AND args_key = ?').get(callId, name, argsKey);
+    return row ? { ...JSON.parse(row.result), duplicate: true } : null;
+  };
+  // Saves details and claims the tool call in one transaction. False: another request already claimed it.
+  function claimTool(callId, name, argsKey, toolCallId, details, result) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const claimed = db.prepare('INSERT OR IGNORE INTO tool_calls VALUES (?, ?, ?, ?, ?, ?)')
+        .run(callId, name, argsKey, String(toolCallId || ''), new Date().toISOString(), JSON.stringify(result)).changes === 1;
+      if (claimed) db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
+      db.exec('COMMIT');
+      return claimed;
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  // Runs the network part once per claim and stores its final result.
+  function finishTool(callId, name, argsKey, result, work) {
+    const flight = `${name}\n${callId}\n${argsKey}`;
+    const task = work().then(() => {
+      db.prepare('UPDATE tool_calls SET result = ? WHERE call_id = ? AND name = ? AND args_key = ?').run(JSON.stringify(result), callId, name, argsKey);
+      return result;
+    }).finally(() => toolFlights.delete(flight));
+    toolFlights.set(flight, task);
+    return task;
+  }
+  const flying = (name, callId, argsKey) => toolFlights.get(`${name}\n${callId}\n${argsKey}`);
+  async function addNote(callId, args, route, toolCallId = '') {
     const row = db.prepare('SELECT id, details, result FROM requests WHERE call_id = ?').get(callId);
     if (!row) return failure('No saved request yet; save the request first');
     const note = typeof args?.note === 'string' ? args.note.trim() : '';
     if (!note || note.length > 1000) return failure('Missing or invalid note');
+    const name = 'add_request_note', argsKey = sha(note);
+    const repeat = flying(name, callId, argsKey) || storedTool(callId, name, argsKey);
+    if (repeat) return repeat;
     const details = JSON.parse(row.details);
+    // The same text already on the request (e.g. added before v1.8.1): nothing to append and no second alert.
+    if ((details.notes || []).includes(note)) return { saved: true, request_id: row.id, note_added: true, duplicate: true, office_alert: 'not_resent' };
     details.notes = [...(details.notes || []), note].slice(-20);
-    db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
-    return { saved: true, request_id: row.id, note_added: true, office_alert: await alert(route, details, row.id, 'note') };
+    const result = { saved: true, request_id: row.id, note_added: true, office_alert: 'pending' };
+    if (!claimTool(callId, name, argsKey, toolCallId, details, result)) return storedTool(callId, name, argsKey);
+    const emailKey = `${row.id}-alert-note-${sha(`${toolCallId}\n${argsKey}`).slice(0, 32)}`;
+    return finishTool(callId, name, argsKey, result, async () => { result.office_alert = await alert(route, details, row.id, 'note', false, '', emailKey); });
   }
   // An email given after the request was saved: only accepted once spelled back and confirmed, then the confirmation goes out.
-  async function addEmail(callId, args, route) {
+  // The Resend key names the address, so a corrected address is sent (one key reused with a new payload is refused by Resend).
+  async function addEmail(callId, args, route, toolCallId = '') {
     const row = db.prepare('SELECT id, details FROM requests WHERE call_id = ?').get(callId);
     if (!row) return failure('No saved request yet; save the request first');
     if (args?.confirmed_after_spelling_back !== true) return failure('Not added: spell the email back letter by letter and get a clear yes first.');
     const email = typeof args?.email === 'string' ? args.email.trim() : '';
     if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return failure('Invalid email');
+    const name = 'add_customer_email', argsKey = sha(email.toLowerCase());
     const details = JSON.parse(row.details);
+    const current = String(details.email || '').toLowerCase() === email.toLowerCase();
+    // A repeat only while this is still the saved address (A, then B, then A again saves A again).
+    const repeat = flying(name, callId, argsKey) || (current && storedTool(callId, name, argsKey));
+    if (repeat) return repeat;
+    if (!current) db.prepare('DELETE FROM tool_calls WHERE call_id = ? AND name = ? AND args_key = ?').run(callId, name, argsKey);
+    // The first address on the request (or the one submit already saved) keeps the v1.5 key, so Resend never sends that
+    // confirmation twice; a corrected address gets a key of its own.
+    const emailKey = current || !details.email ? `${row.id}-caller` : `${row.id}-caller-${argsKey.slice(0, 32)}`;
     details.email = email;
-    db.prepare('UPDATE requests SET details = ? WHERE call_id = ?').run(JSON.stringify(details), callId);
-    const caller_email = details.is_test ? 'suppressed_test' : await receipt(email, details, row.id, 'caller', route);
-    return { saved: true, request_id: row.id, email_added: true, caller_email };
+    const result = { saved: true, request_id: row.id, email_added: true, caller_email: details.is_test ? 'suppressed_test' : 'pending' };
+    if (!claimTool(callId, name, argsKey, toolCallId, details, result)) return storedTool(callId, name, argsKey);
+    return finishTool(callId, name, argsKey, result, async () => {
+      if (!details.is_test) result.caller_email = await receipt(email, details, row.id, 'caller', route, emailKey);
+    });
   }
   // The live transfer came back unanswered: the held urgent alert call goes out now.
   async function noAnswer(callId) {
@@ -913,6 +975,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
       const results = [];
       for (const tool of calls) {
         let result;
+        const started = Date.now();
         const callId = conversationKey(message);
         const name = tool.function?.name || tool.name;
         if (!callId) result = failure('Missing Vapi call, chat or session ID');
@@ -920,14 +983,14 @@ This records a request only. It does not confirm an appointment, dispatch, trans
           try {
             let args = tool.function?.arguments ?? tool.parameters;
             if (typeof args === 'string') args = JSON.parse(args);
-            result = await addNote(callId, args, routeFor(message));
+            result = await addNote(callId, args, routeFor(message), tool.id);
           } catch { result = failure('Unable to add note'); }
         }
         else if (name === 'add_customer_email') {
           try {
             let args = tool.function?.arguments ?? tool.parameters;
             if (typeof args === 'string') args = JSON.parse(args);
-            result = await addEmail(callId, args, routeFor(message));
+            result = await addEmail(callId, args, routeFor(message), tool.id);
           } catch { result = failure('Unable to add email'); }
         }
         else if (name === 'transfer_no_answer') {
@@ -953,6 +1016,8 @@ This records a request only. It does not confirm an appointment, dispatch, trans
           }
         }
         results.push({ toolCallId: tool.id, result: JSON.stringify(result) });
+        // Operational log only: tool, IDs, outcome and time, never arguments or caller details.
+        console.log(`tool-call name=${logSafe(name)} call=${logSafe(callId)} tool_call=${logSafe(tool.id)} outcome=${toolOutcome(result)} ms=${Date.now() - started}`);
       }
       reply(200, { results });
     } catch { if (!res.headersSent) reply(500, { error: 'Request failed' }); }
