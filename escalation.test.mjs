@@ -46,7 +46,7 @@ test('lock-screen subjects: what, where, who to call, never over 90 characters',
   assert.equal(alertSubject({ ...intake, issue: 'Faucet', notes: ['Gate code 4471'] }, 'note'), 'Update – Gate code 4471 – 1412 Dickerson Pike – (615) 555-0142');
   assert.equal(alertSubject({ issue: 'x', caller_id: '+16155550100', greeting_hangup: true }, 'hangup'), 'Caller hung up during greeting – (615) 555-0100 – call them back');
   assert.equal(alertSubject({ ...intake, issue: 'Water heater is 15 years old', job_type: 'Water heater replacement', notes: [] }),
-    'High-value job – Water heater is 15 years old – 1412 Dickerson Pike – (615) 555-0142');
+    'New job – Water heater is 15 years old – 1412 Dickerson Pike – (615) 555-0142', 'high-value subjects stay "New job"');
   assert.equal(alertSubject({ ...intake, job_size: 'Big job (half day+)', notes: [] }), 'URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142', 'urgent subject unchanged');
   assert.ok(alertSubject({ ...intake, issue: 'repipe ' + 'the whole downstairs bathroom and kitchen '.repeat(4), notes: [] }).length <= 90);
   const long = alertSubject({ ...intake, issue: 'URGENT - ' + 'water pouring through the ceiling of the downstairs bathroom '.repeat(4),
@@ -286,4 +286,12 @@ test('the digest lists jobs by priority tier: urgent, high-value, routine, save 
   assert.match(text, new RegExp(['Jobs saved: 6', 'Urgent jobs: 2', '- Urgent – Cy Urgent – 9 Main St – alert call answered', '- Urgent – Flo Urgent – 10 Main St – put through to you live',
     'High-value jobs: 2', '- High-value – Bo Big – 6 Main St – Bathroom remodel', '- High-value – Ed Big – 6 Main St – Water heater leaking',
     'Routine jobs: 2', '- Routine – Ann Routine – 11 Main St – Replace a faucet', '- Routine – Di Routine – 10 Main St – Toilet runs', 'Hang-ups: 0'].join('\n')));
+});
+
+test('a single-tier digest lists only that tier\'s jobs, in save order', () => {
+  const job = (name, issue) => ({ details: { name, address: '9 Oak St, Nashville', issue, job_type: '', job_size: '', job_details: '' } });
+  const { subject, text } = digestEmail({ business: 'Gold Star Plumbing' }, 'Thursday, October 15',
+    { calls: 2, jobs: [job('Ann Cole', 'Leaky faucet'), job('Bo Diaz', 'Toilet runs')], hangups: [] });
+  assert.equal(subject, 'Emma yesterday – 2 calls, 2 jobs saved');
+  assert.match(text, /Jobs saved: 2\nUrgent jobs: 0\nHigh-value jobs: 0\nRoutine jobs: 2\n- Routine – Ann Cole – 9 Oak St – Leaky faucet\n- Routine – Bo Diaz – 9 Oak St – Toilet runs\nHang-ups: 0\n/);
 });

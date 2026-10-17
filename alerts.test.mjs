@@ -173,7 +173,14 @@ test('priority tiers: urgent, high-value (big job or big-ticket work), routine',
     [{ issue: 'Wants to replace the old 50-gallon water heater' }, 'high-value', 'replace ... water heater'],
     [{ issue: 'Quote for a new gas water heater' }, 'high-value', 'new water heater'],
     [{ issue: 'Interested in going tankless' }, 'high-value', 'tankless'],
+    [{ issue: 'The water heater needs to be replaced' }, 'high-value', 'needs to be replaced'],
+    [{ issue: 'Water heater leaking, wants a replacement quote' }, 'high-value', 'replacement quote in the same sentence'],
+    [{ issue: 'Water heater is shot, wants a new one installed' }, 'high-value', 'new one / installed'],
     [{ issue: 'No hot water', job_type: 'Water heater repair', job_details: 'Pilot light keeps going out' }, 'routine', 'water heater repair is not high-value'],
+    [{ issue: 'Water heater repair' }, 'routine', 'water heater repair alone'],
+    [{ issue: 'Replaced the water heater last year, now a drip under the sink' }, 'routine', 'past replacement, different problem'],
+    [{ issue: 'Water heater was replaced in May, pilot light keeps going out' }, 'routine', 'was replaced'],
+    [{ issue: 'Water heater is fine. Replace the kitchen faucet' }, 'routine', 'replace in another sentence'],
     [{ issue: 'Pilot light out' }, 'routine', 'pilot light alone'],
     [{ issue: 'Old galvanized pipes', job_type: 'Whole-house repipe' }, 'high-value', 'repipe'],
     [{ issue: 'Needs repiping', job_size: 'Unknown' }, 'high-value', 'repiping'],
@@ -195,17 +202,23 @@ test('priority tiers: urgent, high-value (big job or big-ticket work), routine',
   for (const [details, tier, why] of cases) assert.equal(priorityTier(details), tier, why);
 });
 
-test('the job card shows the priority tier under the heading', () => {
+test('the job card email shows the priority tier under the heading; the SMS is unchanged', () => {
   const route = { business: 'Gold Star Plumbing' };
   const base = { name: 'Linda Harper', address: '48 Birch Road', callback_phone: '6155550142', notes: [], job_type: '', job_size: '', job_details: '' };
-  const big = { ...base, issue: 'Galvanized pipes rusting', job_type: 'Whole-house repipe', job_size: 'Big job (half day+)' };
+  const big = { ...base, issue: 'Galvanized pipes rusting', job_type: 'Whole-house repipe', job_size: 'Big job (half day+)', preferred_time: 'Friday' };
   assert.match(alertText(route, big, 'new', 'email'), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: High-value job\nLinda Harper/);
-  assert.match(alertText(route, big), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: High-value job\n/);
   assert.match(alertText(route, { ...base, issue: 'URGENT - burst pipe' }, 'new', 'email'), /^Anchorline AI: URGENT call - Gold Star Plumbing\nPriority: Urgent\n/);
   assert.match(alertText(route, { ...base, issue: 'Dripping faucet' }, 'new', 'email'), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: Routine\n/);
-  assert.doesNotMatch(alertText(route, { ...base, issue: 'Dripping faucet' }), /Priority/, 'routine SMS stays short');
-  assert.doesNotMatch(alertText(route, { ...base, issue: 'URGENT - burst pipe' }), /Priority/, 'urgent SMS already says URGENT');
   assert.match(alertText(route, { ...big, recording_url: 'https://example.com/r.wav' }, 'new', 'email'), /^Anchorline AI: New call - Gold Star Plumbing\nPriority: High-value job\nRecording: /);
   assert.doesNotMatch(alertText(route, { ...big, notes: ['Gate code'] }, 'note', 'email'), /Priority/);
   assert.doesNotMatch(alertText(route, { ...base, issue: 'Hung up before giving details', caller_id: '+16155550100' }, 'hangup', 'email'), /Priority/);
+  for (const issue of ['URGENT - burst pipe', 'Dripping faucet']) assert.doesNotMatch(alertText(route, { ...base, issue }), /Priority/);
+  assert.equal(alertText(route, big), 'Anchorline AI: New call - Gold Star Plumbing\nLinda Harper - (615) 555-0142\n48 Birch Road\nGalvanized pipes rusting\n' +
+    'Job: Whole-house repipe - Big job (half day+)\nWants: Friday\nReply STOP to opt out');
+  // A long high-value SMS keeps exactly main's (v1.8.0) text: same Job, Details and Wants content up to the 280-character cut.
+  const long = { name: 'Dana Whitfield', address: '2210 Belmont Blvd, Nashville, TN 37212', issue: 'Water heater is 14 years old and leaking from the bottom',
+    callback_phone: '6155550187', job_type: 'Water heater replacement', job_size: 'Big job (half day+)', notes: [],
+    job_details: '50-gallon gas tank in the garage, wants a quote on tankless too', preferred_time: 'Tomorrow morning' };
+  assert.equal(alertText(route, long), 'Anchorline AI: New call - Gold Star Plumbing\nDana Whitfield - (615) 555-0187\n2210 Belmont Blvd, Nashville, TN 37212\n' +
+    'Water heater is 14 years old and leaking from the bottom\nJob: Water heater replacement - Big job (half day+)\nDetails: 50-gallon gas tank in the garage, wants a quot\nReply STOP to opt out');
 });

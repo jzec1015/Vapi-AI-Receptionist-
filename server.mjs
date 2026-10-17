@@ -55,14 +55,16 @@ export const isUrgent = issue => /^\s*URGENT\b/i.test(issue);
 // Priority tier of a saved request, worked out when a job card or digest is written (never stored):
 //   urgent      the issue starts with "URGENT"
 //   high-value  not urgent, and job_size is "Big job (half day+)" or the job type, issue or details name a big-ticket job:
-//               water heater replacement/install, new water heater, tankless, repipe, main/sewer line, sewer replacement,
-//               slab leak, whole-house, remodel, new construction (whole words, any case; a water heater repair, pilot
-//               light or a faucet/toilet swap stays routine)
+//               a water heater to replace or install, tankless, repipe, main/sewer line, sewer replacement, slab leak,
+//               whole-house, remodel, new construction (whole words, any case; a water heater repair, pilot light, a
+//               faucet/toilet swap or a water heater that "was replaced" before stays routine)
 //   routine     everything else, including requests with no job details (hang-ups keep their own section)
-// "replace the old 50-gallon water heater" counts; "replace the faucet by the water heater" does not.
+// Water heater + replace/install in the same sentence: "replace the old 50-gallon water heater", "the water heater needs to be
+// replaced", "water heater leaking, wants a replacement quote". Not "replace the faucet by the water heater" (the replace word
+// before the heater must be about the heater) nor "replaced the water heater last year" / "it was replaced" (already done).
 const HEATER = '(?:(?:the|a|an|my|our|their|his|her|old|existing|broken|leaking|leaky|gas|electric|\\d+[- ]?gal(?:lon)?)\\s+){0,4}water\\s+heaters?\\b';
-const HIGH_VALUE = new RegExp(['\\btankless\\b', `\\bnew\\s+${HEATER}`,
-  `\\b(?:replace|replacing|install|installing)\\s+${HEATER}`, '\\bwater\\s+heaters?\\W+(?:replacement|replace|replacing|install|installation|installing)\\b',
+const HIGH_VALUE = new RegExp(['\\btankless\\b', `\\b(?:new|replace|replacing|replacement|install|installing)\\s+${HEATER}`,
+  '\\bwater\\s+heaters?\\b[^.;!?\\n]*?(?<!\\b(?:was|were|had|got|been)\\s+)\\b(?:replace|replaced|replacing|replacement|install|installed|installing|installation|new\\s+(?:one|unit|tank|heater))\\b',
   '\\bre-?pip(?:e|es|ed|ing)\\b', '\\bmain\\s+(?:water\\s+|sewer\\s+|drain\\s+)?lines?\\b', '\\bsewer\\s+(?:lines?|mains?|laterals?|replacement)\\b',
   '\\bslab\\s+leaks?\\b', '\\bwhole[\\s-]+(?:house|home)\\b', '\\bremodel(?:s|ed|ing)?\\b', '\\bnew\\s+construction\\b'].join('|'), 'i');
 export function priorityTier(details = {}) {
@@ -70,7 +72,7 @@ export function priorityTier(details = {}) {
   if (/^\s*big job\b/i.test(details.job_size || '') || HIGH_VALUE.test([details.job_type, details.issue, details.job_details].filter(Boolean).join(' \n '))) return 'high-value';
   return 'routine';
 }
-export const TIER_LABEL = { urgent: 'Urgent', 'high-value': 'High-value job', routine: 'Routine' };
+const TIER_LABEL = { urgent: 'Urgent', 'high-value': 'High-value job', routine: 'Routine' };
 const TIER_ORDER = ['urgent', 'high-value', 'routine'];
 
 // Lock-screen email subjects: what, where, who to call, e.g. "URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142".
@@ -97,7 +99,7 @@ export function alertSubject(details, kind = 'new') {
   const phone = formatPhone(details.callback_phone || details.caller_id) || 'no number given';
   if (kind === 'hangup') return `Caller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${SEP}call them back`;
   if (kind === 'unanswered') return subjectLine('UNANSWERED URGENT', details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
-  const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : urgent ? 'URGENT' : priorityTier(details) === 'high-value' ? 'High-value job' : 'New job';
+  const head = kind === 'note' ? (urgent ? 'URGENT update' : 'Update') : urgent ? 'URGENT' : 'New job';
   return subjectLine(head, kind === 'note' ? details.notes.at(-1) : details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
 }
 
@@ -148,9 +150,8 @@ export function alertText(route, details, kind = 'new', channel = 'sms') {
   if (kind === 'new' && details.preferred_time) lines.push(`Wants: ${details.preferred_time}`);
   // Email only: the call recording (from Vapi's end-of-call report) near the top, when the server has it.
   if (channel === 'email' && details.recording_url) lines.splice(1, 0, `Recording: ${details.recording_url}`);
-  // Priority tier right under the heading: every new job card by email; by SMS only high-value (urgent is in the heading).
-  const tier = priorityTier(details);
-  if (kind === 'new' && (channel === 'email' || tier === 'high-value')) lines.splice(1, 0, `Priority: ${TIER_LABEL[tier]}`);
+  // Email only: the priority tier right under the heading on every new job card (the SMS keeps all 280 characters for the job).
+  if (channel === 'email' && kind === 'new') lines.splice(1, 0, `Priority: ${TIER_LABEL[priorityTier(details)]}`);
   if (channel === 'email') return lines.join('\n');
   return `${gsm(lines.join('\n')).slice(0, 280)}\nReply STOP to opt out`;
 }
