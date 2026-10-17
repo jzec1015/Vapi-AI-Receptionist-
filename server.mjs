@@ -41,8 +41,14 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
 //   "No saved request yet" (NO_REQUEST)  NO_REQUEST_SAY. No job is saved, so no team call is set up (run 4); the note points
 //       to the prompt's own rules for when to save (THE PHONE NUMBER RULE, item 6, WRAPPING UP; it never restates them) and
 //       says to call the tool again only after the save, unless the detail went into the save. Never counted.
+//   NO_REQUEST after submit_service_request failed twice in a row in this call (counted in tool_failures too)
+//                                         NOT_SAVED_SAY. THE ONE RULE has already told the caller the team will call them
+//       back, so "let's get the rest of your details" would be false and a save would be a forbidden third submit: the
+//       note says to call no save tool again.
 //   an unconfirmed email                  UNCONFIRMED_SAY, then item 6's spell-back steps and a wait for the caller's yes
 //       (never a retry before they speak). Never counted.
+// The prompt's THE ONE RULE gives every note failure the trouble line, a retry and NOT_SAVED_SAY; it obeyed that over the
+// note (Oct 17), so the three uncounted notes say they replace those steps for this result (REPLACES).
 //   any other failure                     counted: the server counts this call's CONSECUTIVE counted failures of this tool
 //       (tool_failures). The first gets TROUBLE_SAY and one retry in the same reply (THE ONE RULE in
 //       templates/emma-prompt.txt); the failure right after it gets NOT_SAVED_SAY and "do not call it again". A save of that
@@ -58,16 +64,22 @@ const NO_REQUEST = 'No saved request yet; save the request first';
 const SAY_ONLY = 'Say exactly the say line and nothing else about this.';
 const NO_PROMISE = 'Never say "I\'ll note that", "I\'ll let the team know", "I\'ll pass that on", "I\'ve added that" or anything similar.';
 const NO_CLAIM = 'Other than the exact lines given here, never say the team will see, have, know or get this detail.';
-export const notSavedSay = (result = {}, failures = 1) => result.error === NO_REQUEST ? NO_REQUEST_SAY
+const REPLACES = 'This note replaces THE ONE RULE\'s steps for a failed save (trouble line, retry, closing line) for this result.';
+// submitFailed: submit_service_request has failed twice in a row in this call (only read for NO_REQUEST).
+export const notSavedSay = (result = {}, failures = 1, submitFailed = false) => result.error === NO_REQUEST ? (submitFailed ? NOT_SAVED_SAY : NO_REQUEST_SAY)
   : result.error === UNCONFIRMED_EMAIL ? UNCONFIRMED_SAY : failures === 1 ? TROUBLE_SAY : NOT_SAVED_SAY;
-export const notSavedNote = (name, result = {}, failures = 1) => `${SAY_ONLY} ` + (result.error === NO_REQUEST
-  ? 'NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: never say the ' +
+export const notSavedNote = (name, result = {}, failures = 1, submitFailed = false) => `${SAY_ONLY} ` + (result.error === NO_REQUEST && submitFailed
+  ? `${REPLACES} NOT saved: nothing was noted, added or passed on. submit_service_request already failed twice in this call and ` +
+    'you have told the caller the team will call them back, so do not call submit_service_request, add_request_note or ' +
+    'add_customer_email again.'
+  : result.error === NO_REQUEST
+  ? `${REPLACES} NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: never say the ` +
     `team will call or call back about this. Do not call ${name} again before the job is saved. ` +
     'Carry on with the call and save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP ' +
     `say to. Only after that returns saved true, call ${name} again with the same detail, unless it is already in what you ` +
     'saved.'
   : result.error === UNCONFIRMED_EMAIL
-  ? 'NOT saved: the email is not confirmed yet. Then spell the email back letter by letter, and stop and wait for the caller\'s clear yes. ' +
+  ? `${REPLACES} NOT saved: the email is not confirmed yet. Then spell the email back letter by letter, and stop and wait for the caller's clear yes. ` +
     `Only after they say yes, call ${name} again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ` +
     'again before the caller speaks. If they say it\'s wrong, ask them to spell just that part again, nice and slow, and read it back ' +
     `again, as you did before. Only if they won't or can't confirm it, say only "${NOT_SAVED_SAY}"`
@@ -76,7 +88,8 @@ export const notSavedNote = (name, result = {}, failures = 1) => `${SAY_ONLY} ` 
       `${name} once more in that same reply, before the caller speaks; never stop after the say line. If that call is not ` +
       'saved either, its result gives the next line to say.'
     : `${failures === Infinity ? 'NOT saved.' : 'NOT saved again.'} Do not call it again.`) + ` ${NO_PROMISE} ${NO_CLAIM}`;
-const withNotSavedLine = (name, result, failures) => ({ ...result, say: notSavedSay(result, failures), note: notSavedNote(name, result, failures) });
+const withNotSavedLine = (name, result, failures, submitFailed) => ({ ...result, say: notSavedSay(result, failures, submitFailed),
+  note: notSavedNote(name, result, failures, submitFailed) });
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Why a request is test traffic, or null for a live request. Test requests are stored but
@@ -703,14 +716,24 @@ export function createApp(env = process.env, send = fetch) {
       } catch { /* the in-memory run is cleared; see Known limits in NOTES.md */ }
     }
   }
+  // Length of the uncleared run of this call and tool (the in-memory run when the database cannot be read).
+  const runLength = (callId, name) => {
+    try { return db.prepare('SELECT COUNT(*) AS n FROM tool_failures WHERE call_id = ? AND name = ? AND cleared = 0').get(callId, name).n; }
+    catch { return runOf(`${callId}\n${name}`).length; }
+  };
+  // A failed submit_service_request is counted too (same table, no say line or note of its own), so "No saved request yet"
+  // after two in a row (THE ONE RULE: retry once, then the callback line) knows the caller was already told the team will
+  // call back.
   function notSavedLine(name, callId, toolCallId, result) {
     if (callId && result?.saved === true && !result.duplicate) {
       if (NOT_SAVED_TOOLS.includes(name)) clearFailures(callId, [name]);
-      else if (name === 'submit_service_request') clearFailures(callId, NOT_SAVED_TOOLS);
+      else if (name === 'submit_service_request') clearFailures(callId, [...NOT_SAVED_TOOLS, name]);
     }
+    if (name === 'submit_service_request' && callId && result?.saved === false) countFailure(callId, name, toolCallId);
     if (!NOT_SAVED_TOOLS.includes(name) || result?.saved !== false) return result;
     const uncounted = result.error === UNCONFIRMED_EMAIL || result.error === NO_REQUEST;
-    return withNotSavedLine(name, result, uncounted ? 1 : callId ? countFailure(callId, name, toolCallId) : Infinity);
+    const submitFailed = result.error === NO_REQUEST && !!callId && runLength(callId, 'submit_service_request') >= 2;
+    return withNotSavedLine(name, result, uncounted ? 1 : callId ? countFailure(callId, name, toolCallId) : Infinity, submitFailed);
   }
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
@@ -1258,7 +1281,9 @@ This records a request only. It does not confirm an appointment, dispatch, trans
   // The last value this tool saved, while the request still ends with it (current; never when a later value has no
   // tool_calls row, e.g. a note a rolled-back build added): a new call that only repeats it gets that call's stored result,
   // marked duplicate, with no new row, outbox entry or send. A send still running is joined, never redone (the outbox owns
-  // an unfinished one). gpt-4.1 re-sent a saved note on a new toolCall id after being told not to (Oct 17).
+  // an unfinished one). gpt-4.1 re-called add_request_note with the same note after being told not to (Oct 17); this stops
+  // that loop once the note is saved. It does not catch re-calls while nothing is saved (those runs re-called after
+  // saved:false / "No saved request yet": the say line and note handle them), nor a repeat of an older note (A, B, A).
   const sameText = value => String(value).trim().replace(/\s+/g, ' ').toLowerCase();
   async function repeatOfLast(name, callId, current, value) {
     const last = db.prepare(`SELECT tool_call_id, args_key, arg, result FROM tool_calls WHERE call_id = ? AND name = ?

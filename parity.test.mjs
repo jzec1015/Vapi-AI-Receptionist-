@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
-import { createApp, NOT_SAVED_SAY, NO_REQUEST_SAY, UNCONFIRMED_SAY, TROUBLE_SAY } from './server.mjs';
+import { createApp, UNCONFIRMED_SAY } from './server.mjs';
 import { createApp as createV150 } from './fixtures/server-v1.5.0.mjs';
 
 // Production on 2026-10-14 has exactly these variables (values here are fixtures): no OFFICE_EMAIL, no BOOKING_ROUTES,
@@ -75,20 +75,25 @@ const spoken = s => s.url === 'https://api.vapi.ai/call' ? JSON.parse(JSON.strin
 const noteKey = headers => headers?.['Idempotency-Key']?.includes('-alert-note-')
   ? { ...headers, 'Idempotency-Key': headers['Idempotency-Key'].replace(/-alert-note-(\d+|[0-9a-f]{32})$/, '-alert-note-<key>') } : headers;
 // The note-fail-line change adds a note and one exact say line to every saved:false add_request_note / add_customer_email
-// result (every other field unchanged); note-say-dedupe gives "No saved request yet" its own line.
+// result (every other field unchanged); note-say-dedupe picks the line per failure type. SAY_AT lists, per scenario, the
+// step index of each such result and its exact line, so a swapped line, or a failure the list misses, fails the test.
 const NOTE_TOOLS = new Set(['add_request_note', 'add_customer_email']);
-const withoutSayLine = (steps, replies) => replies.map((reply, i) => {
-  const name = steps[i].message?.toolCallList?.[0]?.function?.name;
-  if (!NOTE_TOOLS.has(name) || !reply.json.map) return reply;
-  return { ...reply, json: reply.json.map(r => {
-    if (r.saved !== false) return r;
-    // "No saved request yet" gets its own line (no job is saved, so no team call is set up); every failure has one.
-    if (r.error === 'No saved request yet; save the request first') assert.equal(r.say, NO_REQUEST_SAY);
-    else assert.ok([TROUBLE_SAY, UNCONFIRMED_SAY, NOT_SAVED_SAY].includes(r.say), r.say);
-    assert.match(r.note, /^Say exactly the say line and nothing else about this\. NOT saved/);
-    const { say, note, ...rest } = r; return rest;
-  }) };
-});
+const SAY_AT = { 'late email': { 1: UNCONFIRMED_SAY } };
+const withoutSayLine = (steps, replies, says = {}) => {
+  const seen = [];
+  const stripped = replies.map((reply, i) => {
+    const name = steps[i].message?.toolCallList?.[0]?.function?.name;
+    if (!NOTE_TOOLS.has(name) || !reply.json.map) return reply;
+    return { ...reply, json: reply.json.map(r => {
+      if (r.saved !== false) return r;
+      seen.push(String(i)); assert.equal(r.say, says[i], `step ${i}`);
+      assert.match(r.note, /^Say exactly the say line and nothing else about this\. /);
+      const { say, note, ...rest } = r; return rest;
+    }) };
+  });
+  assert.deepEqual(seen, Object.keys(says));
+  return stripped;
+};
 const shape = s => isAlert(s) ? { url: s.url, method: s.method, headers: noteKey(s.headers), to: s.body.to, from: s.body.from } : spoken(s);
 
 for (const [name, steps] of Object.entries(scenarios)) {
@@ -96,7 +101,7 @@ for (const [name, steps] of Object.entries(scenarios)) {
     const before = await run(t, createV150, steps);
     const after = await run(t, createApp, steps);
     assert.ok(name === 'test call' || before.sent.length > 0, "scenario sends something");
-    assert.deepEqual(withoutSayLine(steps, after.replies), before.replies);
+    assert.deepEqual(withoutSayLine(steps, after.replies, SAY_AT[name]), before.replies);
     assert.deepEqual(after.sent.map(callbackRule).map(shape), before.sent.map(shape));
     assert.ok(!after.sent.some(s => s.method === 'GET'), 'no Vapi call lookups without a transfer route');
   });
