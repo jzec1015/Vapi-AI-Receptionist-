@@ -413,7 +413,7 @@ test('callbackNumbers: callback_phone is the callback number only when saved wit
   assert.equal(callbackText(none), '(615) 555-0100 (caller ID)');
   assert.equal(spokenCallback(none), 'They were calling from (615) 555-0100. They didn\'t give a callback number.');
   // A blocked or empty caller ID is no caller ID.
-  for (const caller_id of ['', undefined, 'anonymous', 'Restricted', '+266696687', '+17378742833', '+86282452253', '+8656696', '+1 ']) {
+  for (const caller_id of ['', undefined, 'anonymous', 'Restricted', 'sip:anonymous@example.com', '+266696687', '+1266696687', '+17378742833', '+86282452253', '+8656696', '+10000000000', '0000000000', '+1 ']) {
     const blocked = job({ callback_phone: '', caller_id });
     assert.equal(callbackNumbers(blocked).callerId, '', String(caller_id));
     assert.equal(callbackText(blocked), 'no number given (no caller ID)');
@@ -435,7 +435,7 @@ test('the SMS and email card label every number the same way; hang-up leads keep
     [{ callback_phone: '6155550199', callback_source: 'tool' }, 'Linda Harper - (615) 555-0199 (confirmed on the call; caller ID (615) 555-0100)'],
     [{ callback_phone: '6155550100', callback_source: 'tool' }, 'Linda Harper - (615) 555-0100 (confirmed on the call)'],
     [{ callback_phone: '6155550199' }, 'Linda Harper - (615) 555-0100 (caller ID; gave (615) 555-0199, not confirmed)'],
-    [{ callback_phone: '6155550100' }, 'Linda Harper - (615) 555-0100 (caller ID)'],
+    [{ callback_phone: '6155550100' }, 'Linda Harper - (615) 555-0100 (caller ID; also the number they gave, not confirmed)'],
     [{ callback_phone: '' }, 'Linda Harper - (615) 555-0100 (caller ID)']
   ];
   for (const [extra, line] of cases) for (const kind of ['new', 'note']) for (const channel of ['sms', 'email'])
@@ -458,4 +458,34 @@ test('a saved job keeps callback_source tool only when Emma sent callback_read_b
   t.after(() => db.close());
   const source = id => JSON.parse(db.prepare('SELECT details FROM requests WHERE call_id = ?').get(id).details).callback_source;
   assert.deepEqual(Object.keys(saves).map(source), ['tool', '', '', '', '', '']);
+});
+
+test('a subject never cuts the "(not confirmed)" or "(caller ID)" label, even for a 100-character number', () => {
+  const long = '615 555 0142 or my wifes cell 615 555 0199 after five, or the shop line 615 555 0123 thanks, ok byee';
+  assert.equal(long.length, 100);
+  const job = { name: 'Dana', address: '12 Main St, Nashville, TN', issue: 'URGENT - burst pipe', notes: [], callback_phone: long };
+  for (const caller_id of ['anonymous', '', '+266696687']) {
+    for (const [kind, head] of [['new', 'URGENT – '], ['unanswered', 'UNANSWERED URGENT – ']]) {
+      const subject = alertSubject({ ...job, caller_id }, kind);
+      assert.ok(subject.length <= 90, subject);
+      assert.ok(subject.startsWith(`${head}burst pipe – 12 Main St – `), subject);
+      assert.ok(subject.endsWith(' (not confirmed)'), subject);
+      assert.equal(subject, `${head}burst pipe – 12 Main St – 615 555 0142 or my… (not confirmed)`);
+    }
+  }
+  // A long, non-US caller ID keeps its label the same way.
+  const id = alertSubject({ ...job, callback_phone: '', caller_id: '+44 20 7946 0958 0000 0000 0000 0000 0000' }, 'unanswered');
+  assert.ok(id.length <= 90 && id.startsWith('UNANSWERED URGENT – burst pipe') && id.endsWith(' (caller ID)'), id);
+  // The note subject and a confirmed number are unchanged.
+  assert.ok(alertSubject({ ...job, caller_id: '', notes: ['Gate code 4471'] }, 'note').endsWith(' (not confirmed)'));
+  assert.equal(alertSubject({ ...job, callback_phone: '6155550142', callback_source: 'tool', caller_id: '' }), 'URGENT – burst pipe – 12 Main St – (615) 555-0142');
+});
+
+test('a number they gave that equals the caller ID but was not read back is stated plainly in writing', () => {
+  const route = { business: 'Gold Star Plumbing' };
+  const job = { name: 'Linda Harper', address: '48 Birch Road', issue: 'URGENT - burst pipe', notes: [], caller_id: '+16155550100', callback_phone: '615-555-0100' };
+  assert.equal(callbackText(job), '(615) 555-0100 (caller ID; also the number they gave, not confirmed)');
+  assert.equal(spokenCallback(job), 'They were calling from (615) 555-0100. Their callback number wasn\'t confirmed, so check your email.');
+  for (const channel of ['sms', 'email']) assert.equal(alertText(route, job, 'new', channel).split('\n').find(l => l.startsWith('Linda')), 'Linda Harper - (615) 555-0100 (caller ID; also the number they gave, not confirmed)');
+  assert.equal(alertSubject(job), 'URGENT – burst pipe – 48 Birch Road – (615) 555-0100 (caller ID)');
 });

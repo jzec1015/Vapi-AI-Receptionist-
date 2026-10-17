@@ -175,7 +175,8 @@ const TIER_LABEL = { urgent: 'Urgent', 'high-value': 'High-value job', routine: 
 const TIER_ORDER = ['urgent', 'high-value', 'routine'];
 
 // Lock-screen email subjects: what, where, who to call, e.g. "URGENT – burst pipe – 1412 Dickerson Pike – (615) 555-0142".
-// At most 90 characters; the phone number is never cut, the address keeps its first part (street), the issue gets the rest.
+// At most 90 characters. The phone part comes whole (alertSubject clips any number in it to 20 characters, so the part
+// and its label are at most 36 and always fit); the address keeps its first part (street), the issue gets the rest.
 const SEP = ' \u2013 ';
 const clip = (text, n) => {
   text = String(text || '').replace(/\s+/g, ' ').trim();
@@ -202,10 +203,14 @@ export const hangupCallbackLabel = details => !details.callback_phone ? '' :
 // alert call, the warm-transfer intro, the "nobody picked up" email and the office receipt. callback_phone is the
 // confirmed callback number only with callback_source 'tool': Emma saved it through submit_service_request with
 // callback_read_back true (submit; confirmedCallback for a hang-up lead). Otherwise the office gets the caller ID, said
-// as "calling from", never as the callback number; a callback_phone that was not read back appears only in writing,
-// labelled "not confirmed". A blocked caller ID (no digits, or a carrier's Anonymous/Restricted/Unavailable/Unknown
-// placeholder number) counts as none. Each value is formatPhone'd, or ''.
-const BLOCKED_CALLER_IDS = new Set(['266696687', '7378742833', '86282452253', '8656696']);
+// as "calling from", never as the callback number. A callback_phone that was not read back is never spoken and never
+// called the callback number: in writing it carries "not confirmed" (callbackText; in the subject it is clipped to 20
+// characters so the label always survives), and when it equals the caller ID the card says so ("also the number they
+// gave, not confirmed"). A blocked caller ID counts as none: empty, under 7 digits (e.g. "anonymous", "Restricted",
+// sip:anonymous@...), or a placeholder number: the Anonymous/Restricted/Unavailable/Unknown spellings 266696687,
+// 7378742833, 86282452253, 8656696, 266696687 with a +1 in front (1266696687) and all zeros (+1 000 000 0000).
+// Each value is formatPhone'd, or ''.
+const BLOCKED_CALLER_IDS = new Set(['266696687', '1266696687', '7378742833', '86282452253', '8656696', '0000000000']);
 export function callbackNumbers(details) {
   const id = digitsOf(details.caller_id);
   const callerId = id.length >= 7 && !BLOCKED_CALLER_IDS.has(id) ? formatPhone(details.caller_id) : '';
@@ -219,7 +224,7 @@ export function callbackNumbers(details) {
 export function callbackText(details) {
   const { confirmed, callerId, unconfirmed, other } = callbackNumbers(details);
   if (confirmed) return `${confirmed} (confirmed on the call${other ? `; caller ID ${callerId}` : ''})`;
-  if (callerId) return `${callerId} (caller ID${unconfirmed && other ? `; gave ${unconfirmed}, not confirmed` : ''})`;
+  if (callerId) return `${callerId} (caller ID${!unconfirmed ? '' : other ? `; gave ${unconfirmed}, not confirmed` : '; also the number they gave, not confirmed'})`;
   return unconfirmed ? `${unconfirmed} (not confirmed; no caller ID)` : 'no number given (no caller ID)';
 }
 // Spoken form, read by the alert call (to: 'alert') or the warm-transfer intro (to: 'transfer'). formatPhone keeps the
@@ -236,7 +241,7 @@ export function alertSubject(details, kind = 'new') {
   const urgent = isUrgent(details.issue);
   const numbers = callbackNumbers(details);
   const phone = kind === 'hangup' ? formatPhone(details.callback_phone || details.caller_id) || 'no number given'
-    : numbers.confirmed || (numbers.callerId ? `${numbers.callerId} (caller ID)` : numbers.unconfirmed ? `${numbers.unconfirmed} (not confirmed)` : 'no number given');
+    : numbers.confirmed || (numbers.callerId ? `${clip(numbers.callerId, 20)} (caller ID)` : numbers.unconfirmed ? `${clip(numbers.unconfirmed, 20)} (not confirmed)` : 'no number given');
   const unverified = details.callback_phone && details.callback_source !== 'tool' ? ' (not verified)' : '';
   if (kind === 'hangup') return `Caller hung up${details.greeting_hangup ? ' during greeting' : ''}${SEP}${phone}${unverified}${SEP}call them back`;
   if (kind === 'unanswered') return subjectLine('UNANSWERED URGENT', details.issue.replace(/^\s*URGENT\s*-\s*/i, ''), details.address, phone);
