@@ -34,9 +34,10 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
   : r?.booked === false ? `not_booked_${logSafe(r.status)}` : r?.error ? 'refused' : 'ok';
 // add_request_note and add_customer_email results that saved nothing carry a note with what to do and what not to say.
 // Without it gpt-4.1 sometimes improvises a false promise ("I'll note that...", "I'll let the team know..."). Every existing
-// field is kept. Two errors are never counted and always get the same note: "No saved request yet" (NO_REQUEST) gets the
-// save-the-job-first steps (THE PHONE NUMBER RULE's read-back and clear yes before the save, then the same call again) and
-// NO say line, because with no job saved no team call is set up (run 4); an unconfirmed email waits for the caller's yes
+// field is kept. Two errors are never counted and always get the same note: "No saved request yet" (NO_REQUEST) gets NO say
+// line, because with no job saved no team call is set up (run 4), and a note that points to the prompt's own rules for
+// when to save (THE PHONE NUMBER RULE, item 6, WRAPPING UP; it never restates them) and says to call the tool again only
+// after the save, unless the detail went into the save; an unconfirmed email waits for the caller's yes
 // (never a retry before they speak; item 6's re-spell steps if they say it's wrong) and has the say line. Every other
 // failure has the say line, and the server counts this call's CONSECUTIVE counted failures of this tool (tool_failures):
 // the first follows THE ONE RULE in templates/emma-prompt.txt (trouble line, one retry in the same reply, then the say
@@ -50,11 +51,10 @@ const NO_REQUEST = 'No saved request yet; save the request first';
 const NO_PROMISE = 'Never say "I\'ll note that", "I\'ll let the team know", "I\'ll pass that on", "I\'ve added that" or anything similar.';
 export const notSavedNote = (name, result = {}, failures = 1) => result.error === NO_REQUEST
   ? 'NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: never say the ' +
-    'team will call or call back about this, or that they will have it. Save the job first with submit_service_request, ' +
-    'following THE PHONE NUMBER RULE: never save until you have read the whole callback number back and the caller has ' +
-    'clearly said yes (unless they refused to give a number); if you have not, your next reply is only the read-back ' +
-    `question, then stop and wait for their answer. Only after submit_service_request returns saved true, call ${name} ` +
-    `again with the same detail. ${NO_PROMISE}`
+    `team will call or call back about this, or that they will have it. Do not call ${name} again before the job is saved. ` +
+    'Carry on with the call and save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP ' +
+    `say to. Only after that returns saved true, call ${name} again with the same detail, unless it is already in what you ` +
+    `saved. ${NO_PROMISE}`
   : result.error === UNCONFIRMED_EMAIL
   ? 'NOT saved: the email is not confirmed yet. Spell the email back letter by letter, then stop and wait for the caller\'s clear yes. ' +
     `Only after they say yes, call ${name} again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ` +

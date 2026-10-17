@@ -719,8 +719,9 @@ test('a 7am digest send that hangs never delays a held urgent ring: it goes on t
   assert.equal(hung, control, `with the digest send hanging the ring went at ${hung} ms instead of ${control} ms`);
 });
 
-// Every saved:false result of add_request_note / add_customer_email carries the line to speak (say) and a note that it was
-// not saved, so gpt-4.1 does not improvise "I'll note that..." or "I'll let the team know...". The fields already there stay.
+// Every saved:false result of add_request_note / add_customer_email carries a note that it was not saved, and all but "No
+// saved request yet" carry the line to speak (say), so gpt-4.1 does not improvise "I'll note that..." or "I'll let the team
+// know...". The fields already there stay.
 // The server counts consecutive failures per call and tool: the first gets one retry (THE ONE RULE), the next "do not call it
 // again". A save of that tool, or the first save of the request, starts the count again. "No saved request yet" is never
 // counted and has no say line (no job is saved, so no team call is set up): it always gets the save-the-job-first note.
@@ -731,11 +732,10 @@ const retryNote = name => 'NOT saved: nothing was noted, added or passed on. Say
   `If it still isn't saved, say only the say line. ${NEVER}`;
 const NO_REQUEST = 'No saved request yet; save the request first';
 const nojobNote = name => 'NOT saved: nothing was noted, added or passed on. There is no saved job yet, so no team call is set up: never say the ' +
-  'team will call or call back about this, or that they will have it. Save the job first with submit_service_request, ' +
-  'following THE PHONE NUMBER RULE: never save until you have read the whole callback number back and the caller has ' +
-  'clearly said yes (unless they refused to give a number); if you have not, your next reply is only the read-back ' +
-  `question, then stop and wait for their answer. Only after submit_service_request returns saved true, call ${name} ` +
-  `again with the same detail. ${NEVER}`;
+  `team will call or call back about this, or that they will have it. Do not call ${name} again before the job is saved. ` +
+  'Carry on with the call and save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP ' +
+  `say to. Only after that returns saved true, call ${name} again with the same detail, unless it is already in what you ` +
+  `saved. ${NEVER}`;
 const stopNote = `NOT saved again. Do not call it again. Say only the say line. ${NEVER}`;
 const noIdNote = `NOT saved. Do not call it again. Say only the say line. ${NEVER}`;
 const confirmNote = 'NOT saved: the email is not confirmed yet. Spell the email back letter by letter, then stop and wait for the caller\'s clear yes. ' +
@@ -759,7 +759,7 @@ const noCall = (name, args) => ({ message: { type: 'tool-calls', toolCallList: [
 const failTrigger = (dir, table) => { const db = new DatabaseSync(join(dir, 'requests.sqlite'));
   try { db.exec(`CREATE TRIGGER fail_${table} BEFORE INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'disk full'); END`); } finally { db.close(); } };
 
-test('every saved:false add_request_note path gets the say line and, as its first failure in the call, the retry note', async t => {
+test('every saved:false add_request_note path gets its note: no job yet the no-job note with no say line, any other the say line and, as its first failure in the call, the retry note', async t => {
   const { post, dir, saved, sms } = await fixture(t);
   const N = 'add_request_note';
   const fresh = async id => { await post(toolCall(id, 'submit_service_request', intake, 'tc-submit')); return id; };
@@ -778,7 +778,7 @@ test('every saved:false add_request_note path gets the say line and, as its firs
   assert.deepEqual(saved('zn-6').notes, ['Gate 1']); assert.deepEqual(saved('zn-7'), before); assert.equal(sms().length, smsBefore);
 });
 
-test('every saved:false add_customer_email path gets the say line and, as its first failure in the call, the retry note', async t => {
+test('every saved:false add_customer_email path gets its note: no job yet the no-job note with no say line, any other the say line and, as its first failure in the call, the retry note', async t => {
   const { post, dir, saved, emails } = await fixture(t);
   const E = 'add_customer_email';
   const fresh = async id => { await post(toolCall(id, 'submit_service_request', intake, 'tc-submit')); return id; };
@@ -931,8 +931,12 @@ test('a re-sent toolCall id (lost response) is not counted again and gets the no
 test('when the database cannot record a failure, the in-memory count still stops the second retry and is cleared by a save', async t => {
   const { post, dir } = await fixture(t);
   const N = 'add_request_note';
-  await post(toolCall('zm-1', 'submit_service_request', intake, 'tc-submit'));
   failTrigger(dir, 'tool_failures');
+  // Unreadable arguments fail before the request is looked up, so they are counted even before the save; the first save of
+  // the request clears that in-memory run.
+  notSaved(await post(toolCall('zm-1', N, '{bad', 'tc-0')), N, 'Unable to add note', 'first');
+  notSaved(await post(toolCall('zm-1', N, '{bad', 'tc-0b')), N, 'Unable to add note', 'again');
+  await post(toolCall('zm-1', 'submit_service_request', intake, 'tc-submit'));
   notSaved(await post(note('zm-1', '', 'tc-1')), N, 'Missing or invalid note', 'first');
   notSaved(await post(note('zm-1', '', 'tc-1')), N, 'Missing or invalid note', 'first');
   notSaved(await post(note('zm-1', '', 'tc-2')), N, 'Missing or invalid note', 'again');
@@ -977,6 +981,9 @@ test('the not-saved note text: retryable is never consulted; the count picks ret
   for (const name of ['add_request_note', 'add_customer_email'])
     for (const failures of [1, 2, Infinity]) assert.equal(notSavedNote(name, { saved: false, retryable: false, error: NO_REQUEST }, failures), nojobNote(name));
   assert.doesNotMatch(nojobNote('x'), /when the team calls|so they have it|Do not call it again/);
-  assert.match(nojobNote('x'), /THE PHONE NUMBER RULE: never save until you have read the whole callback number back and the caller has clearly said yes/);
+  // It points to the prompt's rules for when to save and never restates them (main and emma-social-1017 differ: the
+  // social fallback for a number that can't be confirmed, the address read-back), and never says to save right away.
+  assert.match(nojobNote('x'), /save with submit_service_request at the point THE PHONE NUMBER RULE, item 6 and WRAPPING UP say to\./);
+  assert.doesNotMatch(nojobNote('x'), /read-back|read back|save the job first|right away|callback number/i);
   assert.doesNotMatch(retryNote('x'), /what error says/);
 });
