@@ -721,67 +721,109 @@ test('a 7am digest send that hangs never delays a held urgent ring: it goes on t
 
 // Every saved:false result of add_request_note / add_customer_email carries the line to speak (say) and a note that it was
 // not saved, so gpt-4.1 does not improvise "I'll note that..." or "I'll let the team know...". The fields already there stay.
+// The server counts failures per call and tool: the first gets one retry (THE ONE RULE), later ones "do not call it again".
 const UNCONFIRMED = 'Not added: spell the email back letter by letter and get a clear yes first.';
-const retryNote = name => 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what error ' +
-  `says if it tells you how, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
-  `If it still isn't saved, say only the say line. Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`;
-const notSaved = (result, name, error) => {
+const NEVER = `Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar.`;
+const retryNote = name => 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what the error ' +
+  `says if it tells you, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
+  `If it still isn't saved, say only the say line. ${NEVER}`;
+const stopNote = `NOT saved again. Do not call it again. Say only the say line. ${NEVER}`;
+const confirmNote = 'NOT saved: the email is not confirmed yet. Spell the email back letter by letter, then stop and wait for the caller\'s clear yes. ' +
+  'Only after they say yes, call add_customer_email again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ' +
+  'again before the caller speaks. If they say it\'s wrong, ask them to spell just that part again, nice and slow, and read it back again, as you did ' +
+  `before. Only if they won't or can't confirm it, say only the say line. ${NEVER}`;
+// kind: 'first' (retry note), 'again' (no-retry note), or 'confirm' (unconfirmed email).
+const notSaved = (result, name, error, kind = 'first') => {
   assert.equal(result.saved, false); assert.equal(result.retryable, false); assert.equal(result.error, error);
   assert.equal(result.say, NOT_SAVED_SAY); assert.equal(result.say, 'Mention that when the team calls you, so they have it.');
-  if (error === UNCONFIRMED) {
-    assert.match(result.note, /^NOT saved: the email is not confirmed yet\. Spell the email back letter by letter, then stop and wait for the caller's clear yes\./);
-    assert.match(result.note, /call add_customer_email again with confirmed_after_spelling_back true\. Never set it true without that yes, and never call again before the caller speaks\./);
-    assert.match(result.note, /If they don't confirm it, say only the say line\./);
-    assert.doesNotMatch(result.note, /trouble|once more|same reply/);
-  } else {
-    // THE ONE RULE: trouble line, one retry in that same reply, then only the say line (retryable is not consulted).
-    assert.equal(result.note, retryNote(name));
-  }
-  assert.match(result.note, /Never say "I'll note that", "I'll let the team know", "I'll pass that on", "I've added that" or anything similar\.$/);
+  assert.equal(result.note, { first: retryNote(name), again: stopNote, confirm: confirmNote }[kind]);
   assert.deepEqual(Object.keys(result), ['saved', 'retryable', 'error', 'say', 'note']);
 };
 const noCall = (name, args) => ({ message: { type: 'tool-calls', toolCallList: [{ id: 'tc-x', function: { name, arguments: args } }] } });
 const failTrigger = (dir, table) => { const db = new DatabaseSync(join(dir, 'requests.sqlite'));
   try { db.exec(`CREATE TRIGGER fail_${table} BEFORE INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'disk full'); END`); } finally { db.close(); } };
 
-test('every saved:false add_request_note result carries the say line and the not-saved note', async t => {
+test('every saved:false add_request_note path gets the say line and, as its first failure in the call, the retry note', async t => {
   const { post, dir, saved, sms } = await fixture(t);
   const N = 'add_request_note';
-  notSaved(await post(noCall(N, { note: 'Gate code 1' })), N, 'Missing Vapi call, chat or session ID');
-  notSaved(await post(note('z-1', 'Gate code 1', 'tc-1')), N, 'No saved request yet; save the request first');
-  // A retry of a refused call is refused again, with the same line (nothing was stored for it).
-  notSaved(await post(note('z-1', 'Gate code 1', 'tc-1')), N, 'No saved request yet; save the request first');
-  await post(toolCall('z-1', 'submit_service_request', intake, 'tc-submit'));
-  notSaved(await post(note('z-1', '   ', 'tc-2')), N, 'Missing or invalid note');
-  notSaved(await post(note('z-1', 'x'.repeat(1001), 'tc-3')), N, 'Missing or invalid note');
-  notSaved(await post(toolCall('z-1', N, {}, 'tc-4')), N, 'Missing or invalid note');
-  notSaved(await post(toolCall('z-1', N, '{not json', 'tc-5')), N, 'Unable to add note');
-  assert.equal((await post(note('z-1', 'Gate 1', 'same'))).note_added, true);
-  notSaved(await post(note('z-1', 'Gate 2', 'same')), N, 'Not added: this tool call was already used for a different note. Call add_request_note again.');
-  const smsBefore = sms().length;
+  const fresh = async id => { await post(toolCall(id, 'submit_service_request', intake, 'tc-submit')); return id; };
+  // No call id: nothing to count by and a retry cannot fix it, so straight to the say line.
+  notSaved(await post(noCall(N, { note: 'Gate code 1' })), N, 'Missing Vapi call, chat or session ID', 'again');
+  notSaved(await post(note('zn-1', 'Gate code 1', 'tc-1')), N, 'No saved request yet; save the request first');
+  notSaved(await post(note(await fresh('zn-2'), '   ', 'tc-2')), N, 'Missing or invalid note');
+  notSaved(await post(note(await fresh('zn-3'), 'x'.repeat(1001), 'tc-3')), N, 'Missing or invalid note');
+  notSaved(await post(toolCall(await fresh('zn-4'), N, {}, 'tc-4')), N, 'Missing or invalid note');
+  notSaved(await post(toolCall(await fresh('zn-5'), N, '{not json', 'tc-5')), N, 'Unable to add note');
+  assert.equal((await post(note(await fresh('zn-6'), 'Gate 1', 'same'))).note_added, true);
+  notSaved(await post(note('zn-6', 'Gate 2', 'same')), N, 'Not added: this tool call was already used for a different note. Call add_request_note again.');
+  const before = saved(await fresh('zn-7')), smsBefore = sms().length;
   failTrigger(dir, 'tool_calls');
-  notSaved(await post(note('z-1', 'Back door code 9', 'tc-6')), N, 'Unable to add note');
-  assert.deepEqual(saved('z-1').notes, ['Gate 1']); assert.equal(sms().length, smsBefore);
+  notSaved(await post(note('zn-7', 'Back door code 9', 'tc-7')), N, 'Unable to add note');
+  assert.deepEqual(saved('zn-6').notes, ['Gate 1']); assert.deepEqual(saved('zn-7'), before); assert.equal(sms().length, smsBefore);
 });
 
-test('every saved:false add_customer_email result carries the say line and the not-saved note', async t => {
+test('every saved:false add_customer_email path gets the say line and, as its first failure in the call, the retry note', async t => {
   const { post, dir, saved, emails } = await fixture(t);
   const E = 'add_customer_email';
-  notSaved(await post(noCall(E, { email: 'a@example.org', confirmed_after_spelling_back: true })), E, 'Missing Vapi call, chat or session ID');
-  notSaved(await post(email('z-2', 'a@example.org', 'tc-1')), E, 'No saved request yet; save the request first');
-  await post(toolCall('z-2', 'submit_service_request', intake, 'tc-submit'));
-  notSaved(await post(toolCall('z-2', E, { email: 'a@example.org', confirmed_after_spelling_back: false }, 'tc-2')), E,
-    'Not added: spell the email back letter by letter and get a clear yes first.');
-  notSaved(await post(toolCall('z-2', E, { email: 'a@example.org' }, 'tc-3')), E, 'Not added: spell the email back letter by letter and get a clear yes first.');
-  notSaved(await post(email('z-2', 'not-an-email', 'tc-4')), E, 'Invalid email');
-  notSaved(await post(email('z-2', `${'a'.repeat(250)}@example.org`, 'tc-5')), E, 'Invalid email');
-  notSaved(await post(toolCall('z-2', E, '{not json', 'tc-6')), E, 'Unable to add email');
-  assert.equal((await post(email('z-2', 'a@example.org', 'same'))).caller_email, 'accepted');
-  notSaved(await post(email('z-2', 'b@example.org', 'same')), E, 'Not added: this tool call was already used for a different email. Call add_customer_email again.');
-  const emailsBefore = emails().length;
+  const fresh = async id => { await post(toolCall(id, 'submit_service_request', intake, 'tc-submit')); return id; };
+  notSaved(await post(noCall(E, { email: 'a@example.org', confirmed_after_spelling_back: true })), E, 'Missing Vapi call, chat or session ID', 'again');
+  notSaved(await post(email('ze-1', 'a@example.org', 'tc-1')), E, 'No saved request yet; save the request first');
+  notSaved(await post(email(await fresh('ze-2'), 'not-an-email', 'tc-2')), E, 'Invalid email');
+  notSaved(await post(email(await fresh('ze-3'), `${'a'.repeat(250)}@example.org`, 'tc-3')), E, 'Invalid email');
+  notSaved(await post(toolCall(await fresh('ze-4'), E, '{not json', 'tc-4')), E, 'Unable to add email');
+  assert.equal((await post(email(await fresh('ze-5'), 'a@example.org', 'same'))).caller_email, 'accepted');
+  notSaved(await post(email('ze-5', 'b@example.org', 'same')), E, 'Not added: this tool call was already used for a different email. Call add_customer_email again.');
+  const before = saved(await fresh('ze-6')), emailsBefore = emails().length;
   failTrigger(dir, 'tool_calls');
-  notSaved(await post(email('z-2', 'c@example.org', 'tc-7')), E, 'Unable to add email');
-  assert.equal(saved('z-2').email, 'a@example.org'); assert.equal(emails().length, emailsBefore);
+  notSaved(await post(email('ze-6', 'c@example.org', 'tc-6')), E, 'Unable to add email');
+  assert.equal(saved('ze-5').email, 'a@example.org'); assert.deepEqual(saved('ze-6'), before); assert.equal(emails().length, emailsBefore);
+});
+
+test('an unconfirmed email always gets the wait-for-yes note (with the re-spell steps) and is not counted as a failure', async t => {
+  const { post } = await fixture(t);
+  const E = 'add_customer_email';
+  await post(toolCall('zc-1', 'submit_service_request', intake, 'tc-submit'));
+  notSaved(await post(toolCall('zc-1', E, { email: 'a@example.org', confirmed_after_spelling_back: false }, 'tc-1')), E, UNCONFIRMED, 'confirm');
+  notSaved(await post(toolCall('zc-1', E, { email: 'a@example.org' }, 'tc-2')), E, UNCONFIRMED, 'confirm');
+  notSaved(await post(toolCall('zc-1', E, { email: 'a@example.org', confirmed_after_spelling_back: 'true' }, 'tc-3')), E, UNCONFIRMED, 'confirm');
+  // Three unconfirmed tries did not use up the one retry: the first real failure still gets the retry note.
+  notSaved(await post(email('zc-1', 'nope', 'tc-4')), E, 'Invalid email', 'first');
+  notSaved(await post(email('zc-1', 'nope', 'tc-5')), E, 'Invalid email', 'again');
+  notSaved(await post(toolCall('zc-1', E, { email: 'a@example.org', confirmed_after_spelling_back: false }, 'tc-6')), E, UNCONFIRMED, 'confirm');
+  assert.match(confirmNote, /If they say it's wrong, ask them to spell just that part again, nice and slow, and read it back again/);
+  assert.doesNotMatch(confirmNote, /trouble|once more|same reply/);
+});
+
+test('the server counts failures per call and tool: first gets the retry note, later ones "do not call it again", even after a restart', async t => {
+  const dir = tempDir(t);
+  const N = 'add_request_note', E = 'add_customer_email';
+  const first = await fixture(t, { dir });
+  notSaved(await first.post(note('zk-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await first.post(note('zk-1', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'again');
+  notSaved(await first.post(note('zk-1', 'Gate 1', 'tc-2')), N, 'No saved request yet; save the request first', 'again');
+  // Another tool in the same call, and the same tool in another call, have their own counts.
+  notSaved(await first.post(email('zk-1', 'a@example.org', 'tc-3')), E, 'No saved request yet; save the request first', 'first');
+  notSaved(await first.post(note('zk-2', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  await first.stop();
+  const second = await fixture(t, { dir });
+  notSaved(await second.post(email('zk-1', 'a@example.org', 'tc-3')), E, 'No saved request yet; save the request first', 'again');
+  notSaved(await second.post(note('zk-2', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'again');
+  notSaved(await second.post(note('zk-3', 'Gate 1', 'tc-1')), N, 'No saved request yet; save the request first', 'first');
+  // A success in between does not reset the count, and saved:true results are never touched.
+  await second.post(toolCall('zk-2', 'submit_service_request', intake, 'tc-submit'));
+  assert.equal((await second.post(note('zk-2', 'Gate 1', 'tc-9'))).note_added, true);
+  notSaved(await second.post(note('zk-2', '', 'tc-10')), N, 'Missing or invalid note', 'again');
+  // Chat sessions are counted too.
+  const chat = { message: { type: 'tool-calls', chat: { id: 'c-1' }, toolCallList: [{ id: 't', function: { name: N, arguments: { note: 'x' } } }] } };
+  notSaved(await second.post(chat), N, 'No saved request yet; save the request first', 'first');
+  notSaved(await second.post(chat), N, 'No saved request yet; save the request first', 'again');
+});
+
+test('when the database cannot record a failure, the in-memory count still stops the second retry', async t => {
+  const { post, dir } = await fixture(t);
+  failTrigger(dir, 'tool_failures');
+  notSaved(await post(note('zm-1', 'Gate 1', 'tc-1')), 'add_request_note', 'No saved request yet; save the request first', 'first');
+  notSaved(await post(note('zm-1', 'Gate 1', 'tc-1')), 'add_request_note', 'No saved request yet; save the request first', 'again');
 });
 
 test('saved:true note and email results, and their duplicates, are unchanged: no say or note fields', async t => {
@@ -808,11 +850,12 @@ test('submit_service_request and other tools never get the note/email say line',
   assert.equal(unknown.saved, false); assert.equal(unknown.say, undefined); assert.equal(unknown.note, undefined);
 });
 
-test('the not-saved note: an unconfirmed email waits for the yes; every other failure retries once in the same reply, whatever retryable says', () => {
+test('the not-saved note text: retryable is never consulted; the count picks retry or stop', () => {
   for (const name of ['add_request_note', 'add_customer_email'])
-    for (const result of [{ saved: false, retryable: true, error: 'Unable to add note' }, { saved: false, retryable: false, error: 'Unable to add note' }, { saved: false, error: 'x' }])
-      assert.equal(notSavedNote(name, result), retryNote(name));
-  const unconfirmed = notSavedNote('add_customer_email', { saved: false, retryable: false, error: UNCONFIRMED });
-  assert.match(unconfirmed, /wait for the caller's clear yes/); assert.match(unconfirmed, /never call again before the caller speaks/);
-  assert.doesNotMatch(unconfirmed, /once more|same reply|trouble/);
+    for (const result of [{ saved: false, retryable: true, error: 'Unable to add note' }, { saved: false, retryable: false, error: 'Unable to add note' }, { saved: false, error: 'x' }]) {
+      assert.equal(notSavedNote(name, result), retryNote(name)); assert.equal(notSavedNote(name, result, 1), retryNote(name));
+      assert.equal(notSavedNote(name, result, 2), stopNote); assert.equal(notSavedNote(name, result, Infinity), stopNote);
+    }
+  assert.equal(notSavedNote('add_customer_email', { saved: false, retryable: false, error: UNCONFIRMED }, 5), confirmNote);
+  assert.doesNotMatch(retryNote('x'), /what error says/);
 });

@@ -34,21 +34,25 @@ const toolOutcome = r => r?.duplicate ? 'duplicate' : r && Object.values(r).incl
   : r?.booked === false ? `not_booked_${logSafe(r.status)}` : r?.error ? 'refused' : 'ok';
 // add_request_note and add_customer_email results that saved nothing carry the exact words to speak. Without them gpt-4.1
 // sometimes improvises a false promise ("I'll note that you prefer...", "I'll let the team know..."). Every existing field is
-// kept. note: an unconfirmed email waits for the caller's yes (never a retry before they speak); every other error follows
-// THE ONE RULE in templates/emma-prompt.txt (trouble line, one retry in the same reply, then the say line), whatever retryable says.
+// kept. note: an unconfirmed email waits for the caller's yes (never a retry before they speak; item 6's re-spell steps if
+// they say it's wrong). Otherwise the server counts this call's failures of this tool (tool_failures): the first follows THE
+// ONE RULE in templates/emma-prompt.txt (trouble line, one retry in the same reply, then the say line); a second or later
+// failure, or a body with no call id (nothing to count by, and a retry cannot fix it), gets "do not call it again".
 export const NOT_SAVED_SAY = 'Mention that when the team calls you, so they have it.';
 const NOT_SAVED_TOOLS = ['add_request_note', 'add_customer_email'];
 const UNCONFIRMED_EMAIL = 'Not added: spell the email back letter by letter and get a clear yes first.';
 const NO_PROMISE = 'Never say "I\'ll note that", "I\'ll let the team know", "I\'ll pass that on", "I\'ve added that" or anything similar.';
-export const notSavedNote = (name, result = {}) => result.error === UNCONFIRMED_EMAIL
+export const notSavedNote = (name, result = {}, failures = 1) => result.error === UNCONFIRMED_EMAIL
   ? 'NOT saved: the email is not confirmed yet. Spell the email back letter by letter, then stop and wait for the caller\'s clear yes. ' +
     `Only after they say yes, call ${name} again with confirmed_after_spelling_back true. Never set it true without that yes, and never call ` +
-    `again before the caller speaks. If they don't confirm it, say only the say line. ${NO_PROMISE}`
-  : 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what error says if it ' +
-    `tells you how, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
-    `If it still isn't saved, say only the say line. ${NO_PROMISE}`;
-const withNotSavedLine = (name, result) => NOT_SAVED_TOOLS.includes(name) && result?.saved === false
-  ? { ...result, say: NOT_SAVED_SAY, note: notSavedNote(name, result) } : result;
+    'again before the caller speaks. If they say it\'s wrong, ask them to spell just that part again, nice and slow, and read it back ' +
+    `again, as you did before. Only if they won't or can't confirm it, say only the say line. ${NO_PROMISE}`
+  : failures === 1
+    ? 'NOT saved: nothing was noted, added or passed on. Say "I\'m having trouble saving that, one moment.", fix what the error says if it ' +
+      `tells you, and call ${name} once more in that same reply, before the caller speaks; never stop after the trouble line. ` +
+      `If it still isn't saved, say only the say line. ${NO_PROMISE}`
+    : `NOT saved again. Do not call it again. Say only the say line. ${NO_PROMISE}`;
+const withNotSavedLine = (name, result, failures) => ({ ...result, say: NOT_SAVED_SAY, note: notSavedNote(name, result, failures) });
 const listOf = value => String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 
 // Why a request is test traffic, or null for a live request. Test requests are stored but
@@ -523,6 +527,11 @@ export function createApp(env = process.env, send = fetch) {
       CREATE TABLE IF NOT EXISTS outbox (
         ref TEXT PRIMARY KEY, kind TEXT NOT NULL, call_id TEXT NOT NULL, tool_call_id TEXT, args_key TEXT, created_at INTEGER NOT NULL,
         due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, gave_up TEXT
+      );
+      -- note-fail-line (new table only; older builds ignore it): saved:false results of add_request_note /
+      -- add_customer_email per call and tool, so the second failure in a call tells Emma not to call it again.
+      CREATE TABLE IF NOT EXISTS tool_failures (
+        call_id TEXT NOT NULL, name TEXT NOT NULL, failures INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (call_id, name)
       );`);
     upgradeRetryTables(db);
     // v1.7: trial clients live in their own new tables (clients, client_calls; see migrateClients in trial.mjs).
@@ -611,6 +620,24 @@ export function createApp(env = process.env, send = fetch) {
     return expected.length >= 32 && supplied.length === expected.length && timingSafeEqual(supplied, expected);
   };
   const failure = (error, retryable = false) => ({ saved: false, retryable, error });
+  // How many saved:false results this call has had from this tool, this one included (unconfirmed emails are not counted:
+  // the fix for those waits for the caller). Stored in tool_failures so a restart keeps the count; the in-memory map
+  // covers a database that cannot be written (a storage error), and the larger of the two counts is used.
+  const failCounts = new Map();
+  function countFailure(callId, name) {
+    const slot = `${callId}\n${name}`, mem = (failCounts.get(slot) || 0) + 1;
+    failCounts.delete(slot); failCounts.set(slot, mem);
+    if (failCounts.size > 5000) failCounts.delete(failCounts.keys().next().value);
+    let stored = 0;
+    try {
+      stored = db.prepare(`INSERT INTO tool_failures (call_id, name, failures, updated_at) VALUES (?, ?, 1, ?)
+        ON CONFLICT (call_id, name) DO UPDATE SET failures = failures + 1, updated_at = excluded.updated_at RETURNING failures`)
+        .get(callId, name, new Date().toISOString()).failures;
+    } catch { /* no database, or it cannot be written: the in-memory count stands */ }
+    return Math.max(mem, stored);
+  }
+  const notSavedLine = (name, callId, result) => !NOT_SAVED_TOOLS.includes(name) || result?.saved !== false ? result
+    : withNotSavedLine(name, result, result.error === UNCONFIRMED_EMAIL ? 1 : callId ? countFailure(callId, name) : Infinity);
   // Self-serve trials: /trial/*, /admin/trials, assistant-request answers and the hourly trial sweep.
   const trials = createTrials({ env, send, db: trialsEnabled ? db : null, key, officeNotice, testReason, routes });
   // Delivery ledger: a channel that went out is never sent again; one that failed, or was cut off by a restart (still
@@ -1510,7 +1537,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
             result = saved ? JSON.parse(saved.result) : failure('Unable to process request');
           }
         }
-        result = withNotSavedLine(name, result);
+        result = notSavedLine(name, callId, result);
         results.push({ toolCallId: tool.id, result: JSON.stringify(result) });
         // Operational log only: tool, IDs, outcome and time, never arguments or caller details.
         console.log(`tool-call name=${logSafe(name)} call=${logSafe(callId)} tool_call=${logSafe(tool.id)} outcome=${toolOutcome(result)} ms=${Date.now() - started}`);
