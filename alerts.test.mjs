@@ -489,3 +489,16 @@ test('a number they gave that equals the caller ID but was not read back is stat
   for (const channel of ['sms', 'email']) assert.equal(alertText(route, job, 'new', channel).split('\n').find(l => l.startsWith('Linda')), 'Linda Harper - (615) 555-0100 (caller ID; also the number they gave, not confirmed)');
   assert.equal(alertSubject(job), 'URGENT – burst pipe – 48 Birch Road – (615) 555-0100 (caller ID)');
 });
+
+test('"callerEmail": false never emails the caller, and the office alert still goes out', async t => {
+  const demo = JSON.stringify({ 'client-a': { business: 'Anchorline Demo', sms: [], email: ['office@example.com'], callerEmail: false } });
+  const { post, sent } = await fixture(t, { ALERT_ROUTES: demo });
+  const saved = await result(await post(toolCall('demo-1', 'submit_service_request', { ...intake, email: 'linda@example.com', email_confirmed: true })));
+  assert.equal(saved.saved, true); assert.equal(saved.caller_email, 'off_for_route'); assert.equal(saved.office_alert, 'sent');
+  await post(toolCall('demo-2', 'submit_service_request', intake));
+  const added = await result(await post(toolCall('demo-2', 'add_customer_email', { email: 'linda@example.com', confirmed_after_spelling_back: true })));
+  assert.equal(added.email_added, true); assert.equal(added.caller_email, 'off_for_route');
+  const mails = sent.filter(s => s.url.includes('resend'));
+  assert.equal(mails.filter(s => s.body.to.includes('linda@example.com')).length, 0);
+  assert.ok(mails.some(s => s.body.to.includes('office@example.com')));
+});

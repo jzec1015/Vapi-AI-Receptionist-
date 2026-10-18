@@ -512,6 +512,8 @@ export function createApp(env = process.env, send = fetch) {
   // "backup": "+1..." (E.164) is rung when the urgent alert call is not answered; the "call" numbers are then rung once more
   // about 5 minutes after the first ring, and "email" gets an "UNANSWERED URGENT – ..." email (see escalate).
   // "digest": false turns off the 7am (America/Chicago) daily digest to "email"; "digest": ["..."] adds recipients to it.
+  // "callerEmail": false never emails the caller a confirmation (the website demo line: no team will be in touch);
+  // caller_email is then 'off_for_route'. The office alerts are unchanged.
   let routes = {};
   try { routes = JSON.parse(env.ALERT_ROUTES || '{}') || {}; } catch { routes = {}; }
   // The route for an assistant: an ALERT_ROUTES entry wins; otherwise an active trial client row (SMS stays off
@@ -752,6 +754,7 @@ export function createApp(env = process.env, send = fetch) {
   };
   async function receipt(to, details, id, recipient, route = null, idempotencyKey = `${id}-${recipient}`) {
     if (!to) return 'not_requested';
+    if (recipient === 'caller' && route?.callerEmail === false) return 'off_for_route';
     if (!env.RESEND_API_KEY || !env.EMAIL_FROM) return 'needs_review';
     const branded = recipient === 'caller' && route?.business;
     const message = branded ? confirmationEmail(route, details, id) : { subject: 'Anchorline service request received',
@@ -1310,7 +1313,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     if (last) return last;
     details.email = email;
     return saveTool(name, callId, toolCallId, argsKey, email, assistantId, details,
-      { saved: true, request_id: row.id, email_added: true, caller_email: details.is_test ? 'suppressed_test' : 'pending' });
+      { saved: true, request_id: row.id, email_added: true, caller_email: details.is_test ? 'suppressed_test' : routeOf(assistantId)?.callerEmail === false ? 'off_for_route' : 'pending' });
   }
   // The outbox gave up on a note alert that reached no channel (5 passes failed, or the row went stale after a crash loop
   // of over an hour): Anchorline (OFFICE_EMAIL) is told once, in the office_retries style, retried every minute until
@@ -1492,7 +1495,7 @@ This records a request only. It does not confirm an appointment, dispatch, trans
     // Urgent job with an owner's cell on the route: offer a live transfer and hold the spoken alert call for its outcome.
     const transfer = canTransfer(routeFor(message), details);
     const result = { saved: true, retryable: false, request_id: id,
-      caller_email: !details.email ? 'not_requested' : details.is_test ? 'suppressed_test' : 'pending',
+      caller_email: !details.email ? 'not_requested' : details.is_test ? 'suppressed_test' : routeFor(message)?.callerEmail === false ? 'off_for_route' : 'pending',
       anchorline_email: !env.OFFICE_EMAIL ? 'not_requested' : details.is_test ? 'suppressed_test' : 'pending',
       ...(transfer ? { live_transfer: 'available' } : {}), office_alert: 'pending' };
     // Commit before any network operation, in one transaction: one request per Vapi call, its office-alert retry
