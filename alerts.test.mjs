@@ -22,6 +22,7 @@ async function fixture(t, extra = {}) {
   t.after(async () => { await new Promise(resolve => app.close(resolve)); rmSync(dir, { recursive: true }); });
   const url = `http://127.0.0.1:${app.address().port}/vapi/webhook`;
   const post = async body => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-anchorline-key': key }, body: JSON.stringify(body) });
+  post.base = url.replace('/vapi/webhook', '');
   return { post, sent, dir };
 }
 const result = async response => JSON.parse((await response.json()).results[0].result);
@@ -501,4 +502,28 @@ test('"callerEmail": false never emails the caller, and the office alert still g
   const mails = sent.filter(s => s.url.includes('resend'));
   assert.equal(mails.filter(s => s.body.to.includes('linda@example.com')).length, 0);
   assert.ok(mails.some(s => s.body.to.includes('office@example.com')));
+});
+
+test('ALERT_ROUTES_EXTRA adds routes over ALERT_ROUTES; invalid JSON there is ignored and the main routes still work', async t => {
+  const extra = JSON.stringify({ 'demo-line': { business: 'Anchorline Demo', sms: [], email: ['demo@example.com'], callerEmail: false },
+    'client-b': { business: 'Override', sms: [], email: ['b2@example.com'] } });
+  const main = JSON.stringify({ ...JSON.parse(routes), 'client-b': { business: 'Original', sms: [], email: ['b1@example.com'] } });
+  const health = async post => (await (await fetch(post.base + '/healthz')).json()).alert_routes;
+  const merged = await fixture(t, { ALERT_ROUTES: main, ALERT_ROUTES_EXTRA: extra });
+  assert.equal((await result(await merged.post(toolCall('x-1', 'submit_service_request', intake, { assistantId: 'demo-line' })))).office_alert, 'sent');
+  assert.equal((await result(await merged.post(toolCall('x-2', 'submit_service_request', intake)))).office_alert, 'sent');
+  await merged.post(toolCall('x-3', 'submit_service_request', intake, { assistantId: 'client-b' }));
+  const to = merged.sent.filter(s => s.url.includes('resend')).flatMap(s => s.body.to);
+  assert.ok(to.includes('demo@example.com') && to.includes('office@example.com') && to.includes('b2@example.com') && !to.includes('b1@example.com'));
+  assert.equal(await health(merged.post), 3);
+  const errors = [], error = console.error;
+  console.error = (...a) => errors.push(a.join(' '));
+  try {
+    for (const bad of ['{not json', '[]', 'null']) {
+      const broken = await fixture(t, { ALERT_ROUTES_EXTRA: bad });
+      assert.equal((await result(await broken.post(toolCall(`b-${bad}`, 'submit_service_request', intake)))).office_alert, 'sent');
+      assert.equal(await health(broken.post), 1);
+    }
+  } finally { console.error = error; }
+  assert.equal(errors.filter(e => e === 'ALERT_ROUTES_EXTRA is not a JSON object of routes: ignored').length, 3);
 });

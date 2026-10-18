@@ -516,6 +516,14 @@ export function createApp(env = process.env, send = fetch) {
   // caller_email is then 'off_for_route'. The office alerts are unchanged.
   let routes = {};
   try { routes = JSON.parse(env.ALERT_ROUTES || '{}') || {}; } catch { routes = {}; }
+  // ALERT_ROUTES_EXTRA: more routes in the same shape, merged over ALERT_ROUTES (an extra entry wins on the same assistant),
+  // so a route can be added without editing ALERT_ROUTES. Invalid JSON there is logged by name and ignored.
+  if (env.ALERT_ROUTES_EXTRA) {
+    let extra = null;
+    try { extra = JSON.parse(env.ALERT_ROUTES_EXTRA); } catch { /* reported below */ }
+    if (extra && typeof extra === 'object' && !Array.isArray(extra)) routes = { ...routes, ...extra };
+    else console.error('ALERT_ROUTES_EXTRA is not a JSON object of routes: ignored');
+  }
   // The route for an assistant: an ALERT_ROUTES entry wins; otherwise an active trial client row (SMS stays off
   // until the 10DLC campaign covers trial clients). Every route lookup goes through here.
   const routeOf = assistantId => routes[assistantId] || clientRoute(assistantId);
